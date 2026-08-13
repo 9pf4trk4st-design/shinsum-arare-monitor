@@ -1,0 +1,27 @@
+name: Shinsum Monitor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - run: playwright install --with-deps chromium
+
+      - run: python monitor.py
+        env:
+          SHINSUM_USER: ${{ secrets.SHINSUM_USER }}
+          SHINSUM_PASSWORD: ${{ secrets.SHINSUM_PASSWORD }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CHECK_INTERVAL: "120"
