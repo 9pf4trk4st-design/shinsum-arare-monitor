@@ -1864,6 +1864,14 @@ def notify_selected(
     classification
 ):
     kind = classification["type"]
+    # V27安全弁: 旧ロジックから独立バフが渡ってきても絶対に送信しない。
+    if kind == "独立バフ":
+        print(
+            f"独立バフ単独通知を抑止: {venue} / {race}",
+            flush=True
+        )
+        return
+
     focus = set(classification["focus"])
 
     secondary_buffs = classification.get("secondary_buffs", [])
@@ -2230,12 +2238,9 @@ def inspect(page):
         flush=True
     )
 
-    # 全レース共通で、2〜4号艇の独立バフを先に計算する。
-    # 元1着率が不明な艇でも「理論 + チェッカー」の総合バフで評価する。
-    buff_classification = classify_buff(
-        final_rates,
-        current_diffs
-    )
+    # V27: 独立バフの単独判定・通知は完全廃止。
+    # 対抗艇の大幅補正は「1号艇逃げ強化・対抗艇注意」の中だけで使用する。
+    buff_classification = None
 
     # -----------------------------
     # NEW: 1号艇の逃げ強化 / 逃げ崩れ
@@ -2283,16 +2288,6 @@ def inspect(page):
         )
 
         if classification:
-            if buff_classification:
-                classification["secondary_buffs"] = buff_classification["buffs"]
-
-            buff_key = ""
-            if buff_classification:
-                buff_key = "|B" + "-".join(
-                    str(x["boat"])
-                    for x in buff_classification["buffs"]
-                )
-
             return {
                 "venue": v,
                 "race": r,
@@ -2303,65 +2298,17 @@ def inspect(page):
                 "key": (
                     f"{now():%Y-%m-%d}|"
                     f"{v}|{r}|{a}|{classification['type']}"
-                    f"{buff_key}"
                 )
             }
 
         print(
-            f"最終補正で主選別は対象外、独立バフを続けて確認: "
+            f"最終補正で主選別は対象外: "
             f"{a} / {v} / {r}",
             flush=True
         )
 
-    # -----------------------------
-    # B. 全レース共通
-    #    2〜4号艇の独立バフ
-    # -----------------------------
-    classification = buff_classification
-
-    if not classification:
-        return None
-
-    print(
-        f"独立バフ候補: {v} / {r} / "
-        + ", ".join(
-            (
-                f"{x['boat']}号艇 "
-                f"差{x['current_diff']:+.2f} "
-                f"元{x['base_1st']:.1f}% "
-                f"理論{x['theory_1st']:+.1f}% "
-                f"チェッカー{x['checker_1st']:+.1f}% "
-                f"最終{x['final_1st']:.1f}%"
-                if x["base_known"]
-                else
-                f"{x['boat']}号艇 "
-                f"差{x['current_diff']:+.2f} "
-                f"元1着率表示なし "
-                f"理論{x['theory_1st']:+.1f}% "
-                f"チェッカー{x['checker_1st']:+.1f}% "
-                f"総合バフ{x['total_boost']:+.1f}pt"
-            )
-            for x in classification["buffs"]
-        ),
-        flush=True
-    )
-
-    return {
-        "venue": v,
-        "race": r,
-        "deadline": d,
-        "alert": "",
-        "final_rates": final_rates,
-        "classification": classification,
-        "key": (
-            f"{now():%Y-%m-%d}|"
-            f"{v}|{r}|BUFF|"
-            + "-".join(
-                str(x["boat"])
-                for x in classification["buffs"]
-            )
-        )
-    }
+    # V27: 独立バフ単独通知は完全廃止
+    return None
 
 
 def cycle(page, initial=False):
@@ -2495,7 +2442,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V26 escape-warning-no-independent-buff]",
+            f"監視開始 [V27 independent-buff-hard-disabled]",
             flush=True
         )
 
