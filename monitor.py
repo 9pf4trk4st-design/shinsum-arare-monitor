@@ -715,6 +715,14 @@ def notify_selected(
     kind = classification["type"]
     focus = set(classification["focus"])
 
+    # やや本命/荒れ注意の主判定とは別に、
+    # 2・3・4号艇でプラス補正が出ている艇を「バフ注目」として併記する。
+    secondary_buffs = classification.get("secondary_buffs", [])
+    secondary_focus = {
+        x["boat"] for x in secondary_buffs
+        if x["boat"] not in focus
+    }
+
     if kind == "1号艇有利":
         symbol = "🟢"
     elif kind == "独立バフ":
@@ -730,7 +738,12 @@ def notify_selected(
         if not x:
             continue
 
-        mark = " ←注目" if boat in focus else ""
+        if boat in focus:
+            mark = " ←主注目"
+        elif boat in secondary_focus:
+            mark = " ←バフ注目"
+        else:
+            mark = ""
 
         rate_lines.append(
             f"{boat}号艇 "
@@ -777,11 +790,31 @@ def notify_selected(
             + f"締切 {deadline_value}"
         )
     else:
+        secondary_text = ""
+
+        if secondary_buffs:
+            secondary_lines = []
+            for b in secondary_buffs:
+                secondary_lines.append(
+                    f"{b['boat']}号艇 "
+                    f"平均との差 {b['current_diff']:+.2f} ({b['zone']}) / "
+                    f"理論 {b['theory_1st']:+.1f}% + "
+                    f"チェッカー {b['checker_1st']:+.1f}% "
+                    f"= 補正 {b['total_boost']:+.1f}% / "
+                    f"最終 {b['final_1st']:.1f}%"
+                )
+
+            secondary_text = (
+                "\n\n🚀 2・3・4号艇のバフも確認\n"
+                + "\n".join(secondary_lines)
+            )
+
         body = (
             f"{symbol} {kind}\n"
             f"{venue} {race}【{alert}】\n\n"
             f"全艇・最終補正1着率\n"
             + "\n".join(rate_lines)
+            + secondary_text
             + "\n\n"
             + f"{classification['reason']}\n"
             + f"締切 {deadline_value}"
@@ -899,9 +932,18 @@ def inspect(page):
         flush=True
     )
 
+    # 全レース共通で、2〜4号艇のバフを先に計算しておく。
+    # これにより「4号艇が主役だが2号艇にも強いバフ」のようなケースを
+    # やや本命/荒れ注意の通知内でも見落とさない。
+    buff_classification = classify_buff(
+        final_rates,
+        current_diffs
+    )
+
     # -----------------------------
     # A. やや本命 / 荒れ注意
-    #    → 最終補正1着率で選別
+    #    → 最終補正1着率で主判定
+    #    ＋ 2〜4号艇のバフを副注目として同時表示
     # -----------------------------
     if a:
         classification = classify_final_rates(
@@ -909,6 +951,16 @@ def inspect(page):
         )
 
         if classification:
+            if buff_classification:
+                classification["secondary_buffs"] = buff_classification["buffs"]
+
+            buff_key = ""
+            if buff_classification:
+                buff_key = "|B" + "-".join(
+                    str(x["boat"])
+                    for x in buff_classification["buffs"]
+                )
+
             return {
                 "venue": v,
                 "race": r,
@@ -919,11 +971,12 @@ def inspect(page):
                 "key": (
                     f"{now():%Y-%m-%d}|"
                     f"{v}|{r}|{a}|{classification['type']}"
+                    f"{buff_key}"
                 )
             }
 
         print(
-            f"最終補正で従来選別は対象外、独立バフを続けて確認: "
+            f"最終補正で主選別は対象外、独立バフを続けて確認: "
             f"{a} / {v} / {r}",
             flush=True
         )
@@ -932,10 +985,7 @@ def inspect(page):
     # B. 全レース共通
     #    2〜4号艇の独立バフ
     # -----------------------------
-    classification = classify_buff(
-        final_rates,
-        current_diffs
-    )
+    classification = buff_classification
 
     if not classification:
         return None
