@@ -1673,27 +1673,41 @@ def classify_escape_collapse(final_rates):
                 ),
             })
 
-    if not strong_rivals:
-        return None
-
     strong_rivals.sort(key=lambda x: x["final"], reverse=True)
 
+    # V28:
+    # 1号艇が15pt以上低下した時点で「イン逃げ低下」として通知。
+    # 他艇に最終15%以上がいる場合は、より強い「逃げ崩れ」として表示する。
+    if strong_rivals:
+        kind = "1号艇逃げ崩れ"
+        focus = [1] + [x["boat"] for x in strong_rivals]
+        rival_text = " / ".join(
+            f"{x['boat']}号艇 最終{x['final']:.1f}%"
+            for x in strong_rivals
+        )
+        reason = (
+            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
+            f"（{final-base:+.1f}pt）と15pt以上低下。"
+            f"{rival_text} が15%以上"
+        )
+    else:
+        kind = "1号艇イン逃げ低下"
+        focus = [1]
+        reason = (
+            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
+            f"（{final-base:+.1f}pt）と15pt以上低下。"
+            f"他艇の最終1着率15%以上は確認できなくても、"
+            f"イン逃げ信頼度低下として通知"
+        )
+
     return {
-        "type": "1号艇逃げ崩れ",
-        "focus": [x["boat"] for x in strong_rivals],
+        "type": kind,
+        "focus": focus,
         "one_base": base,
         "one_final": final,
         "one_change": final - base,
         "strong_rivals": strong_rivals,
-        "reason": (
-            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
-            f"（{final-base:+.1f}pt）と大幅弱化。"
-            + " / ".join(
-                f"{x['boat']}号艇 最終{x['final']:.1f}%"
-                for x in strong_rivals
-            )
-            + " が15%以上"
-        ),
+        "reason": reason,
     }
 
 
@@ -1886,6 +1900,8 @@ def notify_selected(
         symbol = "🟢⚠️"
     elif kind == "1号艇逃げ崩れ":
         symbol = "🔴"
+    elif kind == "1号艇イン逃げ低下":
+        symbol = "⚠️"
     elif kind == "独立バフ":
         symbol = "🚀"
     else:
@@ -2442,7 +2458,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V27 independent-buff-hard-disabled]",
+            f"監視開始 [V28 inside-escape-drop-alert]",
             flush=True
         )
 
