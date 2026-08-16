@@ -268,7 +268,9 @@ def parse_theory_adjustments(text):
     end = text.find("シンsumチェッカー", start)
     section = text[start:(end if end > start else start + 8000)]
 
-    regs = re.findall(r"(?m)^\s*(\d{4})\s*$", section)
+    regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
+    regs = list(dict.fromkeys(regs))
+
     if len(regs) < 6:
         return {}
 
@@ -277,7 +279,7 @@ def parse_theory_adjustments(text):
 
     for boat, reg in enumerate(regs, start=1):
         mreg = re.search(
-            rf"(?m)^\s*{re.escape(reg)}\s*$",
+            rf"(?<!\d){re.escape(reg)}(?!\d)",
             section
         )
         if not mreg:
@@ -287,7 +289,7 @@ def parse_theory_adjustments(text):
         if boat < 6:
             next_reg = regs[boat]
             mn = re.search(
-                rf"(?m)^\s*{re.escape(next_reg)}\s*$",
+                rf"(?<!\d){re.escape(next_reg)}(?!\d)",
                 section[mreg.end():]
             )
             if mn:
@@ -328,7 +330,9 @@ def parse_current_diffs(text):
     section = text[start:(end if end > start else start + 8000)]
 
     # 登録番号を出現順に拾う。シンsum理論では上から1〜6号艇。
-    regs = re.findall(r"(?m)^\s*(\d{4})\s*$", section)
+    regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
+
+    regs = list(dict.fromkeys(regs))
 
     if len(regs) < 6:
         return {}
@@ -338,7 +342,7 @@ def parse_current_diffs(text):
 
     for boat, reg in enumerate(regs, start=1):
         mreg = re.search(
-            rf"(?m)^\s*{re.escape(reg)}\s*$",
+            rf"(?<!\d){re.escape(reg)}(?!\d)",
             section
         )
         if not mreg:
@@ -349,7 +353,7 @@ def parse_current_diffs(text):
         if boat < 6:
             next_reg = regs[boat]
             mn = re.search(
-                rf"(?m)^\s*{re.escape(next_reg)}\s*$",
+                rf"(?<!\d){re.escape(next_reg)}(?!\d)",
                 section[mreg.end():]
             )
             if mn:
@@ -393,9 +397,12 @@ def parse_registration_numbers(text):
     section = text[start:(end if end > start else start + 8000)]
 
     regs = re.findall(
-        r"(?m)^\s*(\d{4})\s*$",
+        r"(?<!\d)([3-5]\d{3})(?!\d)",
         section
     )
+
+    # 出現順を維持したまま重複除外
+    regs = list(dict.fromkeys(regs))
 
     if len(regs) < 6:
         print(
@@ -488,7 +495,14 @@ def collect_checker_1st(page, current_diffs, registrations):
         try:
             # シンsum理論欄の登録番号リンクをクリック。
             # 同じ番号が複数ある場合でも先頭を使用。
-            loc = page.get_by_text(reg, exact=True)
+            # 登録番号はリンク(aタグ)を優先して探す。
+            # inner_textの改行/空白に左右されにくくする。
+            loc = page.locator("a").filter(
+                has_text=re.compile(rf"^\\s*{re.escape(reg)}\\s*$")
+            )
+
+            if loc.count() == 0:
+                loc = page.get_by_text(reg, exact=True)
 
             if loc.count() == 0:
                 print(
@@ -1412,7 +1426,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始",
+            f"監視開始 [V8 robust-reg]",
             flush=True
         )
 
