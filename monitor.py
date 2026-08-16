@@ -588,6 +588,182 @@ def alert_near_deadline(text, d):
 
 
 
+def parse_base_1st_rates_dom(page):
+    """
+    画面上の位置(Y座標)を使って「選手名・1着率」欄だけから元1着率を取る。
+
+    inner_text の並びや「←シンsum理論に戻る」等には依存しない。
+    「選手名・1着率」見出しより下、
+    「危険艇 / 戦法別上昇率 / スリット隊形 / シンsum理論」より上に
+    実際に表示されている符号なし%だけを取得する。
+    """
+    try:
+        data = page.evaluate(
+            r"""
+            () => {
+              const norm = (s) =>
+                (s || "")
+                  .replace(/\u00a0/g, " ")
+                  .replace(/\s+/g, " ")
+                  .trim();
+
+              const visible = (el) => {
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                return (
+                  r.width > 0 &&
+                  r.height > 0 &&
+                  st.display !== "none" &&
+                  st.visibility !== "hidden"
+                );
+              };
+
+              const els = Array.from(document.querySelectorAll("body *"))
+                .filter(visible);
+
+              // できるだけ小さい要素で「選手名・1着率」見出しを探す。
+              let headers = els.filter((el) => {
+                const t = norm(el.innerText);
+                return (
+                  t.length <= 30 &&
+                  /選手名\s*[・･]\s*1着率/.test(t)
+                );
+              });
+
+              if (!headers.length) {
+                // 見出しが「選手名」「1着率」に分かれている場合の保険。
+                headers = els.filter((el) => {
+                  const t = norm(el.innerText);
+                  return t === "選手名";
+                });
+              }
+
+              if (!headers.length) {
+                return {
+                  ok: false,
+                  reason: "header_not_found",
+                  values: []
+                };
+              }
+
+              // ページ上部側の最初の候補を使う。
+              headers.sort(
+                (a, b) =>
+                  a.getBoundingClientRect().top -
+                  b.getBoundingClientRect().top
+              );
+
+              const header = headers[0];
+              const hr = header.getBoundingClientRect();
+              const startY = hr.bottom;
+
+              // 次セクションの開始Yを探す。
+              const endWords = [
+                "危険艇",
+                "戦法別上昇率",
+                "スリット隊形",
+                "シンsum理論"
+              ];
+
+              const endYs = [];
+
+              for (const el of els) {
+                const r = el.getBoundingClientRect();
+                if (r.top <= startY + 2) continue;
+
+                const t = norm(el.innerText);
+
+                // 親要素全体を誤検出しないよう短いラベルだけを見る。
+                if (t.length > 40) continue;
+
+                if (endWords.some((w) => t === w || t.startsWith(w))) {
+                  endYs.push(r.top);
+                }
+              }
+
+              const endY = endYs.length
+                ? Math.min(...endYs)
+                : startY + 1400;
+
+              const raw = [];
+
+              for (const el of els) {
+                const r = el.getBoundingClientRect();
+                if (r.top < startY - 2 || r.bottom > endY + 2) {
+                  continue;
+                }
+
+                const t = norm(el.innerText);
+
+                // 元1着率は符号なし xx% だけ。
+                if (!/^\d+(?:\.\d+)?%$/.test(t)) continue;
+
+                raw.push({
+                  text: t,
+                  value: parseFloat(t),
+                  x: r.left,
+                  y: r.top,
+                  h: r.height,
+                  tag: el.tagName
+                });
+              }
+
+              // 入れ子要素で同じ%が重複することがあるため、
+              // 同一Y付近・同一値は1件にする。
+              raw.sort((a, b) => a.y - b.y || a.x - b.x);
+
+              const dedup = [];
+              for (const item of raw) {
+                const dup = dedup.some(
+                  (x) =>
+                    Math.abs(x.y - item.y) < 3 &&
+                    x.value === item.value
+                );
+                if (!dup) dedup.push(item);
+              }
+
+              // 選手一覧は上から1〜6号艇。
+              const values = dedup.slice(0, 6).map((x) => x.value);
+
+              return {
+                ok: values.length > 0,
+                reason: values.length ? "ok" : "no_percent_in_section",
+                startY,
+                endY,
+                values,
+                raw: dedup.slice(0, 12)
+              };
+            }
+            """
+        )
+
+        values = data.get("values", []) if isinstance(data, dict) else []
+
+        result = {
+            boat: float(values[boat - 1])
+            for boat in range(1, len(values) + 1)
+        }
+
+        print(
+            f"元1着率候補(DOM/V19): {values} -> {result}",
+            flush=True
+        )
+
+        if not result:
+            print(
+                f"元1着率DOM取得失敗: {data}",
+                flush=True
+            )
+
+        return result
+
+    except Exception as e:
+        print(
+            f"元1着率DOM解析例外: {repr(e)}",
+            flush=True
+        )
+        return {}
+
 def parse_base_1st_rates(text):
     """
     ページ上部の「選手名・1着率」欄から、明示された元1着率だけを取得する。
@@ -1665,7 +1841,29 @@ def inspect(page):
     # -----------------------------
     # 3種類のデータを取得
     # -----------------------------
-    base_rates = parse_base_1st_rates(text)
+    # DOM方式とテキスト方式を両方実行し、
+    # より多く「明示された元1着率」を取れた方を採用する。
+    #
+    # 理由:
+    # - DOM方式は画面構造に強いが、レイアウトによって1艇分だけ拾うことがある
+    # - テキスト方式は別レースで6艇分を正しく取れることが確認できている
+    # - 1〜2艇しか本当に表示されないレースでは、両方式ともその範囲に留まる
+    base_dom = parse_base_1st_rates_dom(page)
+    base_text = parse_base_1st_rates(text)
+
+    if len(base_text) > len(base_dom):
+        base_rates = base_text
+        print(
+            f"元1着率採用: TEXT {len(base_text)}艇 > DOM {len(base_dom)}艇",
+            flush=True
+        )
+    else:
+        base_rates = base_dom
+        print(
+            f"元1着率採用: DOM {len(base_dom)}艇 >= TEXT {len(base_text)}艇",
+            flush=True
+        )
+
     theory_adj = parse_theory_adjustments(text)
     current_diffs = parse_current_diffs(text)
     registrations = parse_registration_numbers(text)
@@ -1987,7 +2185,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V18 player-section-fix]",
+            f"監視開始 [V20 dual-base-parser]",
             flush=True
         )
 
