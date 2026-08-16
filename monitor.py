@@ -256,98 +256,10 @@ def parse_base_1st_rates(text):
 
 def parse_theory_adjustments(text):
     """
-    シンsum理論表の「1着」補正を6艇全部取得する。
+    シンsum理論表の「1着」補正を6艇全部取得。
 
-    例:
-    {
-        1: +2.0,
-        2: +3.0,
-        3: +4.0,
-        4: -1.0,
-        5: -2.0,
-        6: -1.0
-    }
-    """
-    start = text.find("シンsum理論")
-    if start < 0:
-        return {}
-
-    end = text.find("シンsumチェッカー", start)
-    section = text[start:(end if end > start else start + 7000)]
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
-
-    result = {}
-
-    for boat in range(1, 7):
-        for i, line in enumerate(lines):
-            if line != str(boat):
-                continue
-
-            # 艇番直後の1艇分を確認。
-            # %値は「1着 / 2着 / 3着 / 3連」の順と想定。
-            window = "\n".join(lines[i:i + 20])
-            pcts = re.findall(
-                r"([+-]?\d+(?:\.\d+)?)\s*%",
-                window
-            )
-
-            if pcts:
-                result[boat] = float(pcts[0])
-                break
-
-    return result
-
-
-def parse_current_diffs(text):
-    """
-    シンsum理論表の「平均との差」を6艇分取得する。
-    例: {1: +0.52, 2: +0.31, 3: +0.45, ...}
-    """
-    start = text.find("シンsum理論")
-    if start < 0:
-        return {}
-
-    end = text.find("シンsumチェッカー", start)
-    section = text[start:(end if end > start else start + 7000)]
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
-
-    result = {}
-
-    for boat in range(1, 7):
-        for i, line in enumerate(lines):
-            if line != str(boat):
-                continue
-
-            for candidate in lines[i + 1:i + 14]:
-                if "%" in candidate:
-                    continue
-
-                m = re.fullmatch(
-                    r"([+-]?\d+(?:\.\d+)?)",
-                    candidate
-                )
-
-                if not m:
-                    continue
-
-                value = float(m.group(1))
-
-                # 平均との差として現実的な範囲だけ採用し、
-                # 登録番号などの誤取得を防止
-                if -5.0 <= value <= 5.0:
-                    result[boat] = value
-                    break
-
-            break
-
-    return result
-
-
-
-def parse_registration_numbers(text):
-    """
-    シンsum理論欄から1〜6号艇の登録番号（4桁）を取得する。
-    例: {1:"4836", 2:"3807", ...}
+    各4桁登録番号を起点に、その艇ブロック内で最初に出る
+    %付き数値を1着補正として読む。
     """
     start = text.find("シンsum理論")
     if start < 0:
@@ -355,24 +267,149 @@ def parse_registration_numbers(text):
 
     end = text.find("シンsumチェッカー", start)
     section = text[start:(end if end > start else start + 8000)]
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
 
+    regs = re.findall(r"(?m)^\s*(\d{4})\s*$", section)
+    if len(regs) < 6:
+        return {}
+
+    regs = regs[:6]
     result = {}
 
-    for boat in range(1, 7):
-        for i, line in enumerate(lines):
-            if line != str(boat):
-                continue
+    for boat, reg in enumerate(regs, start=1):
+        mreg = re.search(
+            rf"(?m)^\s*{re.escape(reg)}\s*$",
+            section
+        )
+        if not mreg:
+            continue
 
-            for candidate in lines[i + 1:i + 10]:
-                # 登録番号は通常4桁
-                m = re.fullmatch(r"(\d{4})", candidate)
-                if m:
-                    result[boat] = m.group(1)
-                    break
-            break
+        next_pos = len(section)
+        if boat < 6:
+            next_reg = regs[boat]
+            mn = re.search(
+                rf"(?m)^\s*{re.escape(next_reg)}\s*$",
+                section[mreg.end():]
+            )
+            if mn:
+                next_pos = mreg.end() + mn.start()
+
+        block = section[mreg.end():next_pos]
+
+        pcts = re.findall(
+            r"([+-]?\d+(?:\.\d+)?)\s*%",
+            block
+        )
+
+        if pcts:
+            result[boat] = float(pcts[0])
 
     return result
+
+
+def parse_current_diffs(text):
+    """
+    シンsum理論表の「平均との差」を6艇分取得する。
+
+    重要:
+    艇番の数字(1,2,3...)やヘッダーの「1着/2着/3着」を起点にしない。
+    各艇の4桁登録番号を起点に、その直後に出る
+    「符号付き・%なし」の数値を平均との差として読む。
+
+    例:
+      4836 -> +0.87
+      3807 -> +0.03
+      4419 -> +0.18
+    """
+    start = text.find("シンsum理論")
+    if start < 0:
+        return {}
+
+    end = text.find("シンsumチェッカー", start)
+    section = text[start:(end if end > start else start + 8000)]
+
+    # 登録番号を出現順に拾う。シンsum理論では上から1〜6号艇。
+    regs = re.findall(r"(?m)^\s*(\d{4})\s*$", section)
+
+    if len(regs) < 6:
+        return {}
+
+    regs = regs[:6]
+    result = {}
+
+    for boat, reg in enumerate(regs, start=1):
+        mreg = re.search(
+            rf"(?m)^\s*{re.escape(reg)}\s*$",
+            section
+        )
+        if not mreg:
+            continue
+
+        # 次の登録番号までをその艇の範囲にする。
+        next_pos = len(section)
+        if boat < 6:
+            next_reg = regs[boat]
+            mn = re.search(
+                rf"(?m)^\s*{re.escape(next_reg)}\s*$",
+                section[mreg.end():]
+            )
+            if mn:
+                next_pos = mreg.end() + mn.start()
+
+        block = section[mreg.end():next_pos]
+
+        # +0.87 / -0.02 のような符号付き数値。
+        # %付きの理論補正は除外する。
+        candidates = re.findall(
+            r"(?<![\d.])([+-]\d+(?:\.\d+)?)(?!\s*%)",
+            block
+        )
+
+        if not candidates:
+            continue
+
+        # 最初に出る値が平均との差。
+        value = float(candidates[0])
+
+        # 誤取得防止
+        if -5.0 <= value <= 5.0:
+            result[boat] = value
+
+    return result
+
+
+def parse_registration_numbers(text):
+    """
+    シンsum理論欄の4桁登録番号を上から6個取得し、
+    1〜6号艇に割り当てる。
+
+    艇番の単独行を探さないため、
+    ヘッダー数字を誤認しない。
+    """
+    start = text.find("シンsum理論")
+    if start < 0:
+        return {}
+
+    end = text.find("シンsumチェッカー", start)
+    section = text[start:(end if end > start else start + 8000)]
+
+    regs = re.findall(
+        r"(?m)^\s*(\d{4})\s*$",
+        section
+    )
+
+    if len(regs) < 6:
+        print(
+            f"登録番号候補不足: {regs}",
+            flush=True
+        )
+        return {}
+
+    regs = regs[:6]
+
+    return {
+        boat: regs[boat - 1]
+        for boat in range(1, 7)
+    }
 
 
 def parse_single_checker_1st(text, boat, current_diff):
@@ -766,64 +803,116 @@ def classify_buff(final_rates, current_diffs):
 
 def classify_final_rates(final_rates):
     """
-    6艇すべての「最終補正1着率」を比較して、
-    1号艇有利 or 3・4号艇有利 を返す。
+    取得できた艇だけで「最終補正1着率」を比較する。
+
+    ・6艇全部あれば通常どおり6艇比較
+    ・チェッカー履歴がまだ無い若い選手などが1艇だけいる場合は、
+      その艇を除外して残り5艇で判定する
+    ・2艇以上欠けて4艇以下になった場合は、誤判定防止のため判定しない
     """
-    if len(final_rates) < 6:
+    if len(final_rates) < 5:
         return None
 
+    available = sorted(final_rates.keys())
     values = {
         boat: final_rates[boat]["final"]
-        for boat in range(1, 7)
+        for boat in available
     }
 
     vals = list(values.values())
-
-    b1 = values[1]
-    b3 = values[3]
-    b4 = values[4]
-
     best_all = max(vals)
     second_best = sorted(vals, reverse=True)[1]
 
     # -----------------------------
     # 1号艇有利
+    # 1号艇のチェッカーデータが無い場合は判定不能なのでスキップ
     # -----------------------------
-    best34 = max(b3, b4)
+    if 1 in values:
+        b1 = values[1]
 
-    if (
-        b1 == best_all
-        and b1 >= ONE_MIN
-        and (b1 - best34) >= ONE_GAP_VS_34
-        and (b1 - second_best) >= ONE_GAP_VS_SECOND
-    ):
-        return {
-            "type": "1号艇有利",
-            "focus": [1],
-            "reason": (
-                f"最終補正1着率で1号艇が6艇中トップ。"
-                f"3・4号艇の最大値より {b1 - best34:+.1f}pt、"
-                f"2番手より {b1 - second_best:+.1f}pt 優勢"
-            )
-        }
+        # 3・4号艇のうち取得できているもの
+        vals34 = [
+            values[b]
+            for b in (3, 4)
+            if b in values
+        ]
+
+        if vals34:
+            best34 = max(vals34)
+
+            if (
+                b1 == best_all
+                and b1 >= ONE_MIN
+                and (b1 - best34) >= ONE_GAP_VS_34
+                and (b1 - second_best) >= ONE_GAP_VS_SECOND
+            ):
+                missing = [
+                    str(b)
+                    for b in range(1, 7)
+                    if b not in values
+                ]
+                missing_text = (
+                    f"（{','.join(missing)}号艇はチェッカーデータなしで除外）"
+                    if missing else ""
+                )
+
+                return {
+                    "type": "1号艇有利",
+                    "focus": [1],
+                    "reason": (
+                        f"最終補正1着率で1号艇が取得艇中トップ。"
+                        f"3・4号艇の最大値より {b1 - best34:+.1f}pt、"
+                        f"2番手より {b1 - second_best:+.1f}pt 優勢"
+                        f"{missing_text}"
+                    )
+                }
 
     # -----------------------------
     # 3・4号艇有利
+    # 取得できている3・4号艇だけを候補にする
     # -----------------------------
-    best_boat = 3 if b3 >= b4 else 4
+    candidates34 = [
+        b for b in (3, 4)
+        if b in values
+    ]
+
+    if not candidates34:
+        return None
+
+    best_boat = max(
+        candidates34,
+        key=lambda b: values[b]
+    )
     best_value = values[best_boat]
 
-    best_other = max(
-        values[1],
-        values[2],
-        values[5],
-        values[6]
-    )
+    # 3・4以外の取得済み艇
+    other_values = [
+        values[b]
+        for b in available
+        if b not in (3, 4)
+    ]
+
+    if not other_values:
+        return None
+
+    best_other = max(other_values)
+
+    # 1号艇が取得できている時だけ「1号艇との差」を条件に使う。
+    # 1号艇がデータ不足なら、残り5艇比較なのでこの条件は課さない。
+    gap_vs_1_ok = True
+    gap_vs_1_text = ""
+
+    if 1 in values:
+        gap_vs_1 = best_value - values[1]
+        gap_vs_1_ok = gap_vs_1 >= OUT_GAP_VS_1
+        gap_vs_1_text = f"1号艇より {gap_vs_1:+.1f}pt、"
+    else:
+        gap_vs_1_text = "1号艇はチェッカーデータなしで比較除外、"
 
     if (
         best_value == best_all
         and best_value >= OUT_MIN
-        and (best_value - b1) >= OUT_GAP_VS_1
+        and gap_vs_1_ok
         and (best_value - best_other) >= OUT_GAP_VS_OTHER
     ):
         focus = [best_boat]
@@ -831,21 +920,33 @@ def classify_final_rates(final_rates):
         other_boat = 4 if best_boat == 3 else 3
 
         if (
-            values[other_boat] >= OUT_MIN
+            other_boat in values
+            and values[other_boat] >= OUT_MIN
             and abs(
                 values[best_boat] - values[other_boat]
             ) <= 8
         ):
             focus = [3, 4]
 
+        missing = [
+            str(b)
+            for b in range(1, 7)
+            if b not in values
+        ]
+        missing_text = (
+            f"（{','.join(missing)}号艇を除外した{len(values)}艇比較）"
+            if missing else ""
+        )
+
         return {
             "type": "3・4号艇有利",
             "focus": focus,
             "reason": (
-                f"最終補正1着率で{best_boat}号艇が6艇中トップ。"
-                f"1号艇より {best_value - b1:+.1f}pt、"
+                f"最終補正1着率で{best_boat}号艇が取得艇中トップ。"
+                f"{gap_vs_1_text}"
                 f"3・4以外の最上位より "
                 f"{best_value - best_other:+.1f}pt 優勢"
+                f"{missing_text}"
             )
         }
 
@@ -1060,14 +1161,27 @@ def inspect(page):
         )
         return None
 
-    if len(checker) < 6:
+    if len(checker) < 5:
         print(
-            f"シンsumチェッカー6艇取得失敗: "
+            f"シンsumチェッカー取得不足: "
             f"{v} / {r} / "
-            f"取得 {len(checker)}艇 / {checker}",
+            f"取得 {len(checker)}艇 / {checker} / "
+            f"5艇未満なので判定中止",
             flush=True
         )
         return None
+
+    if len(checker) == 5:
+        missing_checker = [
+            b for b in range(1, 7)
+            if b not in checker
+        ]
+        print(
+            f"シンsumチェッカー1艇データなし: "
+            f"{v} / {r} / "
+            f"{missing_checker}号艇を除外して残り5艇で判定",
+            flush=True
+        )
 
     final_rates = build_final_rates(
         base_rates,
@@ -1075,11 +1189,12 @@ def inspect(page):
         checker
     )
 
-    if len(final_rates) < 6:
+    if len(final_rates) < 5:
         print(
-            f"最終補正1着率6艇計算失敗: "
+            f"最終補正1着率取得不足: "
             f"{v} / {r} / "
-            f"取得 {len(final_rates)}艇",
+            f"取得 {len(final_rates)}艇 / "
+            f"5艇未満なので判定中止",
             flush=True
         )
         return None
@@ -1092,7 +1207,7 @@ def inspect(page):
             f"{final_rates[boat]['theory']:+.1f}"
             f"{final_rates[boat]['checker']:+.1f}"
             f"={final_rates[boat]['final']:.1f}%"
-            for boat in range(1, 7)
+            for boat in sorted(final_rates.keys())
         ),
         flush=True
     )
