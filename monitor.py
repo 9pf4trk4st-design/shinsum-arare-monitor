@@ -475,8 +475,13 @@ def parse_single_checker_1st(text, boat, current_diff):
 
 def collect_checker_1st(page, current_diffs, registrations):
     """
-    シンsumチェッカーは登録番号をタップしないと表示されないため、
-    1〜6号艇の登録番号を順番にクリックして各艇のチェッカー1着率を取得する。
+    1〜6号艇の登録番号を順番にクリックしてチェッカーを取得する。
+
+    V9:
+    - クリック後450ms固定待ちを廃止
+    - 最大4秒、250ms間隔で表示完了を待つ
+    - 1回で出なければ最大3回まで再クリック
+    - 「データが見つかりません」は正式なデータなしとして区別
     """
     result = {}
 
@@ -492,59 +497,109 @@ def collect_checker_1st(page, current_diffs, registrations):
             )
             continue
 
-        try:
-            # シンsum理論欄の登録番号リンクをクリック。
-            # 同じ番号が複数ある場合でも先頭を使用。
-            # 登録番号はリンク(aタグ)を優先して探す。
-            # inner_textの改行/空白に左右されにくくする。
-            loc = page.locator("a").filter(
-                has_text=re.compile(rf"^\\s*{re.escape(reg)}\\s*$")
-            )
+        got = None
+        no_data = False
 
-            if loc.count() == 0:
-                loc = page.get_by_text(reg, exact=True)
-
-            if loc.count() == 0:
-                print(
-                    f"登録番号リンク未検出: {boat}号艇 / {reg}",
-                    flush=True
-                )
-                continue
-
-            loc.first.click(timeout=3000)
-            page.wait_for_timeout(450)
-
-            body = page.locator("body").inner_text(timeout=10000)
-            info = parse_single_checker_1st(
-                body,
-                boat,
-                diff
-            )
-
-            if info:
-                result[boat] = info
-                print(
-                    f"チェッカー取得成功: {boat}号艇 / "
-                    f"{reg} / 差{diff:+.2f} / "
-                    f"{info['zone']} / "
-                    f"1着{info['checker_1st']:+.1f}%",
-                    flush=True
-                )
-            else:
-                print(
-                    f"チェッカー該当行取得失敗: {boat}号艇 / "
-                    f"{reg} / 差{diff:+.2f}",
-                    flush=True
+        for attempt in range(1, 4):
+            try:
+                loc = page.locator("a").filter(
+                    has_text=re.compile(
+                        rf"^\s*{re.escape(reg)}\s*$"
+                    )
                 )
 
-        except Exception as e:
+                if loc.count() == 0:
+                    loc = page.get_by_text(reg, exact=True)
+
+                if loc.count() == 0:
+                    print(
+                        f"登録番号リンク未検出: "
+                        f"{boat}号艇 / {reg}",
+                        flush=True
+                    )
+                    break
+
+                try:
+                    loc.first.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+
+                loc.first.click(
+                    timeout=4000,
+                    force=(attempt >= 2)
+                )
+
+                # 固定450msではなく、チェッカー表示を最大4秒待つ
+                for _ in range(16):
+                    page.wait_for_timeout(250)
+
+                    body = page.locator("body").inner_text(
+                        timeout=10000
+                    )
+
+                    # サイト側が明示的に「データなし」と返した場合
+                    if (
+                        f"{boat}号艇のデータが見つかりません" in body
+                        or "データが見つかりません" in body[
+                            max(0, body.find("シンsumチェッカー")):
+                        ]
+                    ):
+                        no_data = True
+                        break
+
+                    info = parse_single_checker_1st(
+                        body,
+                        boat,
+                        diff
+                    )
+
+                    if info:
+                        got = info
+                        break
+
+                if got or no_data:
+                    break
+
+                print(
+                    f"チェッカー表示待ち再試行: "
+                    f"{boat}号艇 / {reg} / "
+                    f"{attempt}回目",
+                    flush=True
+                )
+
+            except Exception as e:
+                print(
+                    f"チェッカークリック再試行: "
+                    f"{boat}号艇 / {reg} / "
+                    f"{attempt}回目 / {repr(e)}",
+                    flush=True
+                )
+
+        if got:
+            result[boat] = got
             print(
-                f"チェッカークリック/取得失敗: "
-                f"{boat}号艇 / {reg} / {repr(e)}",
+                f"チェッカー取得成功: {boat}号艇 / "
+                f"{reg} / 差{diff:+.2f} / "
+                f"{got['zone']} / "
+                f"1着{got['checker_1st']:+.1f}%",
+                flush=True
+            )
+        elif no_data:
+            print(
+                f"チェッカーデータなし: "
+                f"{boat}号艇 / {reg} / 差{diff:+.2f}",
+                flush=True
+            )
+        else:
+            print(
+                f"チェッカー取得失敗: "
+                f"{boat}号艇 / {reg} / 差{diff:+.2f} / "
+                f"3回再試行しても表示確認できず",
                 flush=True
             )
 
     return result
+
 
 def checker_zone(current_diff):
     if current_diff >= 0.5:
@@ -1426,7 +1481,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V8 robust-reg]",
+            f"監視開始 [V9 checker-wait-retry]",
             flush=True
         )
 
