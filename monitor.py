@@ -592,42 +592,50 @@ def parse_base_1st_rates(text):
     """
     「選手名・1着率」欄に実際に表示されている元1着率だけを取得する。
 
-    艇番や改行位置には依存しない。
-    「選手名・1着率」から「危険艇」等の次セクションまでにある、
-    符号なしの%を上から順に 1号艇, 2号艇... と割り当てる。
-
-    例:
-      49%, 12%, 10%, 15%, 10%, 2%
-      -> {1:49, 2:12, 3:10, 4:15, 5:10, 6:2}
-
-    戸田7Rのように1・2号艇しか単独1着率が表示されていない場合:
-      54%, 17%
-      -> {1:54, 2:17}
-
-    「危険艇」以降の
-      12=1-2, 13=1-3, 14=1-4, 15=1-5, 16=1-6
-    の確率はセクション外に切り落とすので絶対に使用しない。
+    V15:
+    - 見出しの表記ゆれ「選手名・1着率」「選手名 ・ 1着率」
+      「選手名  ・  1着率」などに対応
+    - 「危険艇」より下の 12/13/14/15/16 の組み合わせ確率は除外
+    - 見出しから次セクションまでにある符号なし%を上から順に1〜6号艇へ割当
     """
-    start = text.find("選手名・1着率")
-    if start < 0:
+    # 見出しは空白やタブが混ざることがあるため regex で探す
+    header = re.search(
+        r"選手名\s*・\s*1着率",
+        text
+    )
+    if not header:
+        print(
+            "元1着率見出し未検出",
+            flush=True
+        )
         return {}
 
-    end_candidates = []
-    for marker in (
-        "危険艇",
-        "戦法別上昇率",
-        "スリット隊形",
-        "シンsum理論",
-    ):
-        p = text.find(marker, start + 1)
-        if p > start:
-            end_candidates.append(p)
+    start = header.start()
 
-    end = min(end_candidates) if end_candidates else min(len(text), start + 6000)
+    # 元1着率欄の終了点を決める
+    end_candidates = []
+    for pattern in (
+        r"危険艇",
+        r"戦法別上昇率",
+        r"スリット隊形",
+        r"シン\s*sum理論",
+    ):
+        m = re.search(pattern, text[header.end():])
+        if m:
+            end_candidates.append(
+                header.end() + m.start()
+            )
+
+    end = (
+        min(end_candidates)
+        if end_candidates
+        else min(len(text), start + 6000)
+    )
+
     section = text[start:end]
 
-    # +11% / -8% のような補正値は除外。
-    # 元1着率は符号なしの%のみ。
+    # +11% / -8% などの補正値は除外。
+    # 元1着率は符号なしのパーセントだけ。
     pcts = re.findall(
         r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
         section
@@ -639,7 +647,7 @@ def parse_base_1st_rates(text):
         if 0.0 <= value <= 100.0:
             values.append(value)
 
-    # 最大6艇まで。表示されている分だけ採用する。
+    # 最大6艇。表示分だけ採用。
     values = values[:6]
 
     result = {
@@ -1954,7 +1962,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V14 base-percent-order]",
+            f"監視開始 [V15 flexible-header]",
             flush=True
         )
 
