@@ -2213,13 +2213,16 @@ def inspect(page):
             if b not in checker
         ]
         print(
-            f"シンsumチェッカー取得済み艇で判定継続: "
+            f"チェッカー一部データなし(V29): "
             f"{v} / {r} / "
             f"取得 {len(checker)}艇 / "
-            f"未取得・データなし {missing_checker}号艇",
+            f"データなし {missing_checker}号艇 "
+            f"→ データなし艇は除外し、取得済み艇だけで判定続行",
             flush=True
         )
 
+    # データなし艇は0%扱い・推測・補完をしない。
+    # build_final_ratesは、必要なチェッカー値が取得できた艇だけを評価する。
     final_rates = build_final_rates(
         base_rates,
         theory_adj,
@@ -2458,7 +2461,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V28 inside-escape-drop-alert]",
+            f"監視開始 [V29 partial-checker-data-ok]",
             flush=True
         )
 
