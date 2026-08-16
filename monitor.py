@@ -864,6 +864,39 @@ def parse_base_1st_rates(text):
     return result
 
 
+def extract_theory_section(text):
+    """
+    実際のシンsum理論表だけを切り出す。
+
+    ページ上部の「←シンsum理論に戻る」を誤認しないため、
+    text内のすべての「シンsum理論」候補を調べ、
+    その後に4桁登録番号が最も多く並ぶ候補を本表として採用する。
+    """
+    starts = [m.start() for m in re.finditer(r"シン\s*sum理論", text)]
+
+    best_section = ""
+    best_score = -1
+
+    for start in starts:
+        end = text.find("シンsumチェッカー", start)
+        section = text[start:(end if end > start else min(len(text), start + 10000))]
+
+        regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
+        regs_unique = list(dict.fromkeys(regs))
+
+        diff_like = re.findall(
+            r"(?<![\d.])([+-]\d+(?:\.\d+)?)(?!\s*%)",
+            section
+        )
+
+        score = len(regs_unique) * 100 + len(diff_like)
+
+        if score > best_score:
+            best_score = score
+            best_section = section
+
+    return best_section
+
 def parse_theory_adjustments(text):
     """
     シンsum理論表の「1着」補正を6艇全部取得。
@@ -871,12 +904,9 @@ def parse_theory_adjustments(text):
     各4桁登録番号を起点に、その艇ブロック内で最初に出る
     %付き数値を1着補正として読む。
     """
-    start = text.find("シンsum理論")
-    if start < 0:
+    section = extract_theory_section(text)
+    if not section:
         return {}
-
-    end = text.find("シンsumチェッカー", start)
-    section = text[start:(end if end > start else start + 8000)]
 
     regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
     regs = list(dict.fromkeys(regs))
@@ -932,12 +962,9 @@ def parse_current_diffs(text):
       3807 -> +0.03
       4419 -> +0.18
     """
-    start = text.find("シンsum理論")
-    if start < 0:
+    section = extract_theory_section(text)
+    if not section:
         return {}
-
-    end = text.find("シンsumチェッカー", start)
-    section = text[start:(end if end > start else start + 8000)]
 
     # 登録番号を出現順に拾う。シンsum理論では上から1〜6号艇。
     regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
@@ -999,12 +1026,9 @@ def parse_registration_numbers(text):
     艇番の単独行を探さないため、
     ヘッダー数字を誤認しない。
     """
-    start = text.find("シンsum理論")
-    if start < 0:
+    section = extract_theory_section(text)
+    if not section:
         return {}
-
-    end = text.find("シンsumチェッカー", start)
-    section = text[start:(end if end > start else start + 8000)]
 
     regs = re.findall(
         r"(?<!\d)([3-5]\d{3})(?!\d)",
@@ -2196,7 +2220,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V21 text-priority]",
+            f"監視開始 [V22 theory-section-fix]",
             flush=True
         )
 
