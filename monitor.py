@@ -590,13 +590,10 @@ def alert_near_deadline(text, d):
 
 def parse_base_1st_rates(text):
     """
-    「選手名・1着率」欄に明示されている艇だけ元1着率を取得する。
+    「選手名・1着率」欄に明示された元1着率だけを取得する。
 
-    重要:
-    - 3〜6号艇の単独1着率が表示されていないレースでは無理に補完しない。
-    - 「危険艇」欄の 12 / 13 / 14 / 15 / 16 は
-      1-2 / 1-3 / 1-4 / 1-5 / 1-6 の組み合わせであり艇番ではない。
-    - 「危険艇」以降の確率は元1着率として絶対に使わない。
+    改行型・同一行型の両方に対応。
+    「危険艇」以降の 12/13/14/15/16 は組み合わせ確率なので無視する。
     """
     start = text.find("選手名・1着率")
     if start < 0:
@@ -613,34 +610,38 @@ def parse_base_1st_rates(text):
         if p > start:
             end_candidates.append(p)
 
-    end = min(end_candidates) if end_candidates else min(len(text), start + 5000)
+    end = min(end_candidates) if end_candidates else min(len(text), start + 6000)
     section = text[start:end]
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
+
+    boat_matches = list(re.finditer(
+        r"(?m)^\s*([1-6])(?=\s|$)",
+        section
+    ))
 
     result = {}
 
-    for i, line in enumerate(lines):
-        m = re.fullmatch(r"([1-6])", line)
-        if not m:
-            continue
-
+    for idx, m in enumerate(boat_matches):
         boat = int(m.group(1))
 
-        for candidate in lines[i + 1:i + 8]:
-            if re.fullmatch(r"[1-6]", candidate):
-                break
+        block_end = (
+            boat_matches[idx + 1].start()
+            if idx + 1 < len(boat_matches)
+            else len(section)
+        )
+        block = section[m.end():block_end]
 
-            if candidate.startswith("+") or candidate.startswith("-"):
-                continue
+        pcts = re.findall(
+            r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
+            block
+        )
 
-            m_pct = re.fullmatch(r"(\d+(?:\.\d+)?)\s*%", candidate)
-            if m_pct:
-                value = float(m_pct.group(1))
-                if 0.0 <= value <= 100.0:
-                    result[boat] = value
-                break
+        if pcts:
+            value = float(pcts[0])
+            if 0.0 <= value <= 100.0:
+                result[boat] = value
 
     return result
+
 
 def parse_theory_adjustments(text):
     """
@@ -1719,6 +1720,13 @@ def inspect(page):
         flush=True
     )
 
+    # 全レース共通で、2〜4号艇の独立バフを先に計算する。
+    # 元1着率が不明な艇でも「理論 + チェッカー」の総合バフで評価する。
+    buff_classification = classify_buff(
+        final_rates,
+        current_diffs
+    )
+
     # -----------------------------
     # A. やや本命 / 荒れ注意
     #    → 最終補正1着率で主判定
@@ -1934,7 +1942,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V12 explicit-base-only]",
+            f"監視開始 [V13 base-parse+buff-fix]",
             flush=True
         )
 
