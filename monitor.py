@@ -1851,16 +1851,27 @@ def inspect(page):
     base_dom = parse_base_1st_rates_dom(page)
     base_text = parse_base_1st_rates(text)
 
-    if len(base_text) > len(base_dom):
+    # V21:
+    # TEXT方式を優先する。
+    # V20では DOM=6艇 / TEXT=6艇 の同数時にDOMを採用してしまい、
+    # DOM側の入れ子要素重複（例: 34,34,25,25,22,22）を誤採用した。
+    #
+    # TEXT方式は
+    #   34,25,22,11,2,4
+    # のように正しい6艇を取得できているため、
+    # TEXTが1艇以上取れている場合はTEXTを採用。
+    # TEXTが0艇の時だけDOMへフォールバックする。
+    if len(base_text) > 0:
         base_rates = base_text
         print(
-            f"元1着率採用: TEXT {len(base_text)}艇 > DOM {len(base_dom)}艇",
+            f"元1着率採用(V21): TEXT {len(base_text)}艇 "
+            f"(DOM {len(base_dom)}艇は参考のみ)",
             flush=True
         )
     else:
         base_rates = base_dom
         print(
-            f"元1着率採用: DOM {len(base_dom)}艇 >= TEXT {len(base_text)}艇",
+            f"元1着率採用(V21): TEXT 0艇のためDOM {len(base_dom)}艇を採用",
             flush=True
         )
 
@@ -2185,7 +2196,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V20 dual-base-parser]",
+            f"監視開始 [V21 text-priority]",
             flush=True
         )
 
