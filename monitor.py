@@ -590,65 +590,78 @@ def alert_near_deadline(text, d):
 
 def parse_base_1st_rates(text):
     """
-    「選手名・1着率」欄に実際に表示されている元1着率だけを取得する。
+    選手一覧の「級別(A1/A2/B1/B2) → 1着率%」を使って
+    元1着率を取得する。
 
-    V15:
-    - 見出しの表記ゆれ「選手名・1着率」「選手名 ・ 1着率」
-      「選手名  ・  1着率」などに対応
-    - 「危険艇」より下の 12/13/14/15/16 の組み合わせ確率は除外
-    - 見出しから次セクションまでにある符号なし%を上から順に1〜6号艇へ割当
+    V16:
+    - 「選手名・1着率」という見出し文字列には依存しない
+    - A1/A2/B1/B2 の級別を持つ選手行だけを見る
+    - 「危険艇」の 12/13/14/15/16 には級別が無いので混入しない
+    - 上から順に1〜6号艇へ割り当てる
+
+    例:
+      若林樹蘭 A2 ... 49%
+      山崎義明 A2 ... 12%
+      ...
+      -> {1:49, 2:12, ...}
     """
-    # 見出しは空白やタブが混ざることがあるため regex で探す
-    header = re.search(
-        r"選手名\s*・\s*1着率",
-        text
-    )
-    if not header:
-        print(
-            "元1着率見出し未検出",
-            flush=True
-        )
-        return {}
 
-    start = header.start()
-
-    # 元1着率欄の終了点を決める
+    # シンsum理論など後段の表を混ぜないため、
+    # ページ上部〜選手一覧周辺だけに範囲を制限する。
     end_candidates = []
+
     for pattern in (
-        r"危険艇",
         r"戦法別上昇率",
+        r"危険艇",
         r"スリット隊形",
         r"シン\s*sum理論",
     ):
-        m = re.search(pattern, text[header.end():])
+        m = re.search(pattern, text)
         if m:
-            end_candidates.append(
-                header.end() + m.start()
-            )
+            end_candidates.append(m.start())
 
-    end = (
+    section_end = (
         min(end_candidates)
         if end_candidates
-        else min(len(text), start + 6000)
+        else min(len(text), 7000)
     )
 
-    section = text[start:end]
+    section = text[:section_end]
 
-    # +11% / -8% などの補正値は除外。
-    # 元1着率は符号なしのパーセントだけ。
-    pcts = re.findall(
-        r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
+    # 級別の直後〜次の級別までの範囲で、
+    # 最初に現れる「符号なし%」を元1着率とする。
+    grade_matches = list(re.finditer(
+        r"\b(?:A1|A2|B1|B2)\b",
         section
-    )
+    ))
 
     values = []
-    for raw in pcts:
-        value = float(raw)
+
+    for idx, gm in enumerate(grade_matches):
+        block_end = (
+            grade_matches[idx + 1].start()
+            if idx + 1 < len(grade_matches)
+            else len(section)
+        )
+
+        block = section[gm.end():block_end]
+
+        # +11% / -8% のような補正値は除外。
+        m_pct = re.search(
+            r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
+            block
+        )
+
+        if not m_pct:
+            continue
+
+        value = float(m_pct.group(1))
+
         if 0.0 <= value <= 100.0:
             values.append(value)
 
-    # 最大6艇。表示分だけ採用。
-    values = values[:6]
+        if len(values) >= 6:
+            break
 
     result = {
         boat: values[boat - 1]
@@ -656,7 +669,7 @@ def parse_base_1st_rates(text):
     }
 
     print(
-        f"元1着率候補: {values} -> {result}",
+        f"元1着率候補(級別基準): {values} -> {result}",
         flush=True
     )
 
@@ -1962,7 +1975,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V15 flexible-header]",
+            f"監視開始 [V16 grade-based-base]",
             flush=True
         )
 
