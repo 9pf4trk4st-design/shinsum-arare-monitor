@@ -1404,12 +1404,11 @@ def cycle(page, initial=False):
                 flush=True
             )
 
-    # 起動直後に既に存在している通知を大量送信しない
+    # 起動直後でも、締切15分以内で現在条件を満たす候補は通知する。
+    # その後 seen に登録するため、同一実行中の重複通知は防止される。
     if initial:
-        seen.update(current.keys())
-
         print(
-            f"初期既読登録: {len(current)}件",
+            f"初回候補通知対象: {len(current)}件",
             flush=True
         )
 
@@ -1417,7 +1416,7 @@ def cycle(page, initial=False):
             c = x["classification"]
 
             print(
-                f"既読: "
+                f"初回通知: "
                 f"{c['type']} / "
                 f"{x['alert'] or '通常レース'} / "
                 f"{x['venue']} / "
@@ -1426,6 +1425,16 @@ def cycle(page, initial=False):
                 flush=True
             )
 
+            notify_selected(
+                x["alert"],
+                x["venue"],
+                x["race"],
+                x["deadline"],
+                x["final_rates"],
+                x["classification"]
+            )
+
+        seen.update(current.keys())
         return
 
     new_items = [
@@ -1481,7 +1490,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V9 checker-wait-retry]",
+            f"監視開始 [V10 initial-notify]",
             flush=True
         )
 
