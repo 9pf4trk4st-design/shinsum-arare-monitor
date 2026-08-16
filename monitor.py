@@ -343,6 +343,158 @@ def parse_current_diffs(text):
     return result
 
 
+
+def parse_registration_numbers(text):
+    """
+    シンsum理論欄から1〜6号艇の登録番号（4桁）を取得する。
+    例: {1:"4836", 2:"3807", ...}
+    """
+    start = text.find("シンsum理論")
+    if start < 0:
+        return {}
+
+    end = text.find("シンsumチェッカー", start)
+    section = text[start:(end if end > start else start + 8000)]
+    lines = [x.strip() for x in section.splitlines() if x.strip()]
+
+    result = {}
+
+    for boat in range(1, 7):
+        for i, line in enumerate(lines):
+            if line != str(boat):
+                continue
+
+            for candidate in lines[i + 1:i + 10]:
+                # 登録番号は通常4桁
+                m = re.fullmatch(r"(\d{4})", candidate)
+                if m:
+                    result[boat] = m.group(1)
+                    break
+            break
+
+    return result
+
+
+def parse_single_checker_1st(text, boat, current_diff):
+    """
+    現在表示中のシンsumチェッカーから、指定艇の該当ゾーン1着率を取得する。
+    """
+    start = text.find("シンsumチェッカー")
+    if start < 0:
+        return None
+
+    section = text[start:]
+    compact = re.sub(r"\s+", "", section)
+
+    token = f"{boat}号艇"
+    pos = compact.find(token)
+    if pos < 0:
+        return None
+
+    # 選択中のカードだけ取れればよいので、次の艇カードか十分な長さまで
+    next_positions = []
+    for other in range(1, 7):
+        if other == boat:
+            continue
+        p = compact.find(f"{other}号艇", pos + len(token))
+        if p >= 0:
+            next_positions.append(p)
+
+    end = min(next_positions) if next_positions else min(len(compact), pos + 5000)
+    card = compact[pos:end]
+
+    zone = checker_zone(current_diff)
+    zpos = -1
+    matched = None
+
+    for variant in _zone_variants(zone):
+        zpos = card.find(variant)
+        if zpos >= 0:
+            matched = variant
+            break
+
+    if zpos < 0:
+        return None
+
+    row = card[zpos:zpos + 420]
+    pcts = re.findall(r"([+-]?\d+(?:\.\d+)?)%", row)
+
+    if not pcts:
+        return None
+
+    return {
+        "zone": zone,
+        "matched_zone_text": matched,
+        "checker_1st": float(pcts[0]),
+    }
+
+
+def collect_checker_1st(page, current_diffs, registrations):
+    """
+    シンsumチェッカーは登録番号をタップしないと表示されないため、
+    1〜6号艇の登録番号を順番にクリックして各艇のチェッカー1着率を取得する。
+    """
+    result = {}
+
+    for boat in CHECKER_PARSE_BOATS:
+        diff = current_diffs.get(boat)
+        reg = registrations.get(boat)
+
+        if diff is None or not reg:
+            print(
+                f"チェッカー前提データ不足: {boat}号艇 / "
+                f"差={diff} / 登録番号={reg}",
+                flush=True
+            )
+            continue
+
+        try:
+            # シンsum理論欄の登録番号リンクをクリック。
+            # 同じ番号が複数ある場合でも先頭を使用。
+            loc = page.get_by_text(reg, exact=True)
+
+            if loc.count() == 0:
+                print(
+                    f"登録番号リンク未検出: {boat}号艇 / {reg}",
+                    flush=True
+                )
+                continue
+
+            loc.first.click(timeout=3000)
+            page.wait_for_timeout(450)
+
+            body = page.locator("body").inner_text(timeout=10000)
+            info = parse_single_checker_1st(
+                body,
+                boat,
+                diff
+            )
+
+            if info:
+                result[boat] = info
+                print(
+                    f"チェッカー取得成功: {boat}号艇 / "
+                    f"{reg} / 差{diff:+.2f} / "
+                    f"{info['zone']} / "
+                    f"1着{info['checker_1st']:+.1f}%",
+                    flush=True
+                )
+            else:
+                print(
+                    f"チェッカー該当行取得失敗: {boat}号艇 / "
+                    f"{reg} / 差{diff:+.2f}",
+                    flush=True
+                )
+
+        except Exception as e:
+            print(
+                f"チェッカークリック/取得失敗: "
+                f"{boat}号艇 / {reg} / {repr(e)}",
+                flush=True
+            )
+
+    return result
+
 def checker_zone(current_diff):
     if current_diff >= 0.5:
         return "+0.5以上"
@@ -862,7 +1014,15 @@ def inspect(page):
     base_rates = parse_base_1st_rates(text)
     theory_adj = parse_theory_adjustments(text)
     current_diffs = parse_current_diffs(text)
-    checker = parse_checker_1st(text, current_diffs)
+    registrations = parse_registration_numbers(text)
+
+    # シンsumチェッカーは登録番号をタップして初めて表示されるため、
+    # 1〜6号艇を順番にクリックして取得する。
+    checker = collect_checker_1st(
+        page,
+        current_diffs,
+        registrations
+    )
 
     if len(base_rates) < 6:
         print(
@@ -887,6 +1047,15 @@ def inspect(page):
             f"平均との差6艇取得失敗: "
             f"{v} / {r} / "
             f"取得 {len(current_diffs)}艇 / {current_diffs}",
+            flush=True
+        )
+        return None
+
+    if len(registrations) < 6:
+        print(
+            f"登録番号6艇取得失敗: "
+            f"{v} / {r} / "
+            f"取得 {len(registrations)}艇 / {registrations}",
             flush=True
         )
         return None
