@@ -1516,6 +1516,113 @@ def classify_buff(final_rates, current_diffs):
         "reason": reason,
     }
 
+def classify_escape_boost(final_rates):
+    """
+    1号艇逃げ強化:
+      - 1号艇の元1着率と最終1着率が取得できる
+      - 最終1着率が75%以上
+      - 元より最終が上昇している（元80→最終76のような弱化は除外）
+      - 2〜6号艇で、最終1着率が判明している艇に15%以上がいない
+    """
+    one = final_rates.get(1)
+    if not one or one.get("base") is None or one.get("final") is None:
+        return None
+
+    base = one["base"]
+    final = one["final"]
+    rise = final - base
+
+    if final < ESCAPE_FINAL_MIN or rise <= 0:
+        return None
+
+    strong_rivals = []
+    for boat in range(2, 7):
+        info = final_rates.get(boat)
+        if not info or info.get("final") is None:
+            continue
+        if info["final"] >= RIVAL_FINAL_MIN:
+            strong_rivals.append({
+                "boat": boat,
+                "final": info["final"],
+            })
+
+    if strong_rivals:
+        return None
+
+    return {
+        "type": "1号艇逃げ強化",
+        "focus": [1],
+        "one_base": base,
+        "one_final": final,
+        "one_change": rise,
+        "strong_rivals": [],
+        "reason": (
+            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
+            f"（{rise:+.1f}pt）。最終75%以上かつ上昇。"
+            f"確認できる2〜6号艇に最終15%以上なし"
+        ),
+    }
+
+
+def classify_escape_collapse(final_rates):
+    """
+    1号艇逃げ崩れ:
+      - 1号艇の元/最終が取得できる
+      - 最終が元から大幅低下（初期値15pt以上）
+      - 2〜6号艇のどれかが最終1着率15%以上
+    """
+    one = final_rates.get(1)
+    if not one or one.get("base") is None or one.get("final") is None:
+        return None
+
+    base = one["base"]
+    final = one["final"]
+    drop = base - final
+
+    if drop < ONE_BIG_DROP_MIN:
+        return None
+
+    strong_rivals = []
+    for boat in range(2, 7):
+        info = final_rates.get(boat)
+        if not info or info.get("final") is None:
+            continue
+        if info["final"] >= RIVAL_FINAL_MIN:
+            strong_rivals.append({
+                "boat": boat,
+                "final": info["final"],
+                "base": info.get("base"),
+                "change": (
+                    info["final"] - info["base"]
+                    if info.get("base") is not None
+                    else None
+                ),
+            })
+
+    if not strong_rivals:
+        return None
+
+    strong_rivals.sort(key=lambda x: x["final"], reverse=True)
+
+    return {
+        "type": "1号艇逃げ崩れ",
+        "focus": [x["boat"] for x in strong_rivals],
+        "one_base": base,
+        "one_final": final,
+        "one_change": final - base,
+        "strong_rivals": strong_rivals,
+        "reason": (
+            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
+            f"（{final-base:+.1f}pt）と大幅弱化。"
+            + " / ".join(
+                f"{x['boat']}号艇 最終{x['final']:.1f}%"
+                for x in strong_rivals
+            )
+            + " が15%以上"
+        ),
+    }
+
+
 def classify_final_rates(final_rates):
     """
     取得できた艇だけで「最終補正1着率」を比較する。
@@ -1691,8 +1798,10 @@ def notify_selected(
         if x["boat"] not in focus
     }
 
-    if kind == "1号艇有利":
+    if kind in ("1号艇有利", "1号艇逃げ強化"):
         symbol = "🟢"
+    elif kind == "1号艇逃げ崩れ":
+        symbol = "🔴"
     elif kind == "独立バフ":
         symbol = "🚀"
     else:
@@ -2006,6 +2115,41 @@ def inspect(page):
     )
 
     # -----------------------------
+    # NEW: 1号艇の逃げ強化 / 逃げ崩れ
+    # -----------------------------
+    escape = classify_escape_boost(final_rates)
+    collapse = classify_escape_collapse(final_rates)
+
+    # 逃げ崩れを優先。1号艇大幅低下＋15%以上の他艇があるケース。
+    if collapse:
+        return {
+            "venue": v,
+            "race": r,
+            "deadline": d,
+            "alert": a or "",
+            "final_rates": final_rates,
+            "classification": collapse,
+            "key": (
+                f"{now():%Y-%m-%d}|{v}|{r}|ESCAPE_COLLAPSE"
+            )
+        }
+
+    # 1号艇が元より上昇し、最終75%以上。
+    # かつ確認できる他艇に最終15%以上がいないケース。
+    if escape:
+        return {
+            "venue": v,
+            "race": r,
+            "deadline": d,
+            "alert": a or "",
+            "final_rates": final_rates,
+            "classification": escape,
+            "key": (
+                f"{now():%Y-%m-%d}|{v}|{r}|ESCAPE_BOOST"
+            )
+        }
+
+    # -----------------------------
     # A. やや本命 / 荒れ注意
     #    → 最終補正1着率で主判定
     #    ＋ 2〜4号艇のバフを副注目として同時表示
@@ -2220,7 +2364,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V22 theory-section-fix]",
+            f"監視開始 [V24 escape-drop15]",
             flush=True
         )
 
