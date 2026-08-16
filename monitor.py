@@ -196,66 +196,62 @@ def alert_near_deadline(text, d):
 
 def parse_base_1st_rates(text):
     """
-    ページ上部の「選手名・1着率」から、元の1着率を6艇分取得する。
+    ページ上部の「選手名・1着率」から元の1着率を6艇分取得する。
+
+    DOMの改行位置が変わっても取れるように、
+    「選手名・1着率」〜「戦法別上昇率」の範囲に出る
+    符号なしの%を上から6個、1〜6号艇として読む。
 
     例:
-    {
-        1: 30.0,
-        2: 17.0,
-        3: 17.0,
-        4: 21.0,
-        5: 11.0,
-        6: 3.0
-    }
+      17%, 15%, 11%, 51%, 2%, 2%
+      -> {1:17.0, 2:15.0, 3:11.0, 4:51.0, 5:2.0, 6:2.0}
     """
-    # 「選手名・1着率」からシンsum理論の直前までを優先して見る
     start = text.find("選手名・1着率")
-    theory_start = text.find("シンsum理論")
-
     if start < 0:
-        start = 0
+        start = text.find("選手名")
+    if start < 0:
+        return {}
 
-    if theory_start > start:
-        section = text[start:theory_start]
-    else:
-        section = text[start:start + 5000]
+    end_candidates = []
 
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
-    result = {}
+    for marker in (
+        "戦法別上昇率",
+        "スリット隊形",
+        "シンsum理論",
+    ):
+        p = text.find(marker, start + 1)
+        if p > start:
+            end_candidates.append(p)
 
-    for i, line in enumerate(lines):
-        # 艇番が単独行の場合
-        m_boat = re.fullmatch(r"([1-6])", line)
-        if not m_boat:
-            continue
+    end = min(end_candidates) if end_candidates else min(len(text), start + 5000)
+    section = text[start:end]
 
-        boat = int(m_boat.group(1))
+    # +5%, -8% のような補正値は除外。
+    # 元1着率は符号なしなので、それだけを順番に取る。
+    pcts = re.findall(
+        r"(?<![+\\-\\d.])(\\d+(?:\\.\\d+)?)\\s*%",
+        section
+    )
 
-        # 艇番の後ろにある最初の「%」を元の1着率とみなす
-        for candidate in lines[i + 1:i + 10]:
-            m_pct = re.search(r"(?<![+\-\d])(\d+(?:\.\d+)?)\s*%", candidate)
-            if m_pct:
-                result[boat] = float(m_pct.group(1))
-                break
+    if len(pcts) < 6:
+        print(
+            "元1着率候補不足:",
+            pcts,
+            "section=",
+            repr(section[:1200]),
+            flush=True
+        )
+        return {}
 
-    # 行構造が変わった時のフォールバック
-    if len(result) < 6:
-        compact = re.sub(r"[ \t]+", " ", section)
-        for boat in range(1, 7):
-            if boat in result:
-                continue
+    values = [float(x) for x in pcts[:6]]
 
-            # 「艇番 → 選手名/級別など → xx%」を広めに拾う
-            m = re.search(
-                rf"(?:^|\n)\s*{boat}\s*\n[\s\S]{{0,180}}?"
-                rf"(?<![+\-\d])(\d+(?:\.\d+)?)\s*%",
-                compact,
-                re.M
-            )
-            if m:
-                result[boat] = float(m.group(1))
+    if any(x < 0 or x > 100 for x in values):
+        return {}
 
-    return result
+    return {
+        boat: values[boat - 1]
+        for boat in range(1, 7)
+    }
 
 
 def parse_theory_adjustments(text):
