@@ -29,31 +29,33 @@ ALERT_TYPES = ("やや本命", "荒れ注意")
 # -----------------------------
 # 選別基準
 # -----------------------------
+# 最終補正1着率で比較する。
+# 最終補正1着率 =
+#   元の1着率
+# + シンsum理論欄の1着補正
+# + シンsumチェッカー該当ゾーンの1着補正
+
 # 1号艇有利
-ONE_MIN = 8.0
-ONE_GAP_VS_34 = 8.0
-ONE_GAP_VS_SECOND = 5.0
+ONE_MIN = float(os.getenv("ONE_MIN", "8.0"))
+ONE_GAP_VS_34 = float(os.getenv("ONE_GAP_VS_34", "8.0"))
+ONE_GAP_VS_SECOND = float(os.getenv("ONE_GAP_VS_SECOND", "5.0"))
 
 # 3・4号艇有利
-OUT_MIN = 10.0
-OUT_GAP_VS_1 = 8.0
-OUT_GAP_VS_OTHER = 5.0
+OUT_MIN = float(os.getenv("OUT_MIN", "10.0"))
+OUT_GAP_VS_1 = float(os.getenv("OUT_GAP_VS_1", "8.0"))
+OUT_GAP_VS_OTHER = float(os.getenv("OUT_GAP_VS_OTHER", "5.0"))
 
-# 独立バフ検知（やや本命/荒れ注意が出ていないレースも対象）
-# 通知対象は2・3・4号艇。1号艇は比較・弱化判定用に必ず解析する。
+# 独立バフ検知
 BUFF_TARGET_BOATS = (2, 3, 4)
-CHECKER_PARSE_BOATS = (1, 2, 3, 4)
 
-# 「平均との差」自体に固定の強弱判定は置かない。
-# 現在値が属するゾーン（+0.5以上 / 0〜+0.5 / -0.5〜0 / -0.5未満）を
-# 選手ごとのシンsumチェッカーから引き、その1着率補正とシンsum理論1着率を合算する。
-# 合算がプラスならバフ候補。必要なら環境変数で最低値を上げられる。
+# 最終比較のため1〜6号艇すべてチェッカー解析
+CHECKER_PARSE_BOATS = (1, 2, 3, 4, 5, 6)
+
+# 「理論補正 + チェッカー補正」がこの値を超えた2〜4号艇をバフ候補にする
 BUFF_MIN_TOTAL = float(os.getenv("BUFF_MIN_TOTAL", "0.0"))
 
-# 2〜4号艇のバフ判定では、1号艇の弱化も加味する。
-# 「シンsum理論1着補正 + シンsumチェッカー1着補正」を合算し、
-# マイナスなら1号艇弱化として評価する。
-ONE_WEAK_TOTAL_THRESHOLD = 0.0
+# 1号艇の「理論補正 + チェッカー補正」が0未満なら弱化扱い
+ONE_WEAK_TOTAL_THRESHOLD = float(os.getenv("ONE_WEAK_TOTAL_THRESHOLD", "0.0"))
 
 seen = set()
 
@@ -124,14 +126,14 @@ def candidate_links(page):
 
             try:
                 txt = a.inner_text(timeout=250) or ""
-            except:
+            except Exception:
                 pass
 
             try:
                 txt += "\n" + a.locator(
                     "xpath=ancestor::*[self::div or self::td or self::li or self::section][1]"
                 ).inner_text(timeout=250)
-            except:
+            except Exception:
                 pass
 
             if (
@@ -143,7 +145,7 @@ def candidate_links(page):
             ):
                 out.append(full)
 
-        except:
+        except Exception:
             pass
 
     return list(dict.fromkeys(out))
@@ -192,51 +194,102 @@ def alert_near_deadline(text, d):
     )
 
 
-def parse_theory_1st(text):
+def parse_base_1st_rates(text):
     """
-    シンsum理論の「1着」変化率を6艇全部取得。
+    ページ上部の「選手名・1着率」から、元の1着率を6艇分取得する。
 
-    戻り値例:
+    例:
     {
-        1: -2.0,
-        2: 5.0,
-        3: 23.0,
-        4: 12.0,
-        5: -1.0,
+        1: 30.0,
+        2: 17.0,
+        3: 17.0,
+        4: 21.0,
+        5: 11.0,
         6: 3.0
     }
     """
+    # 「選手名・1着率」からシンsum理論の直前までを優先して見る
+    start = text.find("選手名・1着率")
+    theory_start = text.find("シンsum理論")
 
+    if start < 0:
+        start = 0
+
+    if theory_start > start:
+        section = text[start:theory_start]
+    else:
+        section = text[start:start + 5000]
+
+    lines = [x.strip() for x in section.splitlines() if x.strip()]
+    result = {}
+
+    for i, line in enumerate(lines):
+        # 艇番が単独行の場合
+        m_boat = re.fullmatch(r"([1-6])", line)
+        if not m_boat:
+            continue
+
+        boat = int(m_boat.group(1))
+
+        # 艇番の後ろにある最初の「%」を元の1着率とみなす
+        for candidate in lines[i + 1:i + 10]:
+            m_pct = re.search(r"(?<![+\-\d])(\d+(?:\.\d+)?)\s*%", candidate)
+            if m_pct:
+                result[boat] = float(m_pct.group(1))
+                break
+
+    # 行構造が変わった時のフォールバック
+    if len(result) < 6:
+        compact = re.sub(r"[ \t]+", " ", section)
+        for boat in range(1, 7):
+            if boat in result:
+                continue
+
+            # 「艇番 → 選手名/級別など → xx%」を広めに拾う
+            m = re.search(
+                rf"(?:^|\n)\s*{boat}\s*\n[\s\S]{{0,180}}?"
+                rf"(?<![+\-\d])(\d+(?:\.\d+)?)\s*%",
+                compact,
+                re.M
+            )
+            if m:
+                result[boat] = float(m.group(1))
+
+    return result
+
+
+def parse_theory_adjustments(text):
+    """
+    シンsum理論表の「1着」補正を6艇全部取得する。
+
+    例:
+    {
+        1: +2.0,
+        2: +3.0,
+        3: +4.0,
+        4: -1.0,
+        5: -2.0,
+        6: -1.0
+    }
+    """
     start = text.find("シンsum理論")
-
     if start < 0:
         return {}
 
     end = text.find("シンsumチェッカー", start)
-
-    section = text[
-        start:(end if end > start else start + 6000)
-    ]
-
-    lines = [
-        x.strip()
-        for x in section.splitlines()
-        if x.strip()
-    ]
+    section = text[start:(end if end > start else start + 7000)]
+    lines = [x.strip() for x in section.splitlines() if x.strip()]
 
     result = {}
 
     for boat in range(1, 7):
         for i, line in enumerate(lines):
-
             if line != str(boat):
                 continue
 
-            # 1艇分を広めに確認
-            window = "\n".join(lines[i:i + 18])
-
-            # シンsum理論は
-            # 1着 / 2着 / 3着 / 3連 の順に%が出る想定。
+            # 艇番直後の1艇分を確認。
+            # %値は「1着 / 2着 / 3着 / 3連」の順と想定。
+            window = "\n".join(lines[i:i + 20])
             pcts = re.findall(
                 r"([+-]?\d+(?:\.\d+)?)\s*%",
                 window
@@ -252,31 +305,43 @@ def parse_theory_1st(text):
 def parse_current_diffs(text):
     """
     シンsum理論表の「平均との差」を6艇分取得する。
-    例: {1: +0.24, 2: -0.31, 3: +0.61, ...}
+    例: {1: +0.52, 2: +0.31, 3: +0.45, ...}
     """
     start = text.find("シンsum理論")
     if start < 0:
         return {}
 
     end = text.find("シンsumチェッカー", start)
-    section = text[start:(end if end > start else start + 6000)]
+    section = text[start:(end if end > start else start + 7000)]
     lines = [x.strip() for x in section.splitlines() if x.strip()]
 
     result = {}
+
     for boat in range(1, 7):
         for i, line in enumerate(lines):
             if line != str(boat):
                 continue
 
-            # 艇番の直後に出る「+0.61」「-0.31」等を拾う。
-            # %付きの理論値は除外する。
-            for candidate in lines[i + 1:i + 12]:
+            for candidate in lines[i + 1:i + 14]:
                 if "%" in candidate:
                     continue
-                m = re.fullmatch(r"([+-]\d+(?:\.\d+)?)", candidate)
-                if m:
-                    result[boat] = float(m.group(1))
+
+                m = re.fullmatch(
+                    r"([+-]?\d+(?:\.\d+)?)",
+                    candidate
+                )
+
+                if not m:
+                    continue
+
+                value = float(m.group(1))
+
+                # 平均との差として現実的な範囲だけ採用し、
+                # 登録番号などの誤取得を防止
+                if -5.0 <= value <= 5.0:
+                    result[boat] = value
                     break
+
             break
 
     return result
@@ -292,12 +357,39 @@ def checker_zone(current_diff):
     return "-0.5未満"
 
 
+def _zone_variants(zone):
+    variants = {
+        "+0.5以上": (
+            "+0.5以上",
+            "0.5以上",
+        ),
+        "0〜+0.5": (
+            "0〜+0.5",
+            "0～+0.5",
+            "0~+0.5",
+            "0～0.5",
+            "0〜0.5",
+            "0~0.5",
+        ),
+        "-0.5〜0": (
+            "-0.5〜0",
+            "-0.5～0",
+            "-0.5~0",
+        ),
+        "-0.5未満": (
+            "-0.5未満",
+        ),
+    }
+    return variants.get(zone, (zone,))
+
+
 def parse_checker_1st(text, current_diffs):
     """
-    各艇のシンsumチェッカーから、現在の「平均との差」が属するゾーンの
-    1着率変化を取得する。
+    各艇のシンsumチェッカーから、
+    現在の「平均との差」が属するゾーンの1着率補正を取得。
 
-    例: 3号艇が +0.61 なら「+0.5以上」行の1着率（例 +6.4%）を返す。
+    例:
+    1号艇 差+0.52 → +0.5以上 → +24.1%
     """
     start = text.find("シンsumチェッカー")
     if start < 0:
@@ -313,184 +405,229 @@ def parse_checker_1st(text, current_diffs):
 
         token = f"{boat}号艇"
         pos = compact.find(token)
+
         if pos < 0:
             continue
 
-        # 次の艇カードまでをこの艇の範囲とする。
+        # 次の艇カードまで
         next_positions = []
+
         for other in range(1, 7):
             if other == boat:
                 continue
-            p = compact.find(f"{other}号艇", pos + len(token))
+
+            p = compact.find(
+                f"{other}号艇",
+                pos + len(token)
+            )
+
             if p >= 0:
                 next_positions.append(p)
 
-        end = min(next_positions) if next_positions else min(len(compact), pos + 3500)
-        card = compact[pos:end]
+        end = (
+            min(next_positions)
+            if next_positions
+            else min(len(compact), pos + 4500)
+        )
 
+        card = compact[pos:end]
         zone = checker_zone(current_diffs[boat])
-        zpos = card.find(zone)
-        if zpos < 0:
-            # 表記ゆれ対策（波ダッシュ/全角チルダ等）
-            variants = {
-                "0〜+0.5": ("0~+0.5", "0～+0.5"),
-                "-0.5〜0": ("-0.5~0", "-0.5～0"),
-            }.get(zone, ())
-            for v in variants:
-                zpos = card.find(v)
-                if zpos >= 0:
-                    break
+
+        zpos = -1
+        matched_zone_text = None
+
+        for variant in _zone_variants(zone):
+            zpos = card.find(variant)
+            if zpos >= 0:
+                matched_zone_text = variant
+                break
 
         if zpos < 0:
             continue
 
-        # 該当行は「件数」の後に 1着率 / 2着率 / 3着率 / 3連対率 の順。
-        row = card[zpos:zpos + 220]
-        pcts = re.findall(r"([+-]?\d+(?:\.\d+)?)%", row)
+        # 該当行の後ろ側を確認
+        row = card[zpos:zpos + 320]
+
+        # 「件数」の数字を%と誤認しないよう、%付きだけを拾う
+        pcts = re.findall(
+            r"([+-]?\d+(?:\.\d+)?)%",
+            row
+        )
+
         if not pcts:
             continue
 
         result[boat] = {
             "zone": zone,
+            "matched_zone_text": matched_zone_text,
             "checker_1st": float(pcts[0]),
         }
 
     return result
 
 
-def classify_buff(theory, current_diffs, checker):
+def build_final_rates(base_rates, theory_adj, checker):
+    """
+    最終補正1着率を作る。
+
+    最終補正1着率 =
+      元の1着率
+      + シンsum理論1着補正
+      + シンsumチェッカー1着補正
+    """
+    result = {}
+
+    for boat in range(1, 7):
+        base = base_rates.get(boat)
+        theory = theory_adj.get(boat)
+        checker_info = checker.get(boat)
+
+        if base is None or theory is None or not checker_info:
+            continue
+
+        checker_1st = checker_info["checker_1st"]
+
+        result[boat] = {
+            "base": base,
+            "theory": theory,
+            "checker": checker_1st,
+            "zone": checker_info["zone"],
+            "total_adjustment": theory + checker_1st,
+            "final": base + theory + checker_1st,
+        }
+
+    return result
+
+
+def classify_buff(final_rates, current_diffs):
     """
     2・3・4号艇の独立バフ判定。
 
-    重要:
-      - 「平均との差 +0.5以上」のような固定条件では判定しない。
-      - 現在の平均との差が属するゾーンを選手ごとのチェッカーで確認する。
-      - 最終補正 = シンsum理論の1着率補正 + チェッカー該当ゾーンの1着率補正。
-      - 2・3・4号艇は最終補正がプラスならバフ候補。
-      - 1号艇も同じ方法で最終補正を計算し、マイナスなら弱化として強く加味する。
-
-    例:
-      1号艇: 理論 -3.0 + チェッカー(0〜+0.5) -1.7 = -4.7
-      3号艇: 理論 +17.0 + チェッカー(+0.5以上) +6.4 = +23.4
+    ・バフ量 = 理論補正 + チェッカー補正
+    ・最終1着率 = 元1着率 + バフ量
+    ・1号艇も同じ方式で最終1着率を出し、比較する
     """
     buffs = []
 
-    one_theory = theory.get(1)
-    one_checker_info = checker.get(1)
-    one_checker = one_checker_info["checker_1st"] if one_checker_info else None
-    one_zone = one_checker_info["zone"] if one_checker_info else None
-    one_diff = current_diffs.get(1)
-    one_total = (
-        one_theory + one_checker
-        if one_theory is not None and one_checker is not None
-        else None
-    )
-    one_weak = (
-        one_total is not None
-        and one_total < ONE_WEAK_TOTAL_THRESHOLD
-    )
+    one = final_rates.get(1)
+
+    if one:
+        one_total_adjustment = one["total_adjustment"]
+        one_final = one["final"]
+        one_weak = (
+            one_total_adjustment < ONE_WEAK_TOTAL_THRESHOLD
+        )
+    else:
+        one_total_adjustment = None
+        one_final = None
+        one_weak = False
 
     for boat in BUFF_TARGET_BOATS:
+        info = final_rates.get(boat)
         diff = current_diffs.get(boat)
-        theory_1st = theory.get(boat)
-        c = checker.get(boat)
 
-        if diff is None or theory_1st is None or not c:
+        if not info or diff is None:
             continue
 
-        checker_1st = c["checker_1st"]
-        total_boost = theory_1st + checker_1st
+        total_boost = info["total_adjustment"]
 
-        # 差のゾーンは問わない。現在ゾーンを正しく引いた上で、
-        # 理論＋チェッカーの合計がプラスなら「バフ」とする。
         if total_boost <= BUFF_MIN_TOTAL:
             continue
 
-        edge_vs_one = (
-            total_boost - one_total
-            if one_total is not None
+        edge_vs_one_final = (
+            info["final"] - one_final
+            if one_final is not None
             else None
         )
 
         buffs.append({
             "boat": boat,
             "current_diff": diff,
-            "theory_1st": theory_1st,
-            "checker_1st": checker_1st,
+            "zone": info["zone"],
+            "base_1st": info["base"],
+            "theory_1st": info["theory"],
+            "checker_1st": info["checker"],
             "total_boost": total_boost,
-            "zone": c["zone"],
-            "one_current_diff": one_diff,
-            "one_zone": one_zone,
-            "one_theory": one_theory,
-            "one_checker_1st": one_checker,
-            "one_total": one_total,
+            "final_1st": info["final"],
+            "one_final_1st": one_final,
+            "one_total_adjustment": one_total_adjustment,
             "one_weak": one_weak,
-            "edge_vs_one": edge_vs_one,
+            "edge_vs_one_final": edge_vs_one_final,
         })
 
     if not buffs:
         return None
 
-    # 1号艇が弱化しているケースを最優先。次に1号艇との差、対象艇の合計補正。
+    # 1号艇弱化を優先しつつ、
+    # その後は「最終補正1着率」「1号艇との差」で順位付け
     def buff_rank(x):
-        edge = x["edge_vs_one"]
+        edge = x["edge_vs_one_final"]
+
         return (
             1 if x["one_weak"] else 0,
+            x["final_1st"],
             edge if edge is not None else -999.0,
             x["total_boost"],
         )
 
     buffs.sort(key=buff_rank, reverse=True)
-    focus = [x["boat"] for x in buffs]
+
     best = buffs[0]
+    focus = [x["boat"] for x in buffs]
 
-    if best["one_total"] is not None:
-        weak_text = (
-            f"1号艇 {best['one_zone']} / "
-            f"理論 {best['one_theory']:+.1f}% + "
-            f"チェッカー {best['one_checker_1st']:+.1f}% "
-            f"= {best['one_total']:+.1f}%"
-        )
-        if best["one_weak"]:
-            weak_text += "で弱化"
-
+    if one:
         reason = (
-            f"{best['boat']}号艇は{best['zone']}ゾーンで "
-            f"理論 {best['theory_1st']:+.1f}% + "
-            f"チェッカー {best['checker_1st']:+.1f}% "
-            f"= 合計 {best['total_boost']:+.1f}%。"
-            f"{weak_text}、1号艇との差 {best['edge_vs_one']:+.1f}pt"
+            f"{best['boat']}号艇: 元 {best['base_1st']:.1f}% "
+            f"+ 理論 {best['theory_1st']:+.1f}% "
+            f"+ チェッカー {best['checker_1st']:+.1f}% "
+            f"= 最終 {best['final_1st']:.1f}%。"
+            f"1号艇は 元 {one['base']:.1f}% "
+            f"+ 理論 {one['theory']:+.1f}% "
+            f"+ チェッカー {one['checker']:+.1f}% "
+            f"= 最終 {one['final']:.1f}%。"
         )
+
+        if best["edge_vs_one_final"] is not None:
+            reason += (
+                f" 最終1着率の差 "
+                f"{best['edge_vs_one_final']:+.1f}pt"
+            )
+
+        if one_weak:
+            reason += (
+                f"。1号艇の補正合計 "
+                f"{one_total_adjustment:+.1f}%で弱化"
+            )
     else:
         reason = (
-            f"{best['boat']}号艇は{best['zone']}ゾーンで "
-            f"理論 {best['theory_1st']:+.1f}% + "
-            f"チェッカー {best['checker_1st']:+.1f}% "
-            f"= 合計 {best['total_boost']:+.1f}%"
+            f"{best['boat']}号艇: 元 {best['base_1st']:.1f}% "
+            f"+ 理論 {best['theory_1st']:+.1f}% "
+            f"+ チェッカー {best['checker_1st']:+.1f}% "
+            f"= 最終 {best['final_1st']:.1f}%"
         )
 
     return {
         "type": "独立バフ",
         "focus": focus,
         "buffs": buffs,
-        "one_current_diff": one_diff,
-        "one_zone": one_zone,
-        "one_theory": one_theory,
-        "one_checker_1st": one_checker,
-        "one_total": one_total,
+        "one": one,
         "one_weak": one_weak,
         "reason": reason,
     }
 
 
-def classify_theory(values):
+def classify_final_rates(final_rates):
     """
-    6艇全部を比較して、
-    1号艇有利 or 3・4号艇有利 のどちらかだけ返す。
+    6艇すべての「最終補正1着率」を比較して、
+    1号艇有利 or 3・4号艇有利 を返す。
     """
-
-    if len(values) < 6:
+    if len(final_rates) < 6:
         return None
+
+    values = {
+        boat: final_rates[boat]["final"]
+        for boat in range(1, 7)
+    }
 
     vals = list(values.values())
 
@@ -516,7 +653,7 @@ def classify_theory(values):
             "type": "1号艇有利",
             "focus": [1],
             "reason": (
-                f"1号艇が6艇中トップ。"
+                f"最終補正1着率で1号艇が6艇中トップ。"
                 f"3・4号艇の最大値より {b1 - best34:+.1f}pt、"
                 f"2番手より {b1 - second_best:+.1f}pt 優勢"
             )
@@ -528,7 +665,6 @@ def classify_theory(values):
     best_boat = 3 if b3 >= b4 else 4
     best_value = values[best_boat]
 
-    # 3・4以外の最大値
     best_other = max(
         values[1],
         values[2],
@@ -544,8 +680,6 @@ def classify_theory(values):
     ):
         focus = [best_boat]
 
-        # 3号艇・4号艇の両方が強く、
-        # 数値も近ければ両方注目表示
         other_boat = 4 if best_boat == 3 else 3
 
         if (
@@ -560,7 +694,7 @@ def classify_theory(values):
             "type": "3・4号艇有利",
             "focus": focus,
             "reason": (
-                f"{best_boat}号艇が6艇中トップ。"
+                f"最終補正1着率で{best_boat}号艇が6艇中トップ。"
                 f"1号艇より {best_value - b1:+.1f}pt、"
                 f"3・4以外の最上位より "
                 f"{best_value - best_other:+.1f}pt 優勢"
@@ -575,7 +709,7 @@ def notify_selected(
     venue,
     race,
     deadline_value,
-    theory_values,
+    final_rates,
     classification
 ):
     kind = classification["type"]
@@ -588,57 +722,56 @@ def notify_selected(
     else:
         symbol = "🔥"
 
-    lines = []
+    rate_lines = []
+
     for boat in range(1, 7):
+        x = final_rates.get(boat)
+
+        if not x:
+            continue
+
         mark = " ←注目" if boat in focus else ""
-        lines.append(
+
+        rate_lines.append(
             f"{boat}号艇 "
-            f"{theory_values[boat]:+g}%"
+            f"{x['base']:.1f}% "
+            f"+ 理論{x['theory']:+.1f}% "
+            f"+ チェッカー{x['checker']:+.1f}% "
+            f"= {x['final']:.1f}%"
             f"{mark}"
         )
 
     if kind == "独立バフ":
         buff_lines = []
+
         for b in classification["buffs"]:
             extra = ""
-            if b["boat"] != 1 and b["one_total"] is not None:
+
+            if b["edge_vs_one_final"] is not None:
                 extra = (
-                    f" / 1号艇合計 {b['one_total']:+.1f}%"
-                    f" / 差 {b['edge_vs_one']:+.1f}pt"
+                    f" / 1号艇最終 {b['one_final_1st']:.1f}%"
+                    f" / 差 {b['edge_vs_one_final']:+.1f}pt"
                 )
+
                 if b["one_weak"]:
                     extra += " ←1号艇弱化"
 
             buff_lines.append(
                 f"{b['boat']}号艇 "
-                f"平均との差 {b['current_diff']:+.2f} ({b['zone']}) / "
-                f"理論1着 {b['theory_1st']:+.1f}% / "
-                f"チェッカー1着 {b['checker_1st']:+.1f}% / "
-                f"合計 {b['total_boost']:+.1f}%"
+                f"平均との差 {b['current_diff']:+.2f} ({b['zone']})\n"
+                f"元 {b['base_1st']:.1f}% "
+                f"+ 理論 {b['theory_1st']:+.1f}% "
+                f"+ チェッカー {b['checker_1st']:+.1f}% "
+                f"= 最終 {b['final_1st']:.1f}%"
                 f"{extra}"
             )
-
-        one_breakdown = ""
-        if classification.get("one_total") is not None:
-            one_breakdown = (
-                "\n1号艇の弱化チェック\n"
-                f"平均との差 {classification.get('one_current_diff', 0):+.2f} "
-                f"({classification.get('one_zone') or 'ゾーン不明'}) / "
-                f"理論1着 {classification['one_theory']:+.1f}% "
-                f"+ チェッカー1着 {classification['one_checker_1st']:+.1f}% "
-                f"= 合計 {classification['one_total']:+.1f}%"
-            )
-            if classification.get("one_weak"):
-                one_breakdown += " ←弱化"
 
         body = (
             f"{symbol} シンsum独立バフ検知\n"
             f"{venue} {race}\n\n"
-            + "\n".join(buff_lines)
-            + one_breakdown
-            + "\n\n"
-            + "シンsum理論・1着\n"
-            + "\n".join(lines)
+            + "\n\n".join(buff_lines)
+            + "\n\n全艇・最終補正1着率\n"
+            + "\n".join(rate_lines)
             + "\n\n"
             + f"{classification['reason']}\n"
             + f"締切 {deadline_value}"
@@ -647,8 +780,8 @@ def notify_selected(
         body = (
             f"{symbol} {kind}\n"
             f"{venue} {race}【{alert}】\n\n"
-            f"シンsum理論・1着\n"
-            + "\n".join(lines)
+            f"全艇・最終補正1着率\n"
+            + "\n".join(rate_lines)
             + "\n\n"
             + f"{classification['reason']}\n"
             + f"締切 {deadline_value}"
@@ -694,23 +827,86 @@ def inspect(page):
     d = deadline(text)
     a = alert_near_deadline(text, d)
 
-    theory = parse_theory_1st(text)
+    # -----------------------------
+    # 3種類のデータを取得
+    # -----------------------------
+    base_rates = parse_base_1st_rates(text)
+    theory_adj = parse_theory_adjustments(text)
+    current_diffs = parse_current_diffs(text)
+    checker = parse_checker_1st(text, current_diffs)
 
-    # 6艇全部取れないレースは誤判定防止のため除外
-    if len(theory) < 6:
+    if len(base_rates) < 6:
         print(
-            f"シンsum理論6艇取得失敗: "
+            f"元1着率6艇取得失敗: "
             f"{v} / {r} / "
-            f"取得 {len(theory)}艇",
+            f"取得 {len(base_rates)}艇 / {base_rates}",
             flush=True
         )
         return None
 
+    if len(theory_adj) < 6:
+        print(
+            f"シンsum理論1着補正6艇取得失敗: "
+            f"{v} / {r} / "
+            f"取得 {len(theory_adj)}艇 / {theory_adj}",
+            flush=True
+        )
+        return None
+
+    if len(current_diffs) < 6:
+        print(
+            f"平均との差6艇取得失敗: "
+            f"{v} / {r} / "
+            f"取得 {len(current_diffs)}艇 / {current_diffs}",
+            flush=True
+        )
+        return None
+
+    if len(checker) < 6:
+        print(
+            f"シンsumチェッカー6艇取得失敗: "
+            f"{v} / {r} / "
+            f"取得 {len(checker)}艇 / {checker}",
+            flush=True
+        )
+        return None
+
+    final_rates = build_final_rates(
+        base_rates,
+        theory_adj,
+        checker
+    )
+
+    if len(final_rates) < 6:
+        print(
+            f"最終補正1着率6艇計算失敗: "
+            f"{v} / {r} / "
+            f"取得 {len(final_rates)}艇",
+            flush=True
+        )
+        return None
+
+    print(
+        f"最終補正1着率: {v} / {r} / "
+        + " | ".join(
+            f"{boat}号艇 "
+            f"{final_rates[boat]['base']:.1f}"
+            f"{final_rates[boat]['theory']:+.1f}"
+            f"{final_rates[boat]['checker']:+.1f}"
+            f"={final_rates[boat]['final']:.1f}%"
+            for boat in range(1, 7)
+        ),
+        flush=True
+    )
+
     # -----------------------------
-    # A. 従来: やや本命 / 荒れ注意から選別
+    # A. やや本命 / 荒れ注意
+    #    → 最終補正1着率で選別
     # -----------------------------
     if a:
-        classification = classify_theory(theory)
+        classification = classify_final_rates(
+            final_rates
+        )
 
         if classification:
             return {
@@ -718,7 +914,7 @@ def inspect(page):
                 "race": r,
                 "deadline": d,
                 "alert": a,
-                "theory": theory,
+                "final_rates": final_rates,
                 "classification": classification,
                 "key": (
                     f"{now():%Y-%m-%d}|"
@@ -727,21 +923,18 @@ def inspect(page):
             }
 
         print(
-            f"従来選別は対象外、独立バフを続けて確認: "
+            f"最終補正で従来選別は対象外、独立バフを続けて確認: "
             f"{a} / {v} / {r}",
             flush=True
         )
 
     # -----------------------------
-    # B. 全レース共通: 2〜4号艇の独立バフを検知
-    #    （やや本命/荒れ注意の有無に関係なく確認）
+    # B. 全レース共通
+    #    2〜4号艇の独立バフ
     # -----------------------------
-    current_diffs = parse_current_diffs(text)
-    checker = parse_checker_1st(text, current_diffs)
     classification = classify_buff(
-        theory,
-        current_diffs,
-        checker
+        final_rates,
+        current_diffs
     )
 
     if not classification:
@@ -752,8 +945,10 @@ def inspect(page):
         + ", ".join(
             f"{x['boat']}号艇 "
             f"差{x['current_diff']:+.2f} "
+            f"元{x['base_1st']:.1f}% "
             f"理論{x['theory_1st']:+.1f}% "
-            f"チェッカー{x['checker_1st']:+.1f}%"
+            f"チェッカー{x['checker_1st']:+.1f}% "
+            f"最終{x['final_1st']:.1f}%"
             for x in classification["buffs"]
         ),
         flush=True
@@ -764,12 +959,15 @@ def inspect(page):
         "race": r,
         "deadline": d,
         "alert": "",
-        "theory": theory,
+        "final_rates": final_rates,
         "classification": classification,
         "key": (
             f"{now():%Y-%m-%d}|"
             f"{v}|{r}|BUFF|"
-            + "-".join(str(x["boat"]) for x in classification["buffs"])
+            + "-".join(
+                str(x["boat"])
+                for x in classification["buffs"]
+            )
         )
     }
 
@@ -807,8 +1005,7 @@ def cycle(page, initial=False):
                 flush=True
             )
 
-    # 起動直後に既に存在している通知を
-    # 大量送信しないため既読登録
+    # 起動直後に既に存在している通知を大量送信しない
     if initial:
         seen.update(current.keys())
 
@@ -850,7 +1047,7 @@ def cycle(page, initial=False):
             x["venue"],
             x["race"],
             x["deadline"],
-            x["theory"],
+            x["final_rates"],
             x["classification"]
         )
 
@@ -883,8 +1080,9 @@ def main():
 
         print(
             f"[{now():%Y-%m-%d %H:%M:%S}] "
-            f"やや本命/荒れ注意選別 + "
-            f"2〜4号艇 ゾーン連動独立バフ監視開始",
+            f"最終補正1着率 "
+            f"(元1着率 + 理論補正 + チェッカー補正) "
+            f"監視開始",
             flush=True
         )
 
