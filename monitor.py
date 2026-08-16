@@ -590,10 +590,23 @@ def alert_near_deadline(text, d):
 
 def parse_base_1st_rates(text):
     """
-    「選手名・1着率」欄に明示された元1着率だけを取得する。
+    「選手名・1着率」欄に実際に表示されている元1着率だけを取得する。
 
-    改行型・同一行型の両方に対応。
-    「危険艇」以降の 12/13/14/15/16 は組み合わせ確率なので無視する。
+    艇番や改行位置には依存しない。
+    「選手名・1着率」から「危険艇」等の次セクションまでにある、
+    符号なしの%を上から順に 1号艇, 2号艇... と割り当てる。
+
+    例:
+      49%, 12%, 10%, 15%, 10%, 2%
+      -> {1:49, 2:12, 3:10, 4:15, 5:10, 6:2}
+
+    戸田7Rのように1・2号艇しか単独1着率が表示されていない場合:
+      54%, 17%
+      -> {1:54, 2:17}
+
+    「危険艇」以降の
+      12=1-2, 13=1-3, 14=1-4, 15=1-5, 16=1-6
+    の確率はセクション外に切り落とすので絶対に使用しない。
     """
     start = text.find("選手名・1着率")
     if start < 0:
@@ -613,32 +626,31 @@ def parse_base_1st_rates(text):
     end = min(end_candidates) if end_candidates else min(len(text), start + 6000)
     section = text[start:end]
 
-    boat_matches = list(re.finditer(
-        r"(?m)^\s*([1-6])(?=\s|$)",
+    # +11% / -8% のような補正値は除外。
+    # 元1着率は符号なしの%のみ。
+    pcts = re.findall(
+        r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
         section
-    ))
+    )
 
-    result = {}
+    values = []
+    for raw in pcts:
+        value = float(raw)
+        if 0.0 <= value <= 100.0:
+            values.append(value)
 
-    for idx, m in enumerate(boat_matches):
-        boat = int(m.group(1))
+    # 最大6艇まで。表示されている分だけ採用する。
+    values = values[:6]
 
-        block_end = (
-            boat_matches[idx + 1].start()
-            if idx + 1 < len(boat_matches)
-            else len(section)
-        )
-        block = section[m.end():block_end]
+    result = {
+        boat: values[boat - 1]
+        for boat in range(1, len(values) + 1)
+    }
 
-        pcts = re.findall(
-            r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
-            block
-        )
-
-        if pcts:
-            value = float(pcts[0])
-            if 0.0 <= value <= 100.0:
-                result[boat] = value
+    print(
+        f"元1着率候補: {values} -> {result}",
+        flush=True
+    )
 
     return result
 
@@ -1942,7 +1954,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V13 base-parse+buff-fix]",
+            f"監視開始 [V14 base-percent-order]",
             flush=True
         )
 
