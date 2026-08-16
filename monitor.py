@@ -590,30 +590,23 @@ def alert_near_deadline(text, d):
 
 def parse_base_1st_rates(text):
     """
-    選手一覧の「級別(A1/A2/B1/B2) → 1着率%」を使って
-    元1着率を取得する。
+    元1着率をページ上部の選手一覧から取得する。
 
-    V16:
-    - 「選手名・1着率」という見出し文字列には依存しない
-    - A1/A2/B1/B2 の級別を持つ選手行だけを見る
-    - 「危険艇」の 12/13/14/15/16 には級別が無いので混入しない
-    - 上から順に1〜6号艇へ割り当てる
-
-    例:
-      若林樹蘭 A2 ... 49%
-      山崎義明 A2 ... 12%
-      ...
-      -> {1:49, 2:12, ...}
+    V17:
+    - 「選手名・1着率」の見出しには依存しない
+    - A1/A2/B1/B2 の前後に空白が無くても拾う
+    - ページ先頭から「戦法別上昇率 / 危険艇 / シンsum理論」の
+      最初の出現までを選手一覧候補として見る
+    - 各級別の直後にある最初の符号なし%を元1着率として採用
+    - 12/13/14/15/16 の組み合わせ確率は級別を持たないため拾わない
     """
 
-    # シンsum理論など後段の表を混ぜないため、
-    # ページ上部〜選手一覧周辺だけに範囲を制限する。
+    # まず選手一覧があるページ上部だけに範囲を絞る。
     end_candidates = []
 
     for pattern in (
         r"戦法別上昇率",
         r"危険艇",
-        r"スリット隊形",
         r"シン\s*sum理論",
     ):
         m = re.search(pattern, text)
@@ -623,15 +616,14 @@ def parse_base_1st_rates(text):
     section_end = (
         min(end_candidates)
         if end_candidates
-        else min(len(text), 7000)
+        else min(len(text), 10000)
     )
 
     section = text[:section_end]
 
-    # 級別の直後〜次の級別までの範囲で、
-    # 最初に現れる「符号なし%」を元1着率とする。
+    # \b は日本語との境界で不安定なので使わない。
     grade_matches = list(re.finditer(
-        r"\b(?:A1|A2|B1|B2)\b",
+        r"(?:A1|A2|B1|B2)",
         section
     ))
 
@@ -646,7 +638,8 @@ def parse_base_1st_rates(text):
 
         block = section[gm.end():block_end]
 
-        # +11% / -8% のような補正値は除外。
+        # 元1着率は符号なしのxx%。
+        # +11% / -8% などの補正値は除外。
         m_pct = re.search(
             r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
             block
@@ -663,13 +656,31 @@ def parse_base_1st_rates(text):
         if len(values) >= 6:
             break
 
+    # もし級別方式で取れなかった場合は、
+    # 「戦法別上昇率」より上の符号なし%を最後の保険として使う。
+    # ただし舟券率などを混ぜないよう、候補が6個以上ある場合は
+    # 最後の6個を選手1着率候補とする。
+    if not values:
+        fallback_pcts = [
+            float(x)
+            for x in re.findall(
+                r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
+                section
+            )
+        ]
+
+        if len(fallback_pcts) >= 6:
+            values = fallback_pcts[-6:]
+
+    values = values[:6]
+
     result = {
         boat: values[boat - 1]
         for boat in range(1, len(values) + 1)
     }
 
     print(
-        f"元1着率候補(級別基準): {values} -> {result}",
+        f"元1着率候補(V17): {values} -> {result}",
         flush=True
     )
 
@@ -1975,7 +1986,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V16 grade-based-base]",
+            f"監視開始 [V17 base-parser-robust]",
             flush=True
         )
 
