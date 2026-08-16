@@ -104,6 +104,11 @@ RIVAL_FINAL_MIN = float(os.getenv("RIVAL_FINAL_MIN", "15.0"))
 #   2〜6号艇のどれかが最終1着率15%以上
 ONE_BIG_DROP_MIN = float(os.getenv("ONE_BIG_DROP_MIN", "15.0"))
 
+# 1号艇逃げ強化時の「対抗艇注意」判定
+# 元1着率が表示されていない艇でも、
+# 理論補正 + チェッカー補正 が15pt以上なら注意表示する。
+RIVAL_WARNING_BOOST_MIN = float(os.getenv("RIVAL_WARNING_BOOST_MIN", "15.0"))
+
 seen = set()
 pending_results = {}
 
@@ -1563,18 +1568,73 @@ def classify_escape_boost(final_rates):
     if strong_rivals:
         return None
 
+    # 元1着率が表示されていない艇でも、
+    # 「理論 + チェッカー」の補正合計が大きい場合は注意艇として残す。
+    warning_boats = []
+
+    for boat in range(2, 7):
+        info = final_rates.get(boat)
+        if not info:
+            continue
+
+        theory = info.get("theory")
+        checker = info.get("checker")
+
+        if theory is None or checker is None:
+            continue
+
+        boost = theory + checker
+
+        if boost >= RIVAL_WARNING_BOOST_MIN:
+            warning_boats.append({
+                "boat": boat,
+                "boost": boost,
+                "theory": theory,
+                "checker": checker,
+                "base": info.get("base"),
+                "final": info.get("final"),
+            })
+
+    warning_boats.sort(
+        key=lambda x: x["boost"],
+        reverse=True
+    )
+
+    kind = (
+        "1号艇逃げ強化・対抗艇注意"
+        if warning_boats
+        else "1号艇逃げ強化"
+    )
+
+    focus = [1] + [x["boat"] for x in warning_boats]
+
+    if warning_boats:
+        warning_text = " / ".join(
+            f"{x['boat']}号艇 補正合計{x['boost']:+.1f}pt"
+            for x in warning_boats
+        )
+        reason = (
+            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
+            f"（{rise:+.1f}pt）。最終75%以上かつ上昇。"
+            f"確認できる2〜6号艇に最終15%以上なし。"
+            f"ただし {warning_text} のため展示気配要確認"
+        )
+    else:
+        reason = (
+            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
+            f"（{rise:+.1f}pt）。最終75%以上かつ上昇。"
+            f"確認できる2〜6号艇に最終15%以上なし"
+        )
+
     return {
-        "type": "1号艇逃げ強化",
-        "focus": [1],
+        "type": kind,
+        "focus": focus,
         "one_base": base,
         "one_final": final,
         "one_change": rise,
         "strong_rivals": [],
-        "reason": (
-            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
-            f"（{rise:+.1f}pt）。最終75%以上かつ上昇。"
-            f"確認できる2〜6号艇に最終15%以上なし"
-        ),
+        "warning_boats": warning_boats,
+        "reason": reason,
     }
 
 
@@ -1814,6 +1874,8 @@ def notify_selected(
 
     if kind in ("1号艇有利", "1号艇逃げ強化"):
         symbol = "🟢"
+    elif kind == "1号艇逃げ強化・対抗艇注意":
+        symbol = "🟢⚠️"
     elif kind == "1号艇逃げ崩れ":
         symbol = "🔴"
     elif kind == "独立バフ":
@@ -1853,7 +1915,54 @@ def notify_selected(
 
         rate_lines.append(line + mark)
 
-    if kind == "独立バフ":
+    if kind in ("1号艇逃げ強化", "1号艇逃げ強化・対抗艇注意"):
+        one = final_rates.get(1, {})
+
+        body_lines = [
+            f"{symbol} {kind}",
+            f"{venue} {race}",
+            "",
+            "全艇・評価",
+        ]
+
+        for boat in range(1, 7):
+            info = final_rates.get(boat)
+            if not info:
+                continue
+
+            mark = " ←主注目" if boat == 1 else ""
+            if classification.get("warning_boats"):
+                if any(x["boat"] == boat for x in classification["warning_boats"]):
+                    mark = " ←⚠️注意"
+
+            if info.get("base") is not None and info.get("final") is not None:
+                body_lines.append(
+                    f"{boat}号艇 {info['base']:.1f}% + "
+                    f"理論 {info.get('theory', 0.0):+.1f}% + "
+                    f"チェッカー {info.get('checker', 0.0):+.1f}% "
+                    f"= {info['final']:.1f}%{mark}"
+                )
+            else:
+                boost = (
+                    (info.get("theory") or 0.0)
+                    + (info.get("checker") or 0.0)
+                )
+                body_lines.append(
+                    f"{boat}号艇 元1着率表示なし / "
+                    f"理論 {info.get('theory', 0.0):+.1f}% + "
+                    f"チェッカー {info.get('checker', 0.0):+.1f}% "
+                    f"= 補正合計 {boost:+.1f}pt{mark}"
+                )
+
+        body_lines += [
+            "",
+            classification["reason"],
+            f"締切 {deadline_value}",
+        ]
+
+        body = "\n".join(body_lines)
+
+    elif kind == "独立バフ":
         buff_lines = []
 
         for b in classification["buffs"]:
@@ -2386,7 +2495,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V25 constants-fix]",
+            f"監視開始 [V26 escape-warning-no-independent-buff]",
             flush=True
         )
 
