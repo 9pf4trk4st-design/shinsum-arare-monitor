@@ -590,89 +590,82 @@ def alert_near_deadline(text, d):
 
 def parse_base_1st_rates(text):
     """
-    元1着率をページ上部の選手一覧から取得する。
+    ページ上部の「選手名・1着率」欄から、明示された元1着率だけを取得する。
 
-    V17:
-    - 「選手名・1着率」の見出しには依存しない
-    - A1/A2/B1/B2 の前後に空白が無くても拾う
-    - ページ先頭から「戦法別上昇率 / 危険艇 / シンsum理論」の
-      最初の出現までを選手一覧候補として見る
-    - 各級別の直後にある最初の符号なし%を元1着率として採用
-    - 12/13/14/15/16 の組み合わせ確率は級別を持たないため拾わない
+    V18の重要修正:
+    ページ上部には「←シンsum理論に戻る」があるため、
+    ページ先頭から最初の「シンsum理論」を終了位置にすると
+    選手一覧より前で切れてしまう。
+
+    そこで、
+      1. 締切表示より後にある最初の「選手名」を開始点
+      2. その開始点より後にある
+         「危険艇 / 戦法別上昇率 / スリット隊形 / シンsum理論」
+         の最初を終了点
+    として、選手一覧だけを切り出す。
+
+    切り出した範囲の符号なし%を上から順に1〜6号艇へ割り当てる。
+    「危険艇」以降の12/13/14/15/16の組み合わせ確率は含めない。
     """
 
-    # まず選手一覧があるページ上部だけに範囲を絞る。
+    # 締切表示より後から選手一覧を探す。
+    deadline_pos = -1
+    m_deadline = re.search(
+        r"締切\s*[：:]?\s*(?:[01]?\d|2[0-3]):[0-5]\d",
+        text
+    )
+    if m_deadline:
+        deadline_pos = m_deadline.end()
+
+    # 「選手名・1着率」でも「選手名」単独でも対応。
+    search_from = max(0, deadline_pos)
+    m_header = re.search(
+        r"選手名(?:\s*[・･]\s*1着率)?",
+        text[search_from:]
+    )
+
+    if not m_header:
+        print(
+            "元1着率: 選手一覧開始位置を検出できず",
+            flush=True
+        )
+        return {}
+
+    section_start = search_from + m_header.start()
+
+    # 必ず section_start より後だけを検索する。
+    tail = text[section_start:]
     end_candidates = []
 
     for pattern in (
-        r"戦法別上昇率",
         r"危険艇",
+        r"戦法別上昇率",
+        r"スリット隊形",
         r"シン\s*sum理論",
     ):
-        m = re.search(pattern, text)
+        m = re.search(pattern, tail[1:])
         if m:
-            end_candidates.append(m.start())
+            end_candidates.append(
+                section_start + 1 + m.start()
+            )
 
     section_end = (
         min(end_candidates)
         if end_candidates
-        else min(len(text), 10000)
+        else min(len(text), section_start + 7000)
     )
 
-    section = text[:section_end]
+    section = text[section_start:section_end]
 
-    # \b は日本語との境界で不安定なので使わない。
-    grade_matches = list(re.finditer(
-        r"(?:A1|A2|B1|B2)",
-        section
-    ))
-
-    values = []
-
-    for idx, gm in enumerate(grade_matches):
-        block_end = (
-            grade_matches[idx + 1].start()
-            if idx + 1 < len(grade_matches)
-            else len(section)
-        )
-
-        block = section[gm.end():block_end]
-
-        # 元1着率は符号なしのxx%。
-        # +11% / -8% などの補正値は除外。
-        m_pct = re.search(
+    # 元1着率は符号なしの%。
+    # +11% / -8% のような上昇率・補正値は除外。
+    values = [
+        float(x)
+        for x in re.findall(
             r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
-            block
+            section
         )
-
-        if not m_pct:
-            continue
-
-        value = float(m_pct.group(1))
-
-        if 0.0 <= value <= 100.0:
-            values.append(value)
-
-        if len(values) >= 6:
-            break
-
-    # もし級別方式で取れなかった場合は、
-    # 「戦法別上昇率」より上の符号なし%を最後の保険として使う。
-    # ただし舟券率などを混ぜないよう、候補が6個以上ある場合は
-    # 最後の6個を選手1着率候補とする。
-    if not values:
-        fallback_pcts = [
-            float(x)
-            for x in re.findall(
-                r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
-                section
-            )
-        ]
-
-        if len(fallback_pcts) >= 6:
-            values = fallback_pcts[-6:]
-
-    values = values[:6]
+    ][:6]
 
     result = {
         boat: values[boat - 1]
@@ -680,9 +673,17 @@ def parse_base_1st_rates(text):
     }
 
     print(
-        f"元1着率候補(V17): {values} -> {result}",
+        f"元1着率候補(V18): {values} -> {result}",
         flush=True
     )
+
+    # 取得失敗時は切り出した本文も一部出して原因確認できるようにする。
+    if not result:
+        print(
+            "元1着率解析section:",
+            repr(section[:1200]),
+            flush=True
+        )
 
     return result
 
@@ -1986,7 +1987,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V17 base-parser-robust]",
+            f"監視開始 [V18 player-section-fix]",
             flush=True
         )
 
