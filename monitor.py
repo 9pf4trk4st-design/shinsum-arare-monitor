@@ -90,6 +90,20 @@ BUFF_MIN_TOTAL = float(os.getenv("BUFF_MIN_TOTAL", "0.0"))
 # 1号艇の「理論補正 + チェッカー補正」が0未満なら弱化扱い
 ONE_WEAK_TOTAL_THRESHOLD = float(os.getenv("ONE_WEAK_TOTAL_THRESHOLD", "0.0"))
 
+# 1号艇の逃げ強化 / 逃げ崩れ判定
+# 逃げ強化:
+#   元より上昇し、最終1着率が75%以上
+#   かつ、最終1着率が判明している2〜6号艇に15%以上がいない
+ESCAPE_FINAL_MIN = float(os.getenv("ESCAPE_FINAL_MIN", "75.0"))
+
+# 他艇の「強い対抗」判定
+RIVAL_FINAL_MIN = float(os.getenv("RIVAL_FINAL_MIN", "15.0"))
+
+# 逃げ崩れ:
+#   1号艇が元1着率から15pt以上低下し、
+#   2〜6号艇のどれかが最終1着率15%以上
+ONE_BIG_DROP_MIN = float(os.getenv("ONE_BIG_DROP_MIN", "15.0"))
+
 seen = set()
 pending_results = {}
 
@@ -2361,10 +2375,18 @@ def main():
             return
 
         print(
+            f"逃げ判定設定: "
+            f"逃げ強化最終>={ESCAPE_FINAL_MIN:.1f}% / "
+            f"対抗艇>={RIVAL_FINAL_MIN:.1f}% / "
+            f"逃げ崩れ低下>={ONE_BIG_DROP_MIN:.1f}pt",
+            flush=True
+        )
+
+        print(
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V24 escape-drop15]",
+            f"監視開始 [V25 constants-fix]",
             flush=True
         )
 
