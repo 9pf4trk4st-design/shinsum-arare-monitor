@@ -40,10 +40,15 @@ OUT_GAP_VS_1 = 8.0
 OUT_GAP_VS_OTHER = 5.0
 
 # 独立バフ検知（やや本命/荒れ注意が出ていないレースも対象）
-BUFF_TARGET_BOATS = (1, 2, 3, 4)
-BUFF_MIN_CURRENT_DIFF = 0.50
-BUFF_MIN_THEORY_1ST = 10.0
-BUFF_MIN_CHECKER_1ST = 5.0
+# 通知対象は2・3・4号艇。1号艇は比較・弱化判定用に必ず解析する。
+BUFF_TARGET_BOATS = (2, 3, 4)
+CHECKER_PARSE_BOATS = (1, 2, 3, 4)
+
+# 「平均との差」自体に固定の強弱判定は置かない。
+# 現在値が属するゾーン（+0.5以上 / 0〜+0.5 / -0.5〜0 / -0.5未満）を
+# 選手ごとのシンsumチェッカーから引き、その1着率補正とシンsum理論1着率を合算する。
+# 合算がプラスならバフ候補。必要なら環境変数で最低値を上げられる。
+BUFF_MIN_TOTAL = float(os.getenv("BUFF_MIN_TOTAL", "0.0"))
 
 # 2〜4号艇のバフ判定では、1号艇の弱化も加味する。
 # 「シンsum理論1着補正 + シンsumチェッカー1着補正」を合算し、
@@ -302,7 +307,7 @@ def parse_checker_1st(text, current_diffs):
     compact = re.sub(r"\s+", "", section)
     result = {}
 
-    for boat in BUFF_TARGET_BOATS:
+    for boat in CHECKER_PARSE_BOATS:
         if boat not in current_diffs:
             continue
 
@@ -355,30 +360,26 @@ def parse_checker_1st(text, current_diffs):
 
 def classify_buff(theory, current_diffs, checker):
     """
-    やや本命/荒れ注意が無くても通知する独立バフ判定。
+    2・3・4号艇の独立バフ判定。
 
-    基本条件:
-      - 1〜4号艇
-      - 現在の平均との差が +0.50以上
-      - シンsum理論の1着補正が +10%以上
-      - シンsumチェッカーの現在ゾーンの1着率が +5%以上
+    重要:
+      - 「平均との差 +0.5以上」のような固定条件では判定しない。
+      - 現在の平均との差が属するゾーンを選手ごとのチェッカーで確認する。
+      - 最終補正 = シンsum理論の1着率補正 + チェッカー該当ゾーンの1着率補正。
+      - 2・3・4号艇は最終補正がプラスならバフ候補。
+      - 1号艇も同じ方法で最終補正を計算し、マイナスなら弱化として強く加味する。
 
-    さらに2〜4号艇については、1号艇の弱化も加味する。
-      1号艇合計補正 = 1号艇シンsum理論1着 + 1号艇チェッカー1着
-    例: -3.0% + -1.7% = -4.7%
-
-    1号艇合計補正がマイナスなら「1号艇弱化あり」として優先度を上げる。
-    ただし、1号艇がマイナスでない場合でも対象艇自身のバフが十分強ければ
-    通知対象からは外さない。
+    例:
+      1号艇: 理論 -3.0 + チェッカー(0〜+0.5) -1.7 = -4.7
+      3号艇: 理論 +17.0 + チェッカー(+0.5以上) +6.4 = +23.4
     """
     buffs = []
 
     one_theory = theory.get(1)
     one_checker_info = checker.get(1)
-    one_checker = (
-        one_checker_info["checker_1st"]
-        if one_checker_info else None
-    )
+    one_checker = one_checker_info["checker_1st"] if one_checker_info else None
+    one_zone = one_checker_info["zone"] if one_checker_info else None
+    one_diff = current_diffs.get(1)
     one_total = (
         one_theory + one_checker
         if one_theory is not None and one_checker is not None
@@ -400,81 +401,87 @@ def classify_buff(theory, current_diffs, checker):
         checker_1st = c["checker_1st"]
         total_boost = theory_1st + checker_1st
 
-        if (
-            diff >= BUFF_MIN_CURRENT_DIFF
-            and theory_1st >= BUFF_MIN_THEORY_1ST
-            and checker_1st >= BUFF_MIN_CHECKER_1ST
-        ):
-            edge_vs_one = (
-                total_boost - one_total
-                if boat != 1 and one_total is not None
-                else None
-            )
+        # 差のゾーンは問わない。現在ゾーンを正しく引いた上で、
+        # 理論＋チェッカーの合計がプラスなら「バフ」とする。
+        if total_boost <= BUFF_MIN_TOTAL:
+            continue
 
-            buffs.append({
-                "boat": boat,
-                "current_diff": diff,
-                "theory_1st": theory_1st,
-                "checker_1st": checker_1st,
-                "total_boost": total_boost,
-                "zone": c["zone"],
-                "one_theory": one_theory,
-                "one_checker_1st": one_checker,
-                "one_total": one_total,
-                "one_weak": one_weak if boat != 1 else False,
-                "edge_vs_one": edge_vs_one,
-            })
+        edge_vs_one = (
+            total_boost - one_total
+            if one_total is not None
+            else None
+        )
+
+        buffs.append({
+            "boat": boat,
+            "current_diff": diff,
+            "theory_1st": theory_1st,
+            "checker_1st": checker_1st,
+            "total_boost": total_boost,
+            "zone": c["zone"],
+            "one_current_diff": one_diff,
+            "one_zone": one_zone,
+            "one_theory": one_theory,
+            "one_checker_1st": one_checker,
+            "one_total": one_total,
+            "one_weak": one_weak,
+            "edge_vs_one": edge_vs_one,
+        })
 
     if not buffs:
         return None
 
+    # 1号艇が弱化しているケースを最優先。次に1号艇との差、対象艇の合計補正。
     def buff_rank(x):
         edge = x["edge_vs_one"]
         return (
             1 if x["one_weak"] else 0,
             edge if edge is not None else -999.0,
             x["total_boost"],
-            x["checker_1st"],
         )
 
     buffs.sort(key=buff_rank, reverse=True)
-
     focus = [x["boat"] for x in buffs]
     best = buffs[0]
 
-    if best["boat"] != 1 and best["one_total"] is not None:
+    if best["one_total"] is not None:
         weak_text = (
-            f"1号艇合計 {best['one_total']:+.1f}%"
-            f"（理論 {best['one_theory']:+.1f}%"
-            f" + チェッカー {best['one_checker_1st']:+.1f}%）"
+            f"1号艇 {best['one_zone']} / "
+            f"理論 {best['one_theory']:+.1f}% + "
+            f"チェッカー {best['one_checker_1st']:+.1f}% "
+            f"= {best['one_total']:+.1f}%"
         )
         if best["one_weak"]:
             weak_text += "で弱化"
+
         reason = (
-            f"{best['boat']}号艇を中心にバフ検知。"
-            f"対象艇合計 {best['total_boost']:+.1f}%、"
-            f"{weak_text}、"
-            f"1号艇との差 {best['edge_vs_one']:+.1f}pt"
+            f"{best['boat']}号艇は{best['zone']}ゾーンで "
+            f"理論 {best['theory_1st']:+.1f}% + "
+            f"チェッカー {best['checker_1st']:+.1f}% "
+            f"= 合計 {best['total_boost']:+.1f}%。"
+            f"{weak_text}、1号艇との差 {best['edge_vs_one']:+.1f}pt"
         )
     else:
         reason = (
-            f"{best['boat']}号艇を中心にバフ検知。"
-            f"平均との差 {best['current_diff']:+.2f}、"
-            f"理論1着 {best['theory_1st']:+.1f}%、"
-            f"チェッカー1着 {best['checker_1st']:+.1f}%、"
-            f"合計 {best['total_boost']:+.1f}%"
+            f"{best['boat']}号艇は{best['zone']}ゾーンで "
+            f"理論 {best['theory_1st']:+.1f}% + "
+            f"チェッカー {best['checker_1st']:+.1f}% "
+            f"= 合計 {best['total_boost']:+.1f}%"
         )
 
     return {
         "type": "独立バフ",
         "focus": focus,
         "buffs": buffs,
+        "one_current_diff": one_diff,
+        "one_zone": one_zone,
         "one_theory": one_theory,
         "one_checker_1st": one_checker,
         "one_total": one_total,
         "one_weak": one_weak,
         "reason": reason,
     }
+
 
 def classify_theory(values):
     """
@@ -604,7 +611,7 @@ def notify_selected(
 
             buff_lines.append(
                 f"{b['boat']}号艇 "
-                f"平均との差 {b['current_diff']:+.2f} / "
+                f"平均との差 {b['current_diff']:+.2f} ({b['zone']}) / "
                 f"理論1着 {b['theory_1st']:+.1f}% / "
                 f"チェッカー1着 {b['checker_1st']:+.1f}% / "
                 f"合計 {b['total_boost']:+.1f}%"
@@ -615,6 +622,8 @@ def notify_selected(
         if classification.get("one_total") is not None:
             one_breakdown = (
                 "\n1号艇の弱化チェック\n"
+                f"平均との差 {classification.get('one_current_diff', 0):+.2f} "
+                f"({classification.get('one_zone') or 'ゾーン不明'}) / "
                 f"理論1着 {classification['one_theory']:+.1f}% "
                 f"+ チェッカー1着 {classification['one_checker_1st']:+.1f}% "
                 f"= 合計 {classification['one_total']:+.1f}%"
@@ -703,35 +712,29 @@ def inspect(page):
     if a:
         classification = classify_theory(theory)
 
-        if not classification:
-            print(
-                f"選別対象外: "
-                f"{a} / {v} / {r} / "
-                f"1={theory[1]:+g}% "
-                f"2={theory[2]:+g}% "
-                f"3={theory[3]:+g}% "
-                f"4={theory[4]:+g}% "
-                f"5={theory[5]:+g}% "
-                f"6={theory[6]:+g}%",
-                flush=True
-            )
-            return None
+        if classification:
+            return {
+                "venue": v,
+                "race": r,
+                "deadline": d,
+                "alert": a,
+                "theory": theory,
+                "classification": classification,
+                "key": (
+                    f"{now():%Y-%m-%d}|"
+                    f"{v}|{r}|{a}|{classification['type']}"
+                )
+            }
 
-        return {
-            "venue": v,
-            "race": r,
-            "deadline": d,
-            "alert": a,
-            "theory": theory,
-            "classification": classification,
-            "key": (
-                f"{now():%Y-%m-%d}|"
-                f"{v}|{r}|{a}|{classification['type']}"
-            )
-        }
+        print(
+            f"従来選別は対象外、独立バフを続けて確認: "
+            f"{a} / {v} / {r}",
+            flush=True
+        )
 
     # -----------------------------
-    # B. 新規: 通常レースでも1〜4号艇の独立バフを検知
+    # B. 全レース共通: 2〜4号艇の独立バフを検知
+    #    （やや本命/荒れ注意の有無に関係なく確認）
     # -----------------------------
     current_diffs = parse_current_diffs(text)
     checker = parse_checker_1st(text, current_diffs)
@@ -881,7 +884,7 @@ def main():
         print(
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"やや本命/荒れ注意選別 + "
-            f"1〜4号艇 独立バフ監視開始",
+            f"2〜4号艇 ゾーン連動独立バフ監視開始",
             flush=True
         )
 
