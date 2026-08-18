@@ -1920,6 +1920,13 @@ def notify_selected(
         else:
             mark = ""
 
+        diff = classification.get("current_diffs", {}).get(boat)
+        diff_text = (
+            f" / 平均との差 {diff:+.2f}"
+            if diff is not None
+            else " / 平均との差 データなし"
+        )
+
         if x["base"] is not None:
             line = (
                 f"{boat}号艇 "
@@ -1927,6 +1934,7 @@ def notify_selected(
                 f"+ 理論{x['theory']:+.1f}% "
                 f"+ チェッカー{x['checker']:+.1f}% "
                 f"= {x['final']:.1f}%"
+                f"{diff_text}"
             )
         else:
             line = (
@@ -1934,6 +1942,7 @@ def notify_selected(
                 f"理論{x['theory']:+.1f}% "
                 f"+ チェッカー{x['checker']:+.1f}% "
                 f"= 補正合計{x['total_adjustment']:+.1f}pt"
+                f"{diff_text}"
             )
 
         rate_lines.append(line + mark)
@@ -2472,7 +2481,7 @@ def main():
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             f"最終補正1着率 "
             f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V32 no-save-naruto-off-diff-notify]",
+            f"監視開始 [V33 diff-all-notifications]",
             flush=True
         )
 
