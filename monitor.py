@@ -1,4 +1,4 @@
-# V33: 初日・2日目限定 + スリット補正 + 1号艇1着予想時の2着率100%配分
+# V35: 初日・2日目限定 + スリット補正 + 1号艇1着予想時の2着率100%配分 + シンsumチェッカー2着補正【実反映修正】
 import os
 import re
 import time
@@ -73,7 +73,8 @@ SECOND_W_RECENT3 = float(os.getenv("SECOND_W_RECENT3", "0.05"))
 SECOND_W_ST = float(os.getenv("SECOND_W_ST", "0.08"))
 SECOND_W_DIFF = float(os.getenv("SECOND_W_DIFF", "0.06"))
 SECOND_W_SLIT = float(os.getenv("SECOND_W_SLIT", "0.04"))
-SECOND_THEORY2_MULT = float(os.getenv("SECOND_THEORY2_MULT", "0.80"))
+SECOND_THEORY2_MULT = float(os.getenv("SECOND_THEORY2_MULT", "1.00"))
+SECOND_CHECKER2_MULT = float(os.getenv("SECOND_CHECKER2_MULT", "1.00"))
 SECOND_F1_MULT = float(os.getenv("SECOND_F1_MULT", "0.82"))
 SECOND_F2_MULT = float(os.getenv("SECOND_F2_MULT", "0.70"))
 
@@ -1559,7 +1560,7 @@ def build_second_place_prediction(item):
 
     主材料:
       BOATERS: 1号艇先頭時2着率 / 直近10走1・2・3着率 / 平均ST
-      シンsum: 1-X出目率 / 2着補正 / 平均差 / スリット
+      シンsum: 1-X出目率 / 理論2着補正 / チェッカー2着補正 / 平均差 / スリット
       公式: 今期F数 / 平均ST
 
     外部サイト取得に失敗した項目はその艇の重みから外して再正規化する。
@@ -1646,9 +1647,16 @@ def build_second_place_prediction(item):
         else:
             score = 1.0
 
-        # シンsum2着補正はpt加算。例 +7% は素点へ +5.6pt（既定0.8倍）。
+        # シンsum2着補正はpt加算。
+        # V34: 理論2着 + チェッカー2着を合算して、そのまま2着評価へ反映。
+        # 例: 理論 +6.0 / チェッカー +3.8 → 合計 +9.8pt。
         theory2_val = float(theory2.get(b, 0.0) or 0.0)
-        score += theory2_val * SECOND_THEORY2_MULT
+        checker2_val = float(info.get("checker_2nd", 0.0) or 0.0)
+        total_second_adj = (
+            theory2_val * SECOND_THEORY2_MULT
+            + checker2_val * SECOND_CHECKER2_MULT
+        )
+        score += total_second_adj
 
         # 今期F数は公式のF数だけで判定。F持ちST欄などでは判定しない。
         f_count = int((official.get(b) or {}).get("f_count", 0) or 0)
@@ -1666,6 +1674,8 @@ def build_second_place_prediction(item):
             "recent3": recent3,
             "one_x": one_x_val,
             "theory2": theory2_val,
+            "checker2": checker2_val,
+            "total_second_adj": total_second_adj,
             "st": st_val,
             "f_count": f_count,
             "adjusted_diff": adj_diff,
@@ -1946,6 +1956,9 @@ def parse_single_checker_1st(text, boat, current_diff):
         "zone": zone,
         "matched_zone_text": matched,
         "checker_1st": float(pcts[0]),
+        # 該当ゾーン行は 1着率 / 2着率 / 3着率 / 3連対率 の順。
+        # 2着率が無い場合は0.0として扱う。
+        "checker_2nd": float(pcts[1]) if len(pcts) >= 2 else 0.0,
     }
 
 
@@ -2057,7 +2070,7 @@ def collect_checker_1st(page, current_diffs, registrations):
                 f"チェッカー取得成功: {boat}号艇 / "
                 f"{reg} / 差{diff:+.2f} / "
                 f"{got['zone']} / "
-                f"1着{got['checker_1st']:+.1f}%",
+                f"1着{got['checker_1st']:+.1f}% / 2着{got.get('checker_2nd', 0.0):+.1f}%",
                 flush=True
             )
         elif no_data:
@@ -2191,6 +2204,7 @@ def parse_checker_1st(text, current_diffs):
             "zone": zone,
             "matched_zone_text": matched_zone_text,
             "checker_1st": float(pcts[0]),
+            "checker_2nd": float(pcts[1]) if len(pcts) >= 2 else 0.0,
         }
 
     return result
@@ -2217,6 +2231,10 @@ def build_final_rates(base_rates, theory_adj, checker):
 
         base = base_rates.get(boat)
         checker_1st = checker_info["checker_1st"]
+        # V35: 2着率予測でも同じチェッカー行の2着補正を使うため、
+        # checker_2nd を final_rates に保持する。
+        # 例: 理論2着 +6.0 / チェッカー2着 +3.8 → 合計 +9.8pt。
+        checker_2nd = float(checker_info.get("checker_2nd", 0.0) or 0.0)
         total_adjustment = theory + checker_1st
 
         result[boat] = {
@@ -2224,6 +2242,7 @@ def build_final_rates(base_rates, theory_adj, checker):
             "base_known": base is not None,
             "theory": theory,
             "checker": checker_1st,
+            "checker_2nd": checker_2nd,
             "zone": checker_info["zone"],
             "total_adjustment": total_adjustment,
             "final": (
@@ -2840,7 +2859,11 @@ def notify_selected(
                 if detail.get("recent2") is not None:
                     extras.append(f"直近2着{detail['recent2']:.1f}")
                 if detail.get("theory2") is not None:
-                    extras.append(f"sum2着{detail['theory2']:+.1f}")
+                    extras.append(f"理論2着{detail['theory2']:+.1f}")
+                if detail.get("checker2") is not None:
+                    extras.append(f"チェッカー2着{detail['checker2']:+.1f}")
+                if detail.get("total_second_adj") is not None:
+                    extras.append(f"合計{detail['total_second_adj']:+.1f}")
                 if detail.get("f_count"):
                     extras.append(f"F{detail['f_count']}")
                 extra_text = " / " + " ".join(extras) if extras else ""
@@ -2942,7 +2965,11 @@ def notify_selected(
                 if detail.get("recent2") is not None:
                     extras.append(f"直近2着{detail['recent2']:.1f}")
                 if detail.get("theory2") is not None:
-                    extras.append(f"sum2着{detail['theory2']:+.1f}")
+                    extras.append(f"理論2着{detail['theory2']:+.1f}")
+                if detail.get("checker2") is not None:
+                    extras.append(f"チェッカー2着{detail['checker2']:+.1f}")
+                if detail.get("total_second_adj") is not None:
+                    extras.append(f"合計{detail['total_second_adj']:+.1f}")
                 if detail.get("f_count"):
                     extras.append(f"F{detail['f_count']}")
                 extra_text = " / " + " ".join(extras) if extras else ""
