@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
-from email.header import Header
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -474,198 +473,179 @@ def race_day_number(data):
 
 def evaluate_boat(boat, data, venue):
     """
-    2〜6号艇を「自艇 vs 左隣」で相対評価する。
+    「固定点数だけ」でチャンス判定しない。
 
-    特に重視する形:
-      左艇がスタート展示F
-      ＋ 自艇は展示Fではない
-      ＋ 自艇の展示タイムが左より速い
-      ＋ 自艇のST順位が左より良い
-      ＋ 自艇の今節平均STが左より速い
-      → 左艇の展示Fは本番再現性を割り引き、
-         自艇を「捲り/展開を作れるチャンス」として強く評価する。
+    まず自艇が左隣艇を叩ける根拠を数える。
+    必須根拠:
+      A. 展示タイムが左より良い
+      B. ST順位が左より良い
+      C. スタート展示で左より本番再現性が高い
+      D. 3日目以降のみ、今節平均STが左より良い
 
-    また、展示STが遅くても
-      今節平均STが速い / ST順位が良い
-    場合は「本番ST修正候補」として単純には切らない。
+    最低2個の根拠がない艇は、点数が高くても候補にしない。
+    scoreは候補同士の強弱を付ける補助値としてだけ使う。
     """
     left = boat - 1
-    me, le = data.get(boat, {}), data.get(left, {})
-    score, reasons = 0.0, []
+    me = data.get(boat, {})
+    le = data.get(left, {})
 
-    # 初日・2日目は今節平均STを展開判定に使わない。
-    # 3日目以降だけ今節平均STを追加材料として使う。
+    score = 0.0
+    reasons = []
+    attack_evidence = []
+    caution = []
+
     day_no = race_day_number(data)
     use_series_st = day_no is not None and day_no >= 3
 
-    me_series = me.get("series_st") if use_series_st else None
-    le_series = le.get("series_st") if use_series_st else None
-    me_st = me_series
-    le_st = le_series
+    # --- ST順位 ---
+    mr = avg_rank(me)
+    lr = avg_rank(le)
 
-    # ST順位（F持ち艇は avg_rank 内でF持ち順位も追加される）
-    mr, lr = avg_rank(me), avg_rank(le)
+    rank_edge = None
+    if mr is not None and lr is not None:
+        rank_edge = lr - mr  # +なら自艇が良い
+        if rank_edge >= 0.70:
+            score += 2.0
+            attack_evidence.append("ST順位優勢")
+            reasons.append(f"ST順位 左より{rank_edge:.2f}上")
+        elif rank_edge >= 0.30:
+            score += 1.0
+            attack_evidence.append("ST順位優勢")
+            reasons.append(f"ST順位 左より{rank_edge:.2f}上")
+        elif rank_edge <= -0.70:
+            score -= 1.5
+            caution.append("ST順位劣勢")
+            reasons.append(f"ST順位 左より{-rank_edge:.2f}下")
 
-    # スタート展示
+    # --- 展示タイム ---
+    mt = me.get("ex_time")
+    lt = le.get("ex_time")
+    time_edge = None
+    if mt is not None and lt is not None:
+        time_edge = lt - mt  # +なら自艇が速い
+        if time_edge >= EX_TIME_STRONG:
+            score += 2.5
+            attack_evidence.append("展示タイム優勢")
+            reasons.append(f"展示 左より{time_edge:.02f}速い")
+        elif time_edge >= EX_TIME_GOOD:
+            score += 1.5
+            attack_evidence.append("展示タイム優勢")
+            reasons.append(f"展示 左より{time_edge:.02f}速い")
+        elif time_edge <= -EX_TIME_STRONG:
+            score -= 1.2
+            caution.append("展示タイム劣勢")
+            reasons.append(f"展示 左より{-time_edge:.02f}遅い")
+
+    # --- スタート展示 ---
     exst = me.get("ex_st")
     lexst = le.get("ex_st")
 
-    # 展示タイム
-    mt, lt = me.get("ex_time"), le.get("ex_time")
+    # Fは数値どおりに比較しない。
+    # 左F・自艇非Fなら「左の展示STは本番再現性を割り引く」。
+    if lexst is not None and lexst < 0:
+        reasons.append(f"左艇 展示F{abs(lexst):.02f} → 本番再現性割引")
 
-    # ---------- 1. 今節ST / 平常STの左隣比較 ----------
-    st_edge = None
-    if me_st is not None and le_st is not None:
-        st_edge = le_st - me_st  # +なら自艇が速い
-        if st_edge >= ST_EDGE_STRONG:
-            score += 2.5
-            reasons.append(f"今節ST左より{st_edge:.02f}速い(3日目以降)")
-        elif st_edge >= ST_EDGE_GOOD:
+        if exst is not None and exst >= 0:
+            attack_evidence.append("スタート展示再現性優勢")
             score += 1.5
-            reasons.append(f"今節ST左より{st_edge:.02f}速い(3日目以降)")
-        elif st_edge <= -ST_EDGE_STRONG:
-            score -= 2.0
-            reasons.append(f"今節ST左より{-st_edge:.02f}遅い(3日目以降)")
-        elif st_edge <= -ST_EDGE_GOOD:
-            score -= 1.0
+            reasons.append("自艇は非F → 左より本番ST再現性あり")
 
-    # ---------- 2. ST順位の左隣比較 ----------
-    rank_edge = None
-    if mr is not None and lr is not None:
-        rank_edge = lr - mr  # +なら自艇順位が良い
-        if rank_edge >= 0.70:
-            score += 2.0
-            reasons.append(f"ST順位左より{rank_edge:.2f}上")
-        elif rank_edge >= 0.30:
-            score += 1.0
-            reasons.append(f"ST順位左より{rank_edge:.2f}上")
-        elif rank_edge <= -0.70:
-            score -= 1.5
-            reasons.append(f"ST順位左より{-rank_edge:.2f}下")
-
-    # ---------- 3. 展示タイムの左隣比較 ----------
-    time_edge = None
-    if mt is not None and lt is not None:
-        time_edge = lt - mt  # +なら自艇の展示タイムが速い
-        if time_edge >= EX_TIME_STRONG:
-            score += 2.5
-            reasons.append(f"展示左より{time_edge:.02f}速い")
-        elif time_edge >= EX_TIME_GOOD:
-            score += 1.5
-            reasons.append(f"展示左より{time_edge:.02f}速い")
-        elif time_edge <= -EX_TIME_STRONG:
-            score -= 1.2
-
-    # ---------- 4. 自艇のスタート展示 ----------
-    naturally_fast = (
-        (me_st is not None and me_st <= FAST_ST)
-        or (mr is not None and mr <= 2.8)
-    )
-
-    if exst is not None:
-        if exst < 0:
-            fdepth = abs(exst)
-            # 展示Fは「速い」とそのまま加点しない。
-            # 元々STが速い選手の浅い展示Fなら大幅減点もしない。
-            if naturally_fast and fdepth <= ALLOW_EX_F:
-                score += 0.3
-                reasons.append(f"展示F{fdepth:.02f}(元ST速い・再現性割引)")
-            elif not naturally_fast:
-                score -= 1.5
-                reasons.append(f"展示F{fdepth:.02f}再現性注意")
-            else:
-                score -= 0.5
-                reasons.append(f"展示F{fdepth:.02f}深め")
-        elif exst <= 0.08:
-            score += 1.0
-            reasons.append(f"展示ST{exst:.02f}")
-        elif exst >= 0.18:
-            # 展示で遅れても、今節ST/ST順位が速ければ本番修正候補。
-            correction = (
-                (use_series_st and me_st is not None and me_st <= FAST_ST)
-                or (mr is not None and mr <= 2.8)
-            )
-            if correction:
-                score += 0.4
-                reasons.append(f"展示ST{exst:.02f}遅れ→本番修正候補")
-            else:
-                score -= 0.8
-                reasons.append(f"展示ST{exst:.02f}遅め")
-
-    # ---------- 5. 「左艇が展示F → 右艇が捲れる」相対判定 ----------
-    # 左艇がFを切った展示STは、本番で同じ踏み込みを再現する前提にしない。
-    # 自艇が非Fで、展示タイム・ST順位・今節STでも左より優勢なら強い捲り候補。
-    left_ex_f = lexst is not None and lexst < 0
-    me_ex_not_f = exst is not None and exst >= 0
-    time_better = time_edge is not None and time_edge >= EX_TIME_GOOD
-    rank_better = rank_edge is not None and rank_edge >= 0.30
-    series_better = (
-        use_series_st
-        and st_edge is not None
-        and st_edge >= ST_EDGE_GOOD
-    )
-
-    if left_ex_f:
-        reasons.append(f"左艇展示F{abs(lexst):.02f}→本番再現性割引")
-
-        advantages = sum([
-            bool(me_ex_not_f),
-            bool(time_better),
-            bool(rank_better),
-            bool(series_better),
-        ])
-
-        # 初日・2日目:
-        #   今節平均STは使わず、展示タイム＋当地/初日ST順位＋展示STで判断。
-        # 3日目以降:
-        #   今節平均ST優勢も追加条件にする。
-        if (
-            me_ex_not_f
-            and time_better
-            and rank_better
-            and (series_better if use_series_st else True)
-        ):
-            score += 4.0
-            if use_series_st:
-                reasons.append("左展示F＋非F＋展示/ST順位/今節ST優勢→捲り強チャンス")
-            else:
-                reasons.append("左展示F＋非F＋展示＋当地/初日ST順位優勢→捲り強チャンス")
-        elif me_ex_not_f and advantages >= (3 if use_series_st else 2):
-            score += 2.0
-            reasons.append("左展示F＋複数優勢→捲りチャンス")
-        elif me_ex_not_f and advantages >= 2:
-            score += 0.8
-            reasons.append("左展示F→展開利候補")
-
-    # ---------- 6. 自艇展示遅れの「本番巻き返し」 ----------
-    # 展示ST単発より、今節STとST順位がともに良ければ本番修正を評価。
-    if (
-        use_series_st
-        and exst is not None and exst >= 0.15
-        and me_st is not None and me_st <= FAST_ST
-        and mr is not None and mr <= 2.8
+    elif (
+        exst is not None and lexst is not None
+        and exst >= 0 and lexst >= 0
     ):
-        score += 1.2
-        reasons.append("展示遅れでも今節ST＋ST順位良好→本番巻き返し")
+        # 非F同士なら0.03以上先行をスタート展示根拠とする。
+        ex_edge = lexst - exst
+        if ex_edge >= 0.03:
+            attack_evidence.append("スタート展示優勢")
+            score += 1.5
+            reasons.append(f"展示ST 左より{ex_edge:.02f}先行")
+        elif ex_edge <= -0.05:
+            caution.append("スタート展示劣勢")
+            score -= 0.8
+            reasons.append(f"展示ST 左より{-ex_edge:.02f}遅れ")
 
-    # ---------- 7. F持ち確認 ----------
-    # F持ちは一律に強く消さず、F持ち順位まで確認して補正。
+    # 自艇が展示Fの場合は、平常のST順位から再現性を判定。
+    if exst is not None and exst < 0:
+        fdepth = abs(exst)
+        naturally_fast = mr is not None and mr <= 2.8
+
+        if naturally_fast and fdepth <= ALLOW_EX_F:
+            score += 0.2
+            reasons.append(
+                f"自艇 展示F{fdepth:.02f}だがST順位良好 → 頭候補は維持"
+            )
+        else:
+            score -= 1.2
+            caution.append("自艇展示F再現性注意")
+            reasons.append(f"自艇 展示F{fdepth:.02f} → 本番再現性注意")
+
+    # 展示STで遅れてもST順位上位なら、本番修正候補。
+    if exst is not None and exst >= 0.15 and mr is not None and mr <= 2.8:
+        score += 0.5
+        reasons.append("展示ST遅れだがST順位上位 → 本番修正候補")
+
+    # --- 今節平均ST：3日目以降のみ ---
+    me_series = me.get("series_st") if use_series_st else None
+    le_series = le.get("series_st") if use_series_st else None
+
+    if me_series is not None and le_series is not None:
+        st_edge = le_series - me_series
+
+        if st_edge >= ST_EDGE_STRONG:
+            score += 2.0
+            attack_evidence.append("今節ST優勢")
+            reasons.append(f"今節ST 左より{st_edge:.02f}速い")
+        elif st_edge >= ST_EDGE_GOOD:
+            score += 1.0
+            attack_evidence.append("今節ST優勢")
+            reasons.append(f"今節ST 左より{st_edge:.02f}速い")
+        elif st_edge <= -ST_EDGE_STRONG:
+            score -= 1.5
+            caution.append("今節ST劣勢")
+            reasons.append(f"今節ST 左より{-st_edge:.02f}遅い")
+
+    # --- F持ち艇だけF持ち順位を加味 ---
     if me.get("f_count", 0) >= 1:
-        score -= 0.7
         fr = me.get("f_rank")
+        score -= 0.5
+        reasons.append(f"F持ち{me.get('f_count', 0)}")
+
         if fr is not None:
             if fr <= 2.5:
-                score += 1.2
+                score += 1.0
                 reasons.append(f"F持ち順位{fr:.2f}良好")
-            elif fr <= 3.2:
-                score += 0.4
-                reasons.append(f"F持ち順位{fr:.2f}")
             elif fr >= 4.0:
                 score -= 0.8
+                caution.append("F持ち順位遅め")
                 reasons.append(f"F持ち順位{fr:.2f}遅め")
-        reasons.append(f"F持ち{me['f_count']}")
 
-    return score, reasons
+    # 同じ種類は1根拠として数える。
+    attack_evidence = list(dict.fromkeys(attack_evidence))
+    caution = list(dict.fromkeys(caution))
+
+    # 強い捲り形:
+    # 左が展示F + 自艇非F + 展示タイム優勢 + ST順位優勢
+    strong_pattern = (
+        lexst is not None and lexst < 0
+        and exst is not None and exst >= 0
+        and "展示タイム優勢" in attack_evidence
+        and "ST順位優勢" in attack_evidence
+    )
+
+    if strong_pattern:
+        score += 1.5
+        reasons.append("左展示F＋展示タイム＋ST順位優勢 → 捲り形強い")
+
+    return {
+        "score": score,
+        "reasons": reasons,
+        "attack_evidence": attack_evidence,
+        "attack_hits": len(attack_evidence),
+        "caution": caution,
+        "strong_pattern": strong_pattern,
+        "day_no": day_no,
+    }
 
 def merge_data(*sources):
     out = {i: {} for i in range(1, 7)}
@@ -1359,30 +1339,56 @@ def _zone_variants(zone):
 
 
 def chance_candidates(venue, race, data):
+    """
+    候補条件:
+      - 左艇を叩ける根拠が最低2個
+      - scoreは順位付け用。固定5点を超えたかどうかだけでは決めない。
+
+    これにより「点数だけ高いが、実際に左を叩ける根拠が薄い艇」を除外する。
+    """
     arr = []
+
     for b in range(2, 7):
-        score, reasons = evaluate_boat(b, data, venue)
-        day_no = race_day_number(data)
-        use_series_st = day_no is not None and day_no >= 3
-        me_st = data.get(b, {}).get("series_st") if use_series_st else None
-        left_st = (
-            data.get(b - 1, {}).get("series_st")
-            if use_series_st and b > 1 else None
-        )
-        st_audit = (
-            f"今節ST={me_st:.2f} 左={left_st:.2f} / "
-            if me_st is not None and left_st is not None
-            else "今節ST=判定不使用 / "
-        )
+        ev = evaluate_boat(b, data, venue)
+
         print(
-            f"[展開指数] {venue}{race}R {b}号艇={score:.1f}点 / "
-            + st_audit
-            + " / ".join(reasons),
+            f"[展開判定] {venue}{race}R {b}号艇 "
+            f"根拠={ev['attack_hits']}個 "
+            f"補助点={ev['score']:.1f} "
+            f"根拠内容={','.join(ev['attack_evidence']) or '-'} "
+            f"注意={','.join(ev['caution']) or '-'}",
             flush=True,
         )
-        if score >= CHANCE_SCORE:
-            arr.append({"boat": b, "score": score, "reasons": reasons})
-    arr.sort(key=lambda x: x["score"], reverse=True)
+
+        # ★ここが新しい必須条件
+        if ev["attack_hits"] < 2:
+            print(
+                f"[除外] {venue}{race}R {b}号艇 "
+                "左艇を叩ける根拠が2個未満",
+                flush=True,
+            )
+            continue
+
+        row = {
+            "boat": b,
+            "score": ev["score"],
+            "reasons": ev["reasons"],
+            "attack_evidence": ev["attack_evidence"],
+            "attack_hits": ev["attack_hits"],
+            "strong_pattern": ev["strong_pattern"],
+            "caution": ev["caution"],
+        }
+        arr.append(row)
+
+    arr.sort(
+        key=lambda x: (
+            1 if x["strong_pattern"] else 0,
+            x["attack_hits"],
+            x["score"],
+        ),
+        reverse=True,
+    )
+
     return arr
 
 def shinsum_confirmation(page, venue, race, boats):
@@ -1518,26 +1524,35 @@ def data_ready(data, venue):
 
 def final_chance_type(candidate, shin_row):
     """
-    主判定は 展示→スタート展示→ST順位→展開力。
-    シンsumは最後の確認。
+    最終通知判定。
 
-    - シンsum理論+チェッカーがプラスなら「1着チャンス」
-    - 主判定がかなり強い場合は、シンsumが弱くても「展開チャンス」
-    - どちらにも当たらなければ通知しない
+    前提:
+      左艇を叩ける根拠2個以上は既に満たしている。
+
+    1着チャンス:
+      シンsum理論 + チェッカーの1着補正がプラス。
+
+    展開チャンス:
+      シンsumがプラスでなくても、
+      ・強い捲り形
+      または
+      ・左艇を叩ける根拠3個以上
+      のときだけ残す。
+
+    単にscoreが高いだけでは通知しない。
     """
-    score = candidate["score"]
+    hits = candidate.get("attack_hits", 0)
+    strong = candidate.get("strong_pattern", False)
 
     if shin_row:
         total = shin_row.get("total")
         if total is not None and total > 0:
             return "1着チャンス"
 
-    # ST・展示・左比較がかなり強い艇は展開を作る候補として残す
-    if score >= CHANCE_SCORE + 1.0:
+    if strong or hits >= 3:
         return "展開チャンス"
 
     return None
-
 
 def notify_chance(venue, race, selected, data, shin):
     """
@@ -1545,12 +1560,15 @@ def notify_chance(venue, race, selected, data, shin):
       [{"boat":4, "score":..., "reasons":[...], "kind":"1着チャンス"}, ...]
     """
     best = selected[0]
-    title = f"🚤 {best['boat']}号艇 {best['kind']}"
+    display_title = f"🚤 {best['boat']}号艇 {best['kind']}"
+    title = "ANA Chance Bot"
 
     lines = [
+        display_title,
         f"{venue} {race}R",
         "",
         f"注目: {best['boat']}号艇 / {best['kind']}",
+        f"左艇を叩ける根拠: {best.get('attack_hits', 0)}個",
         "【展開判断】",
         " / ".join(best["reasons"][:7]) or "総合評価",
     ]
@@ -1642,22 +1660,18 @@ def notify_chance(venue, race, selected, data, shin):
 
     body = "\n".join(lines)
 
-    # 日本語・絵文字タイトルをそのままHTTPヘッダーへ入れると
-    # requests側でUnicodeEncodeErrorになるため、RFC2047でASCII化する。
-    safe_title = str(Header(title, "utf-8"))
-
     r = requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=body.encode("utf-8"),
         headers={
-            "Title": safe_title,
+            "Title": title,
             "Priority": "high",
             "Tags": "boat",
         },
         timeout=12,
     )
     r.raise_for_status()
-    print(f"[NOTIFY] {title} / {venue}{race}R", flush=True)
+    print(f"[NOTIFY] {display_title} / {venue}{race}R", flush=True)
 
 def analyze_current_page(page, venue, race):
     """
