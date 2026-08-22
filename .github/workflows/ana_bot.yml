@@ -41,4 +41,4 @@ jobs:
           ANA_BIG_SCORE: "7.0"
           PYTHONUNBUFFERED: "1"
 
-        run: python ana_bot_v4_diagnostic.py
+        run: python ana_bot_v3_all_days_retry.py
