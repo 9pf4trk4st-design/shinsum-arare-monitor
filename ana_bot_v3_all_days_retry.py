@@ -51,6 +51,8 @@ session = requests.Session()
 session.headers.update(HEADERS)
 _seen = set()
 _attempt_state = {}
+_pending_shinsum = {}
+_shinsum_state = {}
 
 def now():
     return datetime.now(JST)
@@ -1588,38 +1590,81 @@ def notify_chance(venue, race, selected, data, shin):
     print(f"[NOTIFY] {title} / {venue}{race}R", flush=True)
 
 def analyze_current_page(page, venue, race):
-    # ① 展示タイム
-    # ② スタート展示
+    """
+    前半判定だけ行う。
+    ① 展示タイム
+    ② スタート展示
+    ③ ボートレース日和ST順位・今節ST・F持ち順位
+    ④ 左隣比較から「捲れる/展開を作れる」候補抽出
+
+    シンsum最終確認はここでは行わず、別フェーズに分離する。
+    """
     ex = official_exhibition(venue, race)
-
-    # F持ち/公式平均STは補助
     official = official_avg_st_f(venue, race)
-
-    # ③ ボートレース日和 ST順位（必須）
     hiyori = hiyori_st_data(page, venue, race)
-
     data = merge_data(official, hiyori, ex)
 
     if not data_ready(data, venue):
-        return False
+        return {"status": "not_ready"}
 
-    # ④ 左隣比較から「展開を作れる / 捲れる」候補を出す
     candidates = chance_candidates(venue, race, data)
 
     if not candidates:
         print(f"[NO-CHANCE] {venue}{race}R 展開候補なし", flush=True)
-        return True
+        return {"status": "done_no_chance"}
 
-    # ⑤ 最後にシンsum理論 + シンsumチェッカーで1着率を確認
+    print(
+        f"[PRESCREEN] {venue}{race}R 候補="
+        + "・".join(f"{x['boat']}号艇({x['score']:.1f})" for x in candidates),
+        flush=True,
+    )
+
+    return {
+        "status": "candidate",
+        "candidates": candidates,
+        "data": data,
+    }
+
+
+def shinsum_is_ready(shin, candidates):
+    """
+    候補艇のうち少なくとも1艇で
+    シンsum理論 + シンsumチェッカーの両方が取れれば最終審査可能。
+    """
+    for c in candidates:
+        row = shin.get(c["boat"])
+        if not row:
+            continue
+        if row.get("theory") is not None and row.get("checker") is not None:
+            return True
+    return False
+
+
+def finalize_with_shinsum(page, venue, race, candidates, data):
+    """
+    シンsum理論 + シンsumチェッカーを取得し、
+    反映済みなら最終判定・通知する。
+
+    戻り値:
+      "not_ready" : シンsum未反映
+      "done"      : 最終判定完了（通知あり/なし）
+    """
     boats = [x["boat"] for x in candidates]
     shin = shinsum_confirmation(page, venue, race, boats)
 
+    if not shinsum_is_ready(shin, candidates):
+        print(f"[SHINSUM-WAIT] {venue}{race}R 理論/チェッカー未反映", flush=True)
+        return "not_ready"
+
     selected = []
+
     for c in candidates:
-        kind = final_chance_type(c, shin.get(c["boat"]))
+        srow = shin.get(c["boat"])
+        kind = final_chance_type(c, srow)
+
         total = None
-        if shin.get(c["boat"]):
-            total = shin[c["boat"]].get("total")
+        if srow:
+            total = srow.get("total")
 
         print(
             f"[FINAL] {venue}{race}R {c['boat']}号艇 "
@@ -1636,9 +1681,8 @@ def analyze_current_page(page, venue, race):
 
     if not selected:
         print(f"[NO-NOTIFY] {venue}{race}R 最終条件届かず", flush=True)
-        return True
+        return "done"
 
-    # 1着チャンスを優先、その中で展開scoreの高い順。
     selected.sort(
         key=lambda x: (
             1 if x["kind"] == "1着チャンス" else 0,
@@ -1648,7 +1692,7 @@ def analyze_current_page(page, venue, race):
     )
 
     notify_chance(venue, race, selected, data, shin)
-    return True
+    return "done"
 
 def remain_minutes_from_text(text):
     d = deadline(text)
@@ -1660,6 +1704,17 @@ def remain_minutes_from_text(text):
     return (t - now()).total_seconds() / 60.0
 
 def cycle(page):
+    """
+    前半:
+      締切15分前 → データ不足なら13分前 → 11分前
+      展示/ST/日和ST順位/F持ち順位で候補を確定
+
+    後半:
+      候補が出たレースだけシンsumを確認
+      未反映なら 9分前 → 7分前 → 5分前 に再取得
+
+    終了済みレースはログにも出さず完全除外。
+    """
     links = candidate_links(page)
     print(f"[CYCLE] {now():%H:%M:%S} 詳細候補リンク={len(links)}", flush=True)
 
@@ -1670,20 +1725,96 @@ def cycle(page):
             page.goto(link, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(350)
 
-            text = page.locator("body").inner_text(timeout=10000)
-            venue = actual_venue(text)
-            rr = actual_race(text)
+            body = page.locator("body").inner_text(timeout=10000)
+            venue = actual_venue(body)
+            rr = actual_race(body)
 
             if not venue or not rr:
                 continue
 
             race = int(rr[:-1])
-            remain = remain_minutes_from_text(text)
+            remain = remain_minutes_from_text(body)
 
             if remain is None:
                 continue
 
+            # 終了済みレースは完全除外。
+            if remain <= 0:
+                continue
+
             key = (today, venue, race)
+
+            # ----------------------------------------------------------
+            # A. シンsum待ちフェーズ（候補確定済み）
+            # ----------------------------------------------------------
+            if key in _pending_shinsum:
+                ss_state = _shinsum_state.get(key, 0)
+
+                if ss_state >= 3:
+                    continue
+
+                # シンsum再取得時刻: 9 → 7 → 5分前
+                ss_target = {0: 9.0, 1: 7.0, 2: 5.0}[ss_state]
+
+                # まだその時刻より早い
+                if remain > ss_target:
+                    continue
+
+                # 5分前を大きく過ぎたら終了
+                if remain < 3.0:
+                    print(
+                        f"[SHINSUM-GIVEUP] {venue}{race}R "
+                        "5分前までに理論/チェッカー未反映",
+                        flush=True,
+                    )
+                    _shinsum_state[key] = 3
+                    _pending_shinsum.pop(key, None)
+                    _attempt_state[key] = 9
+                    continue
+
+                pending = _pending_shinsum[key]
+                ss_attempt = ss_state + 1
+
+                print(
+                    f"[SHINSUM-TRY] {venue}{race}R {ss_attempt}回目 "
+                    f"/ 残り{remain:.1f}分 / 目標{int(ss_target)}分前",
+                    flush=True,
+                )
+
+                result = finalize_with_shinsum(
+                    page,
+                    venue,
+                    race,
+                    pending["candidates"],
+                    pending["data"],
+                )
+
+                if result == "done":
+                    _shinsum_state[key] = 9
+                    _pending_shinsum.pop(key, None)
+                    _attempt_state[key] = 9
+                else:
+                    _shinsum_state[key] = ss_attempt
+                    if ss_attempt < 3:
+                        nxt = 7 if ss_attempt == 1 else 5
+                        print(
+                            f"[SHINSUM-RETRY] {venue}{race}R → {nxt}分前",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[SHINSUM-GIVEUP] {venue}{race}R "
+                            "5分前でも未反映 → 今回は通知見送り",
+                            flush=True,
+                        )
+                        _pending_shinsum.pop(key, None)
+                        _attempt_state[key] = 9
+
+                continue
+
+            # ----------------------------------------------------------
+            # B. 前半の展示/ST審査フェーズ
+            # ----------------------------------------------------------
             state = _attempt_state.get(key, 0)
 
             if state == 9 or state >= 3:
@@ -1691,29 +1822,31 @@ def cycle(page):
 
             target = {0: 15.0, 1: 13.0, 2: 11.0}[state]
 
+            # 15分前より早いレースはまだ何もしない
+            if remain > target:
+                continue
+
+            # 前半判定の締切は11分前。そこを過ぎた新規レースは見送る。
+            if remain < 9.0:
+                _attempt_state[key] = 3
+                continue
+
             print(
                 f"[RACE] {venue}{race}R 残り{remain:.1f}分 state={state}",
                 flush=True,
             )
 
-            if remain > target:
-                continue
-
-            if remain < 9.0:
-                _attempt_state[key] = 3
-                continue
-
             attempt = state + 1
-
             print(
                 f"[TRY] {venue}{race}R {attempt}回目 / "
                 f"目標{int(target)}分前",
                 flush=True,
             )
 
-            if analyze_current_page(page, venue, race):
-                _attempt_state[key] = 9
-            else:
+            result = analyze_current_page(page, venue, race)
+            status = result.get("status")
+
+            if status == "not_ready":
                 _attempt_state[key] = attempt
 
                 if attempt < 3:
@@ -1724,7 +1857,46 @@ def cycle(page):
                     )
                 else:
                     print(
-                        f"[GIVEUP] {venue}{race}R 3回目もデータ不足",
+                        f"[GIVEUP] {venue}{race}R "
+                        "11分前でも展示/STデータ不足",
+                        flush=True,
+                    )
+
+            elif status == "done_no_chance":
+                _attempt_state[key] = 9
+
+            elif status == "candidate":
+                # 候補はここで保存。シンsumは「今すぐ1回」確認する。
+                _pending_shinsum[key] = {
+                    "candidates": result["candidates"],
+                    "data": result["data"],
+                }
+
+                print(
+                    f"[SHINSUM-CHECK] {venue}{race}R "
+                    "候補確定 → シンsum理論/チェッカー確認",
+                    flush=True,
+                )
+
+                ss_result = finalize_with_shinsum(
+                    page,
+                    venue,
+                    race,
+                    result["candidates"],
+                    result["data"],
+                )
+
+                if ss_result == "done":
+                    _attempt_state[key] = 9
+                    _shinsum_state[key] = 9
+                    _pending_shinsum.pop(key, None)
+                else:
+                    # 未反映なら前半審査は終了し、次は9分前まで待つ。
+                    _attempt_state[key] = 3
+                    _shinsum_state[key] = 0
+                    print(
+                        f"[SHINSUM-PENDING] {venue}{race}R "
+                        "未反映 → 9→7→5分前に再確認",
                         flush=True,
                     )
 
@@ -1734,7 +1906,7 @@ def cycle(page):
 def main():
     print(
         "ANA チャンスBOT開始 / 全開催日 / "
-        "15→13→11分前 / 最後にシンsum1着確認",
+        "前半15→13→11分 / シンsum未反映は9→7→5分で再確認",
         flush=True,
     )
 
