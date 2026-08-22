@@ -2,7 +2,6 @@ name: ANA Middle/Longshot Bot
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: "0 23 * * *"
     - cron: "50 4 * * *"
@@ -42,4 +41,4 @@ jobs:
           ANA_BIG_SCORE: "7.0"
           PYTHONUNBUFFERED: "1"
 
-        run: python ana_bot_v3_all_days_retry.py
+        run: python ana_bot_v4_diagnostic.py
