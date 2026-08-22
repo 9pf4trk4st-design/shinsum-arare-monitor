@@ -213,134 +213,347 @@ def _rank_after_label(text, label, boat):
                 return v
     return None
 
+def _row_numbers(cells, lo, hi):
+    vals = []
+    for cell in cells:
+        s = re.sub(r"\s+", " ", str(cell)).strip()
+        for m in re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", s):
+            try:
+                v = float(m.group(1))
+            except Exception:
+                continue
+            if lo <= v <= hi:
+                vals.append(v)
+    return vals
+
+
+def _row_numbers(cells, lo, hi):
+    vals = []
+    for cell in cells:
+        s = re.sub(r"\s+", " ", str(cell)).strip()
+        for m in re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", s):
+            try:
+                v = float(m.group(1))
+            except Exception:
+                continue
+            if lo <= v <= hi:
+                vals.append(v)
+    return vals
+
+
 def hiyori_st_data(venue, race):
     """
-    ボートレース日和出走表から ST順位系を取得。
-    必須: 当地ST順位 / 初日ST順位
-    ナイター場のみ: ナイターST順位
-    今節平均STはページにあれば取得、無ければ公式平均STを補助に使う。
+    ボートレース日和のST順位表を取得する。
+
+    基本判定:
+      - 当地
+      - 初日
+      - ナイター（ナイター開催場のみ）
+
+    F持ち艇だけ追加判定:
+      - F持ち順位
+
+    直近1ヶ月/3ヶ月・最終日は判定に使わない。
     """
     place = TARGET_VENUES[venue]
     hd = now().strftime("%Y%m%d")
-    url = f"https://kyoteibiyori.com/race_shusso.php?place_no={place}&race_no={race}&hiduke={hd}"
+    url = (
+        "https://kyoteibiyori.com/race_shusso.php"
+        f"?place_no={place}&race_no={race}&hiduke={hd}"
+    )
+
     try:
-        r = session.get(url, timeout=12)
+        r = session.get(url, timeout=15)
         r.raise_for_status()
-        txt = clean_text(r.text)
+        raw = r.text
     except Exception as e:
-        print("日和ST取得失敗", venue, race, repr(e), flush=True)
+        print(f"[HIYORI-ERR] {venue}{race}R {e!r}", flush=True)
         return {}
 
     out = {i: {} for i in range(1, 7)}
-    labels = {
-        "local_rank": ["当地ST順位", "当地 ST順位", "当地"],
-        "firstday_rank": ["初日ST順位", "初日 ST順位", "初日"],
+    found = {
+        "local_rank": False,
+        "firstday_rank": False,
+        "night_rank": False,
+        "f_rank": False,
     }
+
+    for tb in tables(raw):
+        for row in tb:
+            if not row:
+                continue
+
+            label = re.sub(r"\s+", "", str(row[0]))
+            nums = _row_numbers(row[1:], 1.0, 6.0)
+
+            key = None
+
+            if label == "当地" or label.startswith("当地ST"):
+                key = "local_rank"
+            elif label == "初日" or label.startswith("初日ST"):
+                key = "firstday_rank"
+            elif venue in NIGHT_VENUES and (
+                label == "ナイター" or label.startswith("ナイターST")
+            ):
+                key = "night_rank"
+            elif label == "F持" or label == "F持ち" or label.startswith("F持"):
+                key = "f_rank"
+
+            if key and len(nums) >= 6:
+                for b, v in enumerate(nums[:6], 1):
+                    out[b][key] = float(v)
+                found[key] = True
+
+            if label in ("平均ST", "今節平均ST"):
+                sts = _row_numbers(row[1:], 0.00, 0.40)
+                if len(sts) >= 6:
+                    for b, v in enumerate(sts[:6], 1):
+                        out[b]["series_st"] = float(v)
+
+    # 本文フォールバック
+    txt = clean_text(raw)
+    fallback_specs = [
+        ("local_rank", "当地"),
+        ("firstday_rank", "初日"),
+        ("f_rank", "F持"),
+    ]
     if venue in NIGHT_VENUES:
-        labels["night_rank"] = ["ナイターST順位", "ナイター ST順位", "ナイター"]
+        fallback_specs.append(("night_rank", "ナイター"))
 
-    for b in range(1, 7):
-        for key, variants in labels.items():
-            for lab in variants:
-                v = _rank_after_label(txt, lab, b)
-                if v is not None:
-                    out[b][key] = v
-                    break
+    for key, label in fallback_specs:
+        if found.get(key):
+            continue
 
-    # 今節平均ST: ラベル周辺で艇別 .xx を拾う。取れない時は None。
-    pos = txt.find("今節平均ST")
-    if pos >= 0:
-        block = txt[pos:pos+2200]
-        for b in range(1, 7):
-            m = re.search(rf"{b}\s*号艇.{{0,120}}?(0\.\d{{2}})", block, re.S)
-            if m:
-                out[b]["series_st"] = float(m.group(1))
+        m = re.search(
+            rf"(?:^|\s){re.escape(label)}(?:ち)?\s+"
+            r"([1-6](?:\.\d+)?)\s+([1-6](?:\.\d+)?)\s+"
+            r"([1-6](?:\.\d+)?)\s+([1-6](?:\.\d+)?)\s+"
+            r"([1-6](?:\.\d+)?)\s+([1-6](?:\.\d+)?)",
+            txt,
+        )
+
+        if m:
+            vals = [float(x) for x in m.groups()]
+            for b, v in enumerate(vals, 1):
+                out[b][key] = v
+            found[key] = True
+
+    local_n = sum(out[b].get("local_rank") is not None for b in range(1, 7))
+    first_n = sum(out[b].get("firstday_rank") is not None for b in range(1, 7))
+    night_n = sum(out[b].get("night_rank") is not None for b in range(1, 7))
+    f_n = sum(out[b].get("f_rank") is not None for b in range(1, 7))
+
+    if venue in NIGHT_VENUES:
+        print(
+            f"[HIYORI-ST] {venue}{race}R 当地={local_n}/6 初日={first_n}/6 "
+            f"ナイター={night_n}/6 F持順位={f_n}/6",
+            flush=True,
+        )
+    else:
+        print(
+            f"[HIYORI-ST] {venue}{race}R 当地={local_n}/6 初日={first_n}/6 "
+            f"F持順位={f_n}/6",
+            flush=True,
+        )
 
     return out
 
 def avg_rank(d):
-    vals = [d.get("local_rank"), d.get("firstday_rank")]
+    """
+    基本ST順位:
+      当地 + 初日
+      ナイター場では + ナイター
+
+    F持ち艇だけ:
+      + F持ち順位
+
+    f_count が0なら F持ち順位は無視する。
+    """
+    vals = [
+        d.get("local_rank"),
+        d.get("firstday_rank"),
+    ]
+
     if d.get("night_rank") is not None:
-        vals.append(d["night_rank"])
+        vals.append(d.get("night_rank"))
+
+    if d.get("f_count", 0) >= 1 and d.get("f_rank") is not None:
+        vals.append(d.get("f_rank"))
+
     vals = [v for v in vals if v is not None]
-    return sum(vals)/len(vals) if vals else None
+
+    return sum(vals) / len(vals) if vals else None
 
 def evaluate_boat(boat, data, venue):
     """
-    自艇 vs 左隣。
-    正のscoreほど「左を叩いて展開を作れる」。
+    2〜6号艇を「自艇 vs 左隣」で相対評価する。
+
+    特に重視する形:
+      左艇がスタート展示F
+      ＋ 自艇は展示Fではない
+      ＋ 自艇の展示タイムが左より速い
+      ＋ 自艇のST順位が左より良い
+      ＋ 自艇の今節平均STが左より速い
+      → 左艇の展示Fは本番再現性を割り引き、
+         自艇を「捲り/展開を作れるチャンス」として強く評価する。
+
+    また、展示STが遅くても
+      今節平均STが速い / ST順位が良い
+    場合は「本番ST修正候補」として単純には切らない。
     """
     left = boat - 1
     me, le = data.get(boat, {}), data.get(left, {})
     score, reasons = 0.0, []
 
-    # 1) 元々のスタート力 / 今節平均ST
-    me_st = me.get("series_st", me.get("avg_st"))
-    le_st = le.get("series_st", le.get("avg_st"))
+    # 今節平均STを最優先。取れない場合のみ通常平均STへフォールバック。
+    me_series = me.get("series_st")
+    le_series = le.get("series_st")
+    me_st = me_series if me_series is not None else me.get("avg_st")
+    le_st = le_series if le_series is not None else le.get("avg_st")
+
+    # ST順位（F持ち艇は avg_rank 内でF持ち順位も追加される）
+    mr, lr = avg_rank(me), avg_rank(le)
+
+    # スタート展示
+    exst = me.get("ex_st")
+    lexst = le.get("ex_st")
+
+    # 展示タイム
+    mt, lt = me.get("ex_time"), le.get("ex_time")
+
+    # ---------- 1. 今節ST / 平常STの左隣比較 ----------
+    st_edge = None
     if me_st is not None and le_st is not None:
-        edge = le_st - me_st  # +なら自艇が速い
-        if edge >= ST_EDGE_STRONG:
-            score += 2.5; reasons.append(f"ST左より{edge:.02f}速い")
-        elif edge >= ST_EDGE_GOOD:
-            score += 1.5; reasons.append(f"ST左より{edge:.02f}速い")
-        elif edge <= -ST_EDGE_STRONG:
-            score -= 2.0; reasons.append(f"ST左より{-edge:.02f}遅い")
-        elif edge <= -ST_EDGE_GOOD:
+        st_edge = le_st - me_st  # +なら自艇が速い
+        if st_edge >= ST_EDGE_STRONG:
+            score += 2.5
+            reasons.append(f"今節ST左より{st_edge:.02f}速い")
+        elif st_edge >= ST_EDGE_GOOD:
+            score += 1.5
+            reasons.append(f"今節ST左より{st_edge:.02f}速い")
+        elif st_edge <= -ST_EDGE_STRONG:
+            score -= 2.0
+            reasons.append(f"今節ST左より{-st_edge:.02f}遅い")
+        elif st_edge <= -ST_EDGE_GOOD:
             score -= 1.0
 
-    # 2) ST順位: 当地 + 初日 + (ナイター時だけナイター)
-    mr, lr = avg_rank(me), avg_rank(le)
+    # ---------- 2. ST順位の左隣比較 ----------
+    rank_edge = None
     if mr is not None and lr is not None:
         rank_edge = lr - mr  # +なら自艇順位が良い
         if rank_edge >= 0.70:
-            score += 2.0; reasons.append(f"ST順位左より{rank_edge:.2f}上")
+            score += 2.0
+            reasons.append(f"ST順位左より{rank_edge:.2f}上")
         elif rank_edge >= 0.30:
-            score += 1.0; reasons.append(f"ST順位左より{rank_edge:.2f}上")
+            score += 1.0
+            reasons.append(f"ST順位左より{rank_edge:.2f}上")
         elif rank_edge <= -0.70:
             score -= 1.5
+            reasons.append(f"ST順位左より{-rank_edge:.2f}下")
 
-    # 3) スタート展示。「Fだから消し」はしない。
-    exst = me.get("ex_st")
-    naturally_fast = (me_st is not None and me_st <= FAST_ST) or (mr is not None and mr <= 2.8)
+    # ---------- 3. 展示タイムの左隣比較 ----------
+    time_edge = None
+    if mt is not None and lt is not None:
+        time_edge = lt - mt  # +なら自艇の展示タイムが速い
+        if time_edge >= EX_TIME_STRONG:
+            score += 2.5
+            reasons.append(f"展示左より{time_edge:.02f}速い")
+        elif time_edge >= EX_TIME_GOOD:
+            score += 1.5
+            reasons.append(f"展示左より{time_edge:.02f}速い")
+        elif time_edge <= -EX_TIME_STRONG:
+            score -= 1.2
+
+    # ---------- 4. 自艇のスタート展示 ----------
+    naturally_fast = (
+        (me_st is not None and me_st <= FAST_ST)
+        or (mr is not None and mr <= 2.8)
+    )
+
     if exst is not None:
         if exst < 0:
             fdepth = abs(exst)
+            # 展示Fは「速い」とそのまま加点しない。
+            # 元々STが速い選手の浅い展示Fなら大幅減点もしない。
             if naturally_fast and fdepth <= ALLOW_EX_F:
-                score += 1.5
-                reasons.append(f"展示F{fdepth:.02f}許容(元ST速い)")
+                score += 0.3
+                reasons.append(f"展示F{fdepth:.02f}(元ST速い・再現性割引)")
             elif not naturally_fast:
                 score -= 1.5
                 reasons.append(f"展示F{fdepth:.02f}再現性注意")
-            elif fdepth > ALLOW_EX_F:
+            else:
                 score -= 0.5
+                reasons.append(f"展示F{fdepth:.02f}深め")
         elif exst <= 0.08:
-            score += 1.0; reasons.append(f"展示ST{exst:.02f}")
+            score += 1.0
+            reasons.append(f"展示ST{exst:.02f}")
         elif exst >= 0.18:
-            score -= 0.8
+            # 展示で遅れても、今節ST/ST順位が速ければ本番修正候補。
+            correction = (
+                (me_st is not None and me_st <= FAST_ST)
+                or (mr is not None and mr <= 2.8)
+            )
+            if correction:
+                score += 0.4
+                reasons.append(f"展示ST{exst:.02f}遅れ→本番修正候補")
+            else:
+                score -= 0.8
+                reasons.append(f"展示ST{exst:.02f}遅め")
 
-    # 左隣の展示Fが「普段遅いのにF」なら、自艇には追い風
-    lexst = le.get("ex_st")
-    left_st = le_st
-    left_rank = lr
-    left_naturally_fast = (left_st is not None and left_st <= FAST_ST) or (left_rank is not None and left_rank <= 2.8)
-    if lexst is not None and lexst < 0 and not left_naturally_fast:
-        score += 1.0
-        reasons.append("左艇は展示Fだが平常ST弱め")
+    # ---------- 5. 「左艇が展示F → 右艇が捲れる」相対判定 ----------
+    # 左艇がFを切った展示STは、本番で同じ踏み込みを再現する前提にしない。
+    # 自艇が非Fで、展示タイム・ST順位・今節STでも左より優勢なら強い捲り候補。
+    left_ex_f = lexst is not None and lexst < 0
+    me_ex_not_f = exst is not None and exst >= 0
+    time_better = time_edge is not None and time_edge >= EX_TIME_GOOD
+    rank_better = rank_edge is not None and rank_edge >= 0.30
+    series_better = st_edge is not None and st_edge >= ST_EDGE_GOOD
 
-    # 4) 展示タイム: 左より良ければ強い
-    mt, lt = me.get("ex_time"), le.get("ex_time")
-    if mt is not None and lt is not None:
-        tedge = lt - mt  # +なら自艇が速い
-        if tedge >= EX_TIME_STRONG:
-            score += 2.5; reasons.append(f"展示左より{tedge:.02f}速い")
-        elif tedge >= EX_TIME_GOOD:
-            score += 1.5; reasons.append(f"展示左より{tedge:.02f}速い")
-        elif tedge <= -EX_TIME_STRONG:
-            score -= 1.2
+    if left_ex_f:
+        reasons.append(f"左艇展示F{abs(lexst):.02f}→本番再現性割引")
 
-    # 5) F持ちは軽い減点。ただし展示Fとは別物。
+        advantages = sum([
+            bool(me_ex_not_f),
+            bool(time_better),
+            bool(rank_better),
+            bool(series_better),
+        ])
+
+        if me_ex_not_f and time_better and rank_better and series_better:
+            score += 4.0
+            reasons.append("左展示F＋非F＋展示/ST順位/今節ST優勢→捲り強チャンス")
+        elif me_ex_not_f and advantages >= 3:
+            score += 2.0
+            reasons.append("左展示F＋複数優勢→捲りチャンス")
+        elif me_ex_not_f and advantages >= 2:
+            score += 0.8
+            reasons.append("左展示F→展開利候補")
+
+    # ---------- 6. 自艇展示遅れの「本番巻き返し」 ----------
+    # 展示ST単発より、今節STとST順位がともに良ければ本番修正を評価。
+    if (
+        exst is not None and exst >= 0.15
+        and me_st is not None and me_st <= FAST_ST
+        and mr is not None and mr <= 2.8
+    ):
+        score += 1.2
+        reasons.append("展示遅れでも今節ST＋ST順位良好→本番巻き返し")
+
+    # ---------- 7. F持ち確認 ----------
+    # F持ちは一律に強く消さず、F持ち順位まで確認して補正。
     if me.get("f_count", 0) >= 1:
         score -= 0.7
+        fr = me.get("f_rank")
+        if fr is not None:
+            if fr <= 2.5:
+                score += 1.2
+                reasons.append(f"F持ち順位{fr:.2f}良好")
+            elif fr <= 3.2:
+                score += 0.4
+                reasons.append(f"F持ち順位{fr:.2f}")
+            elif fr >= 4.0:
+                score -= 0.8
+                reasons.append(f"F持ち順位{fr:.2f}遅め")
         reasons.append(f"F持ち{me['f_count']}")
 
     return score, reasons
@@ -1098,46 +1311,137 @@ def shinsum_confirmation(page, venue, race, boats):
         }
     return out
 
-def data_ready(data):
-    et = sum(data[b].get("ex_time") is not None for b in range(1, 7))
-    es = sum(data[b].get("ex_st") is not None for b in range(1, 7))
-    st = sum(
-        data[b].get("series_st") is not None
-        or data[b].get("avg_st") is not None
-        or avg_rank(data[b]) is not None
-        for b in range(1, 7)
-    )
-    print(f"[DATA] 展示={et}/6 展示ST={es}/6 ST系={st}/6", flush=True)
-    return et >= 5 and es >= 5 and st >= 5
+def data_ready(data, venue):
+    """
+    必須データ:
+      1) 展示タイム
+      2) スタート展示
+      3) ボートレース日和ST順位（当地 + 初日）
+      4) ナイター場ならナイターST順位
+      5) F持ち艇がいる場合、その艇のF持ち順位
 
-def notify_chance(venue, race, candidates, data, shin):
-    best = candidates[0]
-    title = f"🚤 {best['boat']}号艇 チャンス"
+    最初にF持ちかどうかを確認し、
+    F持ち艇だけF持ち順位を必須にする。
+    """
+    ex_time = sum(data[b].get("ex_time") is not None for b in range(1, 7))
+    ex_st = sum(data[b].get("ex_st") is not None for b in range(1, 7))
+    series_st = sum(data[b].get("series_st") is not None for b in range(1, 7))
+    local = sum(data[b].get("local_rank") is not None for b in range(1, 7))
+    firstday = sum(data[b].get("firstday_rank") is not None for b in range(1, 7))
+    night = sum(data[b].get("night_rank") is not None for b in range(1, 7))
+
+    f_boats = [
+        b for b in range(1, 7)
+        if data[b].get("f_count", 0) >= 1
+    ]
+
+    missing_f_rank = [
+        b for b in f_boats
+        if data[b].get("f_rank") is None
+    ]
+
+    print(
+        "[F-CHECK] F持ち=" +
+        ("・".join(f"{b}号艇" for b in f_boats) if f_boats else "なし"),
+        flush=True,
+    )
+
+    if f_boats:
+        print(
+            "[F-RANK] " +
+            " / ".join(
+                f"{b}号艇={data[b].get('f_rank', '-')}"
+                for b in f_boats
+            ),
+            flush=True,
+        )
+
+    if venue in NIGHT_VENUES:
+        print(
+            f"[DATA] 展示={ex_time}/6 展示ST={ex_st}/6 今節ST={series_st}/6 "
+            f"当地ST順位={local}/6 初日ST順位={firstday}/6 "
+            f"ナイターST順位={night}/6 "
+            f"F持順位不足={missing_f_rank}",
+            flush=True,
+        )
+        rank_ready = local >= 5 and firstday >= 5 and night >= 5
+    else:
+        print(
+            f"[DATA] 展示={ex_time}/6 展示ST={ex_st}/6 今節ST={series_st}/6 "
+            f"当地ST順位={local}/6 初日ST順位={firstday}/6 "
+            f"F持順位不足={missing_f_rank}",
+            flush=True,
+        )
+        rank_ready = local >= 5 and firstday >= 5
+
+    return (
+        ex_time >= 5
+        and ex_st >= 5
+        and series_st >= 5
+        and rank_ready
+        and not missing_f_rank
+    )
+
+def final_chance_type(candidate, shin_row):
+    """
+    主判定は 展示→スタート展示→ST順位→展開力。
+    シンsumは最後の確認。
+
+    - シンsum理論+チェッカーがプラスなら「1着チャンス」
+    - 主判定がかなり強い場合は、シンsumが弱くても「展開チャンス」
+    - どちらにも当たらなければ通知しない
+    """
+    score = candidate["score"]
+
+    if shin_row:
+        total = shin_row.get("total")
+        if total is not None and total > 0:
+            return "1着チャンス"
+
+    # ST・展示・左比較がかなり強い艇は展開を作る候補として残す
+    if score >= CHANCE_SCORE + 1.0:
+        return "展開チャンス"
+
+    return None
+
+
+def notify_chance(venue, race, selected, data, shin):
+    """
+    selected:
+      [{"boat":4, "score":..., "reasons":[...], "kind":"1着チャンス"}, ...]
+    """
+    best = selected[0]
+    title = f"🚤 {best['boat']}号艇 {best['kind']}"
 
     lines = [
         f"{venue} {race}R",
         "",
-        f"注目: {best['boat']}号艇 / 指数 {best['score']:.1f}",
-        " / ".join(best["reasons"][:6]) or "総合評価",
+        f"注目: {best['boat']}号艇 / {best['kind']}",
+        "【展開判断】",
+        " / ".join(best["reasons"][:7]) or "総合評価",
     ]
 
-    if len(candidates) > 1:
+    if len(selected) > 1:
         lines.append(
             "他候補: "
             + "・".join(
-                f"{x['boat']}号艇({x['score']:.1f})"
-                for x in candidates[1:3]
+                f"{x['boat']}号艇 {x['kind']}"
+                for x in selected[1:3]
             )
         )
 
-    lines += ["", "【ST・展示】"]
+    lines += ["", "【展示→スタート展示→ST順位】"]
 
     for b in range(1, 7):
         d = data.get(b, {})
-        stv = d.get("series_st", d.get("avg_st"))
         exst = d.get("ex_st")
         ext = d.get("ex_time")
-        rr = avg_rank(d)
+        local = d.get("local_rank")
+        firstday = d.get("firstday_rank")
+        night = d.get("night_rank")
+        f_count = d.get("f_count", 0)
+        f_rank = d.get("f_rank")
+        series_st = d.get("series_st")
 
         if exst is None:
             exs = "-"
@@ -1146,18 +1450,36 @@ def notify_chance(venue, race, candidates, data, shin):
         else:
             exs = f"{exst:.02f}"
 
-        rr_text = f"{rr:.2f}" if rr is not None else "-"
-        st_text = f"{stv:.2f}" if stv is not None else "-"
         ext_text = f"{ext:.2f}" if ext is not None else "-"
+        series_text = f"{series_st:.2f}" if series_st is not None else "-"
+        local_text = f"{local:.2f}" if local is not None else "-"
+        first_text = f"{firstday:.2f}" if firstday is not None else "-"
 
-        lines.append(
-            f"{b}号艇 ST={st_text} / ST順={rr_text} "
-            f"/ 展示ST={exs} / 展示={ext_text}"
-        )
+        if venue in NIGHT_VENUES:
+            night_text = f"{night:.2f}" if night is not None else "-"
+            f_text = (
+                f" / F持ち={f_count} / F持順位={f_rank:.2f}"
+                if f_count >= 1 and f_rank is not None
+                else (f" / F持ち={f_count}" if f_count >= 1 else "")
+            )
+            lines.append(
+                f"{b}号艇 展示={ext_text} / 展示ST={exs} / 今節ST={series_text} / "
+                f"当地={local_text} / 初日={first_text} / ナイター={night_text}" + f_text
+            )
+        else:
+            f_text = (
+                f" / F持ち={f_count} / F持順位={f_rank:.2f}"
+                if f_count >= 1 and f_rank is not None
+                else (f" / F持ち={f_count}" if f_count >= 1 else "")
+            )
+            lines.append(
+                f"{b}号艇 展示={ext_text} / 展示ST={exs} / 今節ST={series_text} / "
+                f"当地={local_text} / 初日={first_text}" + f_text
+            )
 
-    lines += ["", "【最後にシンsumで1着確認】"]
+    lines += ["", "【最終確認：シンsum1着率】"]
 
-    for x in candidates[:3]:
+    for x in selected[:3]:
         b = x["boat"]
         s = shin.get(b)
 
@@ -1175,12 +1497,13 @@ def notify_chance(venue, race, candidates, data, shin):
         if s.get("final") is not None:
             lines.append(
                 f"{b}号艇 元{s['base']:.1f}% + 理論{th:+.1f}% "
-                f"+ チェッカー{ck:+.1f}% = {s['final']:.1f}%"
+                f"+ チェッカー{ck:+.1f}% = 最終{s['final']:.1f}% "
+                f"(補正{s['total']:+.1f}pt)"
             )
         else:
             lines.append(
-                f"{b}号艇 元1着率表示なし / 理論{th:+.1f}% "
-                f"+ チェッカー{ck:+.1f}% = 補正{s['total']:+.1f}pt"
+                f"{b}号艇 理論{th:+.1f}% + チェッカー{ck:+.1f}% "
+                f"= 補正{s['total']:+.1f}pt"
             )
 
     body = "\n".join(lines)
@@ -1199,24 +1522,66 @@ def notify_chance(venue, race, candidates, data, shin):
     print(f"[NOTIFY] {title} / {venue}{race}R", flush=True)
 
 def analyze_current_page(page, venue, race):
+    # ① 展示タイム
+    # ② スタート展示
     ex = official_exhibition(venue, race)
+
+    # F持ち/公式平均STは補助
     official = official_avg_st_f(venue, race)
+
+    # ③ ボートレース日和 ST順位（必須）
     hiyori = hiyori_st_data(venue, race)
+
     data = merge_data(official, hiyori, ex)
 
-    if not data_ready(data):
+    if not data_ready(data, venue):
         return False
 
+    # ④ 左隣比較から「展開を作れる / 捲れる」候補を出す
     candidates = chance_candidates(venue, race, data)
 
     if not candidates:
-        print(f"[NO-CHANCE] {venue}{race}R", flush=True)
+        print(f"[NO-CHANCE] {venue}{race}R 展開候補なし", flush=True)
         return True
 
+    # ⑤ 最後にシンsum理論 + シンsumチェッカーで1着率を確認
     boats = [x["boat"] for x in candidates]
     shin = shinsum_confirmation(page, venue, race, boats)
 
-    notify_chance(venue, race, candidates, data, shin)
+    selected = []
+    for c in candidates:
+        kind = final_chance_type(c, shin.get(c["boat"]))
+        total = None
+        if shin.get(c["boat"]):
+            total = shin[c["boat"]].get("total")
+
+        print(
+            f"[FINAL] {venue}{race}R {c['boat']}号艇 "
+            f"展開score={c['score']:.1f} / "
+            f"シンsum補正={total if total is not None else '-'} / "
+            f"判定={kind or '通知なし'}",
+            flush=True,
+        )
+
+        if kind:
+            row = dict(c)
+            row["kind"] = kind
+            selected.append(row)
+
+    if not selected:
+        print(f"[NO-NOTIFY] {venue}{race}R 最終条件届かず", flush=True)
+        return True
+
+    # 1着チャンスを優先、その中で展開scoreの高い順。
+    selected.sort(
+        key=lambda x: (
+            1 if x["kind"] == "1着チャンス" else 0,
+            x["score"],
+        ),
+        reverse=True,
+    )
+
+    notify_chance(venue, race, selected, data, shin)
     return True
 
 def remain_minutes_from_text(text):
