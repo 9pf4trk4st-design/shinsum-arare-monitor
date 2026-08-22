@@ -241,19 +241,37 @@ def _row_numbers(cells, lo, hi):
     return vals
 
 
-def hiyori_st_data(venue, race):
+def _num_or_none(s, lo=None, hi=None):
+    s = re.sub(r"\s+", "", str(s))
+    if s in ("", "-", "－", "—"):
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except Exception:
+        return None
+    if lo is not None and v < lo:
+        return None
+    if hi is not None and v > hi:
+        return None
+    return v
+
+
+def hiyori_st_data(parent_page, venue, race):
     """
-    ボートレース日和のST順位表を取得する。
+    ボートレース日和はST順位表がJavaScript描画されるため、
+    requestsのHTMLではなくPlaywrightで描画後のtr/tdを読む。
 
-    基本判定:
-      - 当地
-      - 初日
-      - ナイター（ナイター開催場のみ）
+    取得するもの:
+      - 当地ST順位
+      - 初日ST順位
+      - ナイターST順位（ナイター場のみ）
+      - F持ち順位（F持ち艇のみ）
+      - 今節平均ST
 
-    F持ち艇だけ追加判定:
-      - F持ち順位
-
-    直近1ヶ月/3ヶ月・最終日は判定に使わない。
+    直近3ヶ月・直近1ヶ月・最終日は判定に使わない。
     """
     place = TARGET_VENUES[venue]
     hd = now().strftime("%Y%m%d")
@@ -262,101 +280,149 @@ def hiyori_st_data(venue, race):
         f"?place_no={place}&race_no={race}&hiduke={hd}"
     )
 
-    try:
-        r = session.get(url, timeout=15)
-        r.raise_for_status()
-        raw = r.text
-    except Exception as e:
-        print(f"[HIYORI-ERR] {venue}{race}R {e!r}", flush=True)
-        return {}
-
+    hp = parent_page.context.new_page()
     out = {i: {} for i in range(1, 7)}
-    found = {
-        "local_rank": False,
-        "firstday_rank": False,
-        "night_rank": False,
-        "f_rank": False,
-    }
 
-    for tb in tables(raw):
-        for row in tb:
-            if not row:
+    try:
+        hp.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        # ST順位/今節データがJSで埋まるのを待つ
+        try:
+            hp.wait_for_function(
+                """() => {
+                    const t = document.body?.innerText || '';
+                    return t.includes('ST順位') && t.includes('平均ST');
+                }""",
+                timeout=10000,
+            )
+        except Exception:
+            hp.wait_for_timeout(2500)
+
+        # DOM上の全trを「セル配列」のまま取得。
+        rows = hp.locator("tr").evaluate_all(
+            """els => els.map(tr =>
+                Array.from(tr.querySelectorAll('th,td'))
+                     .map(x => (x.innerText || x.textContent || '').trim())
+            )"""
+        )
+
+        # 表示上、行頭がラベル、後ろ6列が1〜6号艇。
+        for cells in rows:
+            if not cells:
                 continue
 
-            label = re.sub(r"\s+", "", str(row[0]))
-            nums = _row_numbers(row[1:], 1.0, 6.0)
+            label = re.sub(r"\s+", "", cells[0])
 
-            key = None
+            def six_values(lo=None, hi=None):
+                vals = [_num_or_none(x, lo, hi) for x in cells[1:7]]
+                return vals if len(vals) == 6 else None
 
             if label == "当地" or label.startswith("当地ST"):
-                key = "local_rank"
+                vals = six_values(1.0, 6.0)
+                if vals:
+                    for b, v in enumerate(vals, 1):
+                        if v is not None:
+                            out[b]["local_rank"] = v
+
             elif label == "初日" or label.startswith("初日ST"):
-                key = "firstday_rank"
+                vals = six_values(1.0, 6.0)
+                if vals:
+                    for b, v in enumerate(vals, 1):
+                        if v is not None:
+                            out[b]["firstday_rank"] = v
+
             elif venue in NIGHT_VENUES and (
                 label == "ナイター" or label.startswith("ナイターST")
             ):
-                key = "night_rank"
+                vals = six_values(1.0, 6.0)
+                if vals:
+                    for b, v in enumerate(vals, 1):
+                        if v is not None:
+                            out[b]["night_rank"] = v
+
             elif label == "F持" or label == "F持ち" or label.startswith("F持"):
-                key = "f_rank"
+                # ST順位欄のF持ち行は、F持ち艇だけ数字、他艇は「-」。
+                vals = six_values(1.0, 6.0)
+                if vals:
+                    for b, v in enumerate(vals, 1):
+                        if v is not None:
+                            out[b]["f_rank"] = v
+                            # F持ち順位が出ている = 現在F持ち
+                            out[b]["f_count"] = max(int(out[b].get("f_count", 0)), 1)
 
-            if key and len(nums) >= 6:
-                for b, v in enumerate(nums[:6], 1):
-                    out[b][key] = float(v)
-                found[key] = True
+            elif label in ("平均ST", "今節平均ST"):
+                vals = six_values(0.00, 0.40)
+                if vals:
+                    for b, v in enumerate(vals, 1):
+                        if v is not None:
+                            out[b]["series_st"] = v
 
-            if label in ("平均ST", "今節平均ST"):
-                sts = _row_numbers(row[1:], 0.00, 0.40)
-                if len(sts) >= 6:
-                    for b, v in enumerate(sts[:6], 1):
-                        out[b]["series_st"] = float(v)
+        # 行が複雑な場合の補助:
+        # innerTextを行単位で見て「平均ST 0.14 0.17 ...」等も拾う。
+        body_text = hp.locator("body").inner_text(timeout=10000)
+        lines = [re.sub(r"\s+", " ", x).strip() for x in body_text.splitlines()]
 
-    # 本文フォールバック
-    txt = clean_text(raw)
-    fallback_specs = [
-        ("local_rank", "当地"),
-        ("firstday_rank", "初日"),
-        ("f_rank", "F持"),
-    ]
-    if venue in NIGHT_VENUES:
-        fallback_specs.append(("night_rank", "ナイター"))
+        def fallback_line(label, key, lo, hi, f_only=False):
+            for i, line in enumerate(lines):
+                if re.sub(r"\s+", "", line) != label:
+                    continue
+                # 次の数行も含め、6艇分の表示セルを順に拾う
+                chunk = lines[i:i+10]
+                raw = []
+                for z in chunk[1:]:
+                    zz = z.strip()
+                    if zz in ("-", "－", "—"):
+                        raw.append(None)
+                    else:
+                        v = _num_or_none(zz, lo, hi)
+                        if v is not None:
+                            raw.append(v)
+                    if len(raw) >= 6:
+                        break
+                if len(raw) >= 6:
+                    for b, v in enumerate(raw[:6], 1):
+                        if v is not None and key not in out[b]:
+                            out[b][key] = v
+                            if f_only:
+                                out[b]["f_count"] = max(int(out[b].get("f_count", 0)), 1)
+                    return
 
-    for key, label in fallback_specs:
-        if found.get(key):
-            continue
+        fallback_line("当地", "local_rank", 1.0, 6.0)
+        fallback_line("初日", "firstday_rank", 1.0, 6.0)
+        if venue in NIGHT_VENUES:
+            fallback_line("ナイター", "night_rank", 1.0, 6.0)
+        fallback_line("F持", "f_rank", 1.0, 6.0, f_only=True)
+        fallback_line("平均ST", "series_st", 0.00, 0.40)
 
-        m = re.search(
-            rf"(?:^|\s){re.escape(label)}(?:ち)?\s+"
-            r"([1-6](?:\.\d+)?)\s+([1-6](?:\.\d+)?)\s+"
-            r"([1-6](?:\.\d+)?)\s+([1-6](?:\.\d+)?)\s+"
-            r"([1-6](?:\.\d+)?)\s+([1-6](?:\.\d+)?)",
-            txt,
-        )
+        local_n = sum(out[b].get("local_rank") is not None for b in range(1, 7))
+        first_n = sum(out[b].get("firstday_rank") is not None for b in range(1, 7))
+        night_n = sum(out[b].get("night_rank") is not None for b in range(1, 7))
+        f_boats = [b for b in range(1, 7) if out[b].get("f_count", 0) >= 1]
+        f_n = sum(out[b].get("f_rank") is not None for b in f_boats)
+        series_n = sum(out[b].get("series_st") is not None for b in range(1, 7))
 
-        if m:
-            vals = [float(x) for x in m.groups()]
-            for b, v in enumerate(vals, 1):
-                out[b][key] = v
-            found[key] = True
+        if venue in NIGHT_VENUES:
+            print(
+                f"[HIYORI-ST] {venue}{race}R 当地={local_n}/6 初日={first_n}/6 "
+                f"ナイター={night_n}/6 今節ST={series_n}/6 "
+                f"F持ち={f_boats or 'なし'} F持順位={f_n}/{len(f_boats)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[HIYORI-ST] {venue}{race}R 当地={local_n}/6 初日={first_n}/6 "
+                f"今節ST={series_n}/6 "
+                f"F持ち={f_boats or 'なし'} F持順位={f_n}/{len(f_boats)}",
+                flush=True,
+            )
 
-    local_n = sum(out[b].get("local_rank") is not None for b in range(1, 7))
-    first_n = sum(out[b].get("firstday_rank") is not None for b in range(1, 7))
-    night_n = sum(out[b].get("night_rank") is not None for b in range(1, 7))
-    f_n = sum(out[b].get("f_rank") is not None for b in range(1, 7))
+        return out
 
-    if venue in NIGHT_VENUES:
-        print(
-            f"[HIYORI-ST] {venue}{race}R 当地={local_n}/6 初日={first_n}/6 "
-            f"ナイター={night_n}/6 F持順位={f_n}/6",
-            flush=True,
-        )
-    else:
-        print(
-            f"[HIYORI-ST] {venue}{race}R 当地={local_n}/6 初日={first_n}/6 "
-            f"F持順位={f_n}/6",
-            flush=True,
-        )
-
-    return out
+    except Exception as e:
+        print(f"[HIYORI-ERR] {venue}{race}R {e!r}", flush=True)
+        return {}
+    finally:
+        hp.close()
 
 def avg_rank(d):
     """
@@ -1530,7 +1596,7 @@ def analyze_current_page(page, venue, race):
     official = official_avg_st_f(venue, race)
 
     # ③ ボートレース日和 ST順位（必須）
-    hiyori = hiyori_st_data(venue, race)
+    hiyori = hiyori_st_data(page, venue, race)
 
     data = merge_data(official, hiyori, ex)
 
