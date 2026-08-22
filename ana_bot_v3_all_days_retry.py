@@ -549,55 +549,103 @@ def cycle():
     不足時2回目: 締切13分前
     不足時3回目: 締切11分前
     データが揃った時点で終了。同一レースの重複判定を防止。
+    v4: 監視診断ログ付き。
     """
     today = now().strftime("%Y%m%d")
+    print(f"[CYCLE] {now():%Y-%m-%d %H:%M:%S} 監視開始", flush=True)
+
+    venues_seen = 0
+    races_with_deadline = 0
+    races_in_window = 0
 
     for venue in TARGET_VENUES:
-        day = meeting_day(venue)
-        if day not in ALLOWED_DAYS:
+        try:
+            day = meeting_day(venue)
+        except Exception as e:
+            print(f"[VENUE-ERR] {venue} 開催日判定失敗: {e!r}", flush=True)
             continue
+
+        print(f"[VENUE] {venue} 開催{day}日目", flush=True)
+
+        if day not in ALLOWED_DAYS:
+            print(f"[SKIP] {venue} 対象日外", flush=True)
+            continue
+
+        venues_seen += 1
 
         for race in range(1, 13):
             key = (today, venue, race)
             state = _attempt_state.get(key, 0)
-            if state == 9 or state >= 3:
+
+            if state == 9:
+                print(f"[DONE] {venue}{race}R 判定済み", flush=True)
+                continue
+            if state >= 3:
                 continue
 
             try:
                 remain = deadline_minutes(venue, race)
+
                 if remain is None:
+                    print(f"[NO-DEADLINE] {venue}{race}R 締切時刻取得できず", flush=True)
                     continue
+
+                races_with_deadline += 1
+                print(
+                    f"[DEADLINE] {venue}{race}R 締切まで {remain:.1f}分 / state={state}",
+                    flush=True,
+                )
 
                 target = {0: 15.0, 1: 13.0, 2: 11.0}[state]
+
                 if remain > target:
                     continue
+
                 if remain < 9.0:
                     _attempt_state[key] = 3
+                    print(f"[MISS] {venue}{race}R 監視開始が遅く9分未満 → 見送り", flush=True)
                     continue
 
+                races_in_window += 1
                 attempt = state + 1
                 print(
-                    f"取得{attempt}回目 {venue}{race}R "
+                    f"[TRY] 取得{attempt}回目 {venue}{race}R "
                     f"締切まで{remain:.1f}分（{int(target)}分前狙い）",
                     flush=True,
                 )
 
-                if inspect_race(venue, race, day):
+                ok = inspect_race(venue, race, day)
+
+                if ok:
                     _attempt_state[key] = 9
+                    print(f"[READY] {venue}{race}R データ取得・判定完了", flush=True)
                 else:
                     _attempt_state[key] = attempt
                     if attempt < 3:
                         nxt = 13 if attempt == 1 else 11
-                        print(f"{venue}{race}R → 締切{nxt}分前に再取得", flush=True)
+                        print(
+                            f"[RETRY] {venue}{race}R データ不足 → 締切{nxt}分前に再取得",
+                            flush=True,
+                        )
                     else:
-                        print(f"{venue}{race}R 3回目も不足 → 判定見送り", flush=True)
+                        print(
+                            f"[GIVEUP] {venue}{race}R 3回目も不足 → 判定見送り",
+                            flush=True,
+                        )
 
             except Exception as e:
-                print("race error", venue, race, repr(e), flush=True)
+                print(f"[RACE-ERR] {venue}{race}R: {e!r}", flush=True)
+
+    print(
+        f"[CYCLE-END] 対象場={venues_seen} "
+        f"締切取得={races_with_deadline} "
+        f"15/13/11分窓={races_in_window}",
+        flush=True,
+    )
 
 def main():
     print(
-        f"中穴・大穴BOT v3 開始 / 15→13→11分前取得 / 対象日={sorted(ALLOWED_DAYS)} / "
+        f"中穴・大穴BOT v4 開始 / 診断ログ / 15→13→11分前取得 / 対象日={sorted(ALLOWED_DAYS)} / "
         f"中穴>={MID_SCORE} 大穴>={BIG_SCORE}",
         flush=True,
     )
