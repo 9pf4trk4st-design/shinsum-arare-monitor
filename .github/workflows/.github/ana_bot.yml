@@ -1,0 +1,34 @@
+name: Ana Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 23 * * *"
+    - cron: "50 4 * * *"
+    - cron: "40 10 * * *"
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: pip install -r requirements_ana_bot.txt
+
+      - name: Run Ana Bot
+        run: python ana_bot_v2_all_days.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CHECK_INTERVAL: "120"
+          ANA_ALLOWED_DAYS: "1,2,3,4,5,6,7"
+          ANA_MID_SCORE: "5.0"
+          ANA_BIG_SCORE: "7.0"
