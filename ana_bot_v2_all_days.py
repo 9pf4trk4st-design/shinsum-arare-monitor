@@ -484,49 +484,120 @@ def notify(venue, race, day, result, data):
     print("通知", venue, race, level, flush=True)
 
 
+def deadline_minutes(venue, race):
+    """公式ページから締切時刻を取得し、締切までの分数を返す。"""
+    jcd = TARGET_VENUES[venue]
+    hd = now().strftime("%Y%m%d")
+    for page in ("racelist", "beforeinfo"):
+        url = f"https://www.boatrace.jp/owpc/pc/race/{page}?hd={hd}&jcd={jcd:02d}&rno={race}"
+        try:
+            r = session.get(url, timeout=12)
+            r.raise_for_status()
+            txt = clean_text(r.text)
+            m = re.search(r"(?:締切予定|締切時刻|締切)\s*[:：]?\s*(\d{1,2})[:：](\d{2})", txt)
+            if m:
+                hh, mm = map(int, m.groups())
+                target = now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+                return (target - now()).total_seconds() / 60.0
+        except Exception as e:
+            print("締切取得失敗", venue, race, repr(e), flush=True)
+    return None
+
+
+def data_ready(data):
+    """展示タイム・スタート展示・ST系が各5艇以上なら判定可能。"""
+    ex_time = sum(data[b].get("ex_time") is not None for b in range(1, 7))
+    ex_st = sum(data[b].get("ex_st") is not None for b in range(1, 7))
+    st = sum(
+        data[b].get("series_st") is not None
+        or data[b].get("avg_st") is not None
+        or avg_rank(data[b]) is not None
+        for b in range(1, 7)
+    )
+    return ex_time >= 5 and ex_st >= 5 and st >= 5
+
+
 def inspect_race(venue, race, day):
     ex = official_exhibition(venue, race)
-    # 展示未公開ならまだ判定しない
-    if sum("ex_time" in v for v in ex.values()) < 5:
-        return
-
     official = official_avg_st_f(venue, race)
     hiyori = hiyori_st_data(venue, race)
     data = merge_data(official, hiyori, ex)
 
-    # 最低限の信頼性チェック
-    have_st = sum(data[b].get("avg_st") is not None or data[b].get("series_st") is not None for b in range(1,7))
-    have_ex = sum(data[b].get("ex_time") is not None for b in range(1,7))
-    if have_st < 5 or have_ex < 5:
-        print(f"材料不足 {venue}{race}R ST={have_st} 展示={have_ex}", flush=True)
-        return
+    if not data_ready(data):
+        et = sum(data[b].get("ex_time") is not None for b in range(1, 7))
+        es = sum(data[b].get("ex_st") is not None for b in range(1, 7))
+        print(f"データ不足 {venue}{race}R 展示={et}/6 展示ST={es}/6", flush=True)
+        return False
 
     result = classify_race(venue, race, data)
-    if not result:
-        return
+    if result:
+        key = (now().strftime("%Y%m%d"), venue, race, result[0], result[1][0]["boat"])
+        if key not in _seen:
+            notify(venue, race, day, result, data)
+            _seen.add(key)
+    else:
+        print(f"判定完了・穴条件なし {venue}{race}R", flush=True)
+    return True
 
-    key = (now().strftime("%Y%m%d"), venue, race, result[0], result[1][0]["boat"])
-    if key in _seen:
-        return
-    notify(venue, race, day, result, data)
-    _seen.add(key)
+
+_attempt_state = {}
 
 
 def cycle():
+    """
+    1回目: 締切15分前
+    不足時2回目: 締切13分前
+    不足時3回目: 締切11分前
+    データが揃った時点で終了。同一レースの重複判定を防止。
+    """
+    today = now().strftime("%Y%m%d")
+
     for venue in TARGET_VENUES:
         day = meeting_day(venue)
         if day not in ALLOWED_DAYS:
             continue
+
         for race in range(1, 13):
+            key = (today, venue, race)
+            state = _attempt_state.get(key, 0)
+            if state == 9 or state >= 3:
+                continue
+
             try:
-                inspect_race(venue, race, day)
+                remain = deadline_minutes(venue, race)
+                if remain is None:
+                    continue
+
+                target = {0: 15.0, 1: 13.0, 2: 11.0}[state]
+                if remain > target:
+                    continue
+                if remain < 9.0:
+                    _attempt_state[key] = 3
+                    continue
+
+                attempt = state + 1
+                print(
+                    f"取得{attempt}回目 {venue}{race}R "
+                    f"締切まで{remain:.1f}分（{int(target)}分前狙い）",
+                    flush=True,
+                )
+
+                if inspect_race(venue, race, day):
+                    _attempt_state[key] = 9
+                else:
+                    _attempt_state[key] = attempt
+                    if attempt < 3:
+                        nxt = 13 if attempt == 1 else 11
+                        print(f"{venue}{race}R → 締切{nxt}分前に再取得", flush=True)
+                    else:
+                        print(f"{venue}{race}R 3回目も不足 → 判定見送り", flush=True)
+
             except Exception as e:
                 print("race error", venue, race, repr(e), flush=True)
 
-
 def main():
     print(
-        f"中穴・大穴BOT v1 開始 / 対象日={sorted(ALLOWED_DAYS)} / "
+        f"中穴・大穴BOT v3 開始 / 15→13→11分前取得 / 対象日={sorted(ALLOWED_DAYS)} / "
         f"中穴>={MID_SCORE} 大穴>={BIG_SCORE}",
         flush=True,
     )
