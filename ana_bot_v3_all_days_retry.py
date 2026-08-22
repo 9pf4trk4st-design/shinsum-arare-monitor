@@ -349,8 +349,9 @@ def hiyori_st_data(parent_page, venue, race):
                     for b, v in enumerate(vals, 1):
                         if v is not None:
                             out[b]["f_rank"] = v
-                            # F持ち順位が出ている = 現在F持ち
-                            out[b]["f_count"] = max(int(out[b].get("f_count", 0)), 1)
+                            # 注意:
+                            # F持ち順位が表示されていても「現在F持ち」とは限らない。
+                            # 現在のF有無は公式BOATRACEのF0/F1のみで判定する。
 
             elif label in ("平均ST", "今節平均ST"):
                 vals = six_values(0.00, 0.40)
@@ -385,8 +386,8 @@ def hiyori_st_data(parent_page, venue, race):
                     for b, v in enumerate(raw[:6], 1):
                         if v is not None and key not in out[b]:
                             out[b][key] = v
-                            if f_only:
-                                out[b]["f_count"] = max(int(out[b].get("f_count", 0)), 1)
+                            # f_onlyでもf_countは立てない。
+                            # 現在Fは公式BOATRACE F0/F1を正とする。
                     return
 
         fallback_line("当地", "local_rank", 1.0, 6.0)
@@ -399,22 +400,21 @@ def hiyori_st_data(parent_page, venue, race):
         local_n = sum(out[b].get("local_rank") is not None for b in range(1, 7))
         first_n = sum(out[b].get("firstday_rank") is not None for b in range(1, 7))
         night_n = sum(out[b].get("night_rank") is not None for b in range(1, 7))
-        f_boats = [b for b in range(1, 7) if out[b].get("f_count", 0) >= 1]
-        f_n = sum(out[b].get("f_rank") is not None for b in f_boats)
+        f_rank_n = sum(out[b].get("f_rank") is not None for b in range(1, 7))
         series_n = sum(out[b].get("series_st") is not None for b in range(1, 7))
 
         if venue in NIGHT_VENUES:
             print(
                 f"[HIYORI-ST] {venue}{race}R 当地={local_n}/6 初日={first_n}/6 "
                 f"ナイター={night_n}/6 今節ST={series_n}/6 "
-                f"F持ち={f_boats or 'なし'} F持順位={f_n}/{len(f_boats)}",
+                f"F持順位データ={f_rank_n}/6",
                 flush=True,
             )
         else:
             print(
                 f"[HIYORI-ST] {venue}{race}R 当地={local_n}/6 初日={first_n}/6 "
                 f"今節ST={series_n}/6 "
-                f"F持ち={f_boats or 'なし'} F持順位={f_n}/{len(f_boats)}",
+                f"F持順位データ={f_rank_n}/6",
                 flush=True,
             )
 
@@ -1321,8 +1321,16 @@ def chance_candidates(venue, race, data):
     arr = []
     for b in range(2, 7):
         score, reasons = evaluate_boat(b, data, venue)
+        me_st = data.get(b, {}).get("series_st")
+        left_st = data.get(b - 1, {}).get("series_st") if b > 1 else None
+        st_audit = (
+            f"今節ST={me_st:.2f} 左={left_st:.2f} / "
+            if me_st is not None and left_st is not None
+            else ""
+        )
         print(
-            f"[SCORE] {venue}{race}R {b}号艇={score:.1f} / "
+            f"[展開指数] {venue}{race}R {b}号艇={score:.1f}点 / "
+            + st_audit
             + " / ".join(reasons),
             flush=True,
         )
@@ -1603,6 +1611,14 @@ def analyze_current_page(page, venue, race):
     official = official_avg_st_f(venue, race)
     hiyori = hiyori_st_data(page, venue, race)
     data = merge_data(official, hiyori, ex)
+
+    # 現在のF有無は公式BOATRACEを唯一の正とする。
+    # 日和の「F持順位」は順位データとしてだけ利用する。
+    for b in range(1, 7):
+        if b in official:
+            data[b]["f_count"] = int(official[b].get("f_count", 0))
+        else:
+            data[b]["f_count"] = 0
 
     if not data_ready(data, venue):
         return {"status": "not_ready"}
