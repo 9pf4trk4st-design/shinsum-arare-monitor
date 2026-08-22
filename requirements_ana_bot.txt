@@ -1,0 +1,3 @@
+ana_bot_v2_all_days.py
+requirements_ana_bot.txt
+.github/workflows/ana_bot.yml
