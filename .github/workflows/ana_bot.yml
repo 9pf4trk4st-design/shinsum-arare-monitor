@@ -4,18 +4,16 @@ on:
   workflow_dispatch:
 
   schedule:
-    # GitHub Actions の cron は UTC
-    # 日本時間 08:00～22:59 をカバー
-    # 5分間隔で起動
-    - cron: "*/5 23 * * *"
-    - cron: "*/5 0-13 * * *"
+    - cron: "0 23 * * *"
+    - cron: "50 4 * * *"
+    - cron: "40 10 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   group: ana-middle-longshot-bot
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run-ana-bot:
@@ -30,42 +28,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
+        run: pip install -r requirements_ana_bot.txt
 
-          if [ -f requirements_ana_bot.txt ]; then
-            pip install -r requirements_ana_bot.txt
-          else
-            pip install requests beautifulsoup4 lxml playwright
-          fi
-
-          python -m playwright install --with-deps chromium
-
-      - name: Run ANA Middle/Longshot Bot
+      - name: Run ANA Bot
         env:
           TZ: Asia/Tokyo
-
-          # ntfy通知
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-
-          # 必要な場合に使用
-          SHINSUM_ID: ${{ secrets.SHINSUM_ID }}
-          SHINSUM_PASSWORD: ${{ secrets.SHINSUM_PASSWORD }}
-
+          CHECK_INTERVAL: "120"
+          ANA_ALLOWED_DAYS: "1,2,3,4,5,6,7"
+          ANA_MID_SCORE: "5.0"
+          ANA_BIG_SCORE: "7.0"
           PYTHONUNBUFFERED: "1"
 
-        run: |
-          echo "======================================"
-          echo " ANA Middle/Longshot Bot START"
-          echo " JST: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S')"
-          echo "======================================"
-
-          python ana_bot_v2_all_days.py
-
-          echo "======================================"
-          echo " ANA Middle/Longshot Bot END"
-          echo " JST: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S')"
-          echo "======================================"
+        run: python ana_bot_v3_all_days_retry.py
