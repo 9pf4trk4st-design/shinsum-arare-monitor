@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
+from email.header import Header
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -452,6 +453,25 @@ def avg_rank(d):
 
     return sum(vals) / len(vals) if vals else None
 
+
+def race_day_number(data):
+    """
+    merge済みdataから開催何日目を取得。
+    official側の day / race_day / day_no があれば使用。
+    無ければNone（安全側で今節平均STは使わない）。
+    """
+    for b in range(1, 7):
+        d = data.get(b, {})
+        for key in ("day_no", "race_day", "day"):
+            v = d.get(key)
+            if v is None:
+                continue
+            m = re.search(r"\d+", str(v))
+            if m:
+                return int(m.group())
+    return None
+
+
 def evaluate_boat(boat, data, venue):
     """
     2〜6号艇を「自艇 vs 左隣」で相対評価する。
@@ -473,11 +493,15 @@ def evaluate_boat(boat, data, venue):
     me, le = data.get(boat, {}), data.get(left, {})
     score, reasons = 0.0, []
 
-    # 今節平均STを最優先。取れない場合のみ通常平均STへフォールバック。
-    me_series = me.get("series_st")
-    le_series = le.get("series_st")
-    me_st = me_series if me_series is not None else me.get("avg_st")
-    le_st = le_series if le_series is not None else le.get("avg_st")
+    # 初日・2日目は今節平均STを展開判定に使わない。
+    # 3日目以降だけ今節平均STを追加材料として使う。
+    day_no = race_day_number(data)
+    use_series_st = day_no is not None and day_no >= 3
+
+    me_series = me.get("series_st") if use_series_st else None
+    le_series = le.get("series_st") if use_series_st else None
+    me_st = me_series
+    le_st = le_series
 
     # ST順位（F持ち艇は avg_rank 内でF持ち順位も追加される）
     mr, lr = avg_rank(me), avg_rank(le)
@@ -495,13 +519,13 @@ def evaluate_boat(boat, data, venue):
         st_edge = le_st - me_st  # +なら自艇が速い
         if st_edge >= ST_EDGE_STRONG:
             score += 2.5
-            reasons.append(f"今節ST左より{st_edge:.02f}速い")
+            reasons.append(f"今節ST左より{st_edge:.02f}速い(3日目以降)")
         elif st_edge >= ST_EDGE_GOOD:
             score += 1.5
-            reasons.append(f"今節ST左より{st_edge:.02f}速い")
+            reasons.append(f"今節ST左より{st_edge:.02f}速い(3日目以降)")
         elif st_edge <= -ST_EDGE_STRONG:
             score -= 2.0
-            reasons.append(f"今節ST左より{-st_edge:.02f}遅い")
+            reasons.append(f"今節ST左より{-st_edge:.02f}遅い(3日目以降)")
         elif st_edge <= -ST_EDGE_GOOD:
             score -= 1.0
 
@@ -558,7 +582,7 @@ def evaluate_boat(boat, data, venue):
         elif exst >= 0.18:
             # 展示で遅れても、今節ST/ST順位が速ければ本番修正候補。
             correction = (
-                (me_st is not None and me_st <= FAST_ST)
+                (use_series_st and me_st is not None and me_st <= FAST_ST)
                 or (mr is not None and mr <= 2.8)
             )
             if correction:
@@ -575,7 +599,11 @@ def evaluate_boat(boat, data, venue):
     me_ex_not_f = exst is not None and exst >= 0
     time_better = time_edge is not None and time_edge >= EX_TIME_GOOD
     rank_better = rank_edge is not None and rank_edge >= 0.30
-    series_better = st_edge is not None and st_edge >= ST_EDGE_GOOD
+    series_better = (
+        use_series_st
+        and st_edge is not None
+        and st_edge >= ST_EDGE_GOOD
+    )
 
     if left_ex_f:
         reasons.append(f"左艇展示F{abs(lexst):.02f}→本番再現性割引")
@@ -587,10 +615,22 @@ def evaluate_boat(boat, data, venue):
             bool(series_better),
         ])
 
-        if me_ex_not_f and time_better and rank_better and series_better:
+        # 初日・2日目:
+        #   今節平均STは使わず、展示タイム＋当地/初日ST順位＋展示STで判断。
+        # 3日目以降:
+        #   今節平均ST優勢も追加条件にする。
+        if (
+            me_ex_not_f
+            and time_better
+            and rank_better
+            and (series_better if use_series_st else True)
+        ):
             score += 4.0
-            reasons.append("左展示F＋非F＋展示/ST順位/今節ST優勢→捲り強チャンス")
-        elif me_ex_not_f and advantages >= 3:
+            if use_series_st:
+                reasons.append("左展示F＋非F＋展示/ST順位/今節ST優勢→捲り強チャンス")
+            else:
+                reasons.append("左展示F＋非F＋展示＋当地/初日ST順位優勢→捲り強チャンス")
+        elif me_ex_not_f and advantages >= (3 if use_series_st else 2):
             score += 2.0
             reasons.append("左展示F＋複数優勢→捲りチャンス")
         elif me_ex_not_f and advantages >= 2:
@@ -600,7 +640,8 @@ def evaluate_boat(boat, data, venue):
     # ---------- 6. 自艇展示遅れの「本番巻き返し」 ----------
     # 展示ST単発より、今節STとST順位がともに良ければ本番修正を評価。
     if (
-        exst is not None and exst >= 0.15
+        use_series_st
+        and exst is not None and exst >= 0.15
         and me_st is not None and me_st <= FAST_ST
         and mr is not None and mr <= 2.8
     ):
@@ -1321,12 +1362,17 @@ def chance_candidates(venue, race, data):
     arr = []
     for b in range(2, 7):
         score, reasons = evaluate_boat(b, data, venue)
-        me_st = data.get(b, {}).get("series_st")
-        left_st = data.get(b - 1, {}).get("series_st") if b > 1 else None
+        day_no = race_day_number(data)
+        use_series_st = day_no is not None and day_no >= 3
+        me_st = data.get(b, {}).get("series_st") if use_series_st else None
+        left_st = (
+            data.get(b - 1, {}).get("series_st")
+            if use_series_st and b > 1 else None
+        )
         st_audit = (
             f"今節ST={me_st:.2f} 左={left_st:.2f} / "
             if me_st is not None and left_st is not None
-            else ""
+            else "今節ST=判定不使用 / "
         )
         print(
             f"[展開指数] {venue}{race}R {b}号艇={score:.1f}点 / "
@@ -1450,10 +1496,22 @@ def data_ready(data, venue):
         )
         rank_ready = local >= 5 and firstday >= 5
 
+    day_no = race_day_number(data)
+
+    # 初日・2日目は今節平均STを完全に無視。
+    # 開催日が取れない場合も、安全側で今節STを必須にしない。
+    series_ready = True if day_no is None or day_no <= 2 else series_st >= 5
+
+    print(
+        f"[DAY] 開催日={day_no if day_no is not None else '不明'} "
+        f"/ 今節ST使用={'する' if day_no is not None and day_no >= 3 else 'しない'}",
+        flush=True,
+    )
+
     return (
         ex_time >= 5
         and ex_st >= 5
-        and series_st >= 5
+        and series_ready
         and rank_ready
         and not missing_f_rank
     )
@@ -1584,11 +1642,15 @@ def notify_chance(venue, race, selected, data, shin):
 
     body = "\n".join(lines)
 
+    # 日本語・絵文字タイトルをそのままHTTPヘッダーへ入れると
+    # requests側でUnicodeEncodeErrorになるため、RFC2047でASCII化する。
+    safe_title = str(Header(title, "utf-8"))
+
     r = requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=body.encode("utf-8"),
         headers={
-            "Title": title,
+            "Title": safe_title,
             "Priority": "high",
             "Tags": "boat",
         },
