@@ -40,6 +40,9 @@ _http.headers.update({
     "User-Agent": "Mozilla/5.0 (compatible; shinsum-monitor-image/1.0)"
 })
 
+# 開催日は同じ場なら1R〜12Rで共通。場単位でキャッシュする。
+_EVENT_DAY_CACHE = {}
+
 ALERT_TYPES = ("やや本命", "荒れ注意")
 
 # -----------------------------
@@ -103,36 +106,54 @@ def parse_event_day(text):
 
 def fetch_event_day_official(venue, race_no):
     """
-    BOATRACE公式レースページから開催日(初日=1, 2日目=2...)を取得。
-    Shinsum詳細ページに開催日表記が無い場合の本命フォールバック。
+    BOATRACE公式から開催日を取得。
+    同じ場の開催日は1R〜12Rで共通なので、場単位で1回だけ取得して使い回す。
     """
+    cache_key = f"{now():%Y%m%d}|{venue}"
+
+    if cache_key in _EVENT_DAY_CACHE:
+        cached = _EVENT_DAY_CACHE[cache_key]
+        print(
+            f"[DAY-CACHE] {venue} -> "
+            f"{'初日' if cached == 1 else str(cached) + '日目' if cached else '不明'}",
+            flush=True
+        )
+        return cached
+
     jcd = VENUE_CODES.get(venue)
     if not jcd:
+        _EVENT_DAY_CACHE[cache_key] = None
         return None
 
     hd = now().strftime("%Y%m%d")
+
+    # 開催日判定だけなら1Rで十分。同じ場の全Rで共通。
+    check_race = 1
+
     urls = [
         (
             "https://www.boatrace.jp/owpc/pc/race/racelist"
-            f"?hd={hd}&jcd={jcd:02d}&rno={race_no}"
+            f"?hd={hd}&jcd={jcd:02d}&rno={check_race}"
         ),
         (
             "https://www.boatrace.jp/owpc/pc/race/beforeinfo"
-            f"?hd={hd}&jcd={jcd:02d}&rno={race_no}"
+            f"?hd={hd}&jcd={jcd:02d}&rno={check_race}"
         ),
     ]
 
+    day = None
+
     for url in urls:
         try:
-            r = _http.get(url, timeout=15)
+            r = _http.get(url, timeout=8)
             r.raise_for_status()
             plain = _clean_html(r.text)
             compact = re.sub(r"\s+", "", plain)
 
             if "初日" in compact:
-                return 1
+                day = 1
+                break
 
-            # 例: 第2日 / 第2日目 / 2日目
             for pat in (
                 r"第([1-9]|1[0-2])日目",
                 r"第([1-9]|1[0-2])日",
@@ -140,22 +161,33 @@ def fetch_event_day_official(venue, race_no):
             ):
                 m = re.search(pat, compact)
                 if m:
-                    return int(m.group(1))
+                    day = int(m.group(1))
+                    break
+
+            if day is not None:
+                break
 
         except Exception as e:
             print(
-                f"[DAY-FETCH-ERR] {venue}{race_no}R {e!r}",
+                f"[DAY-FETCH-ERR] {venue} {e!r}",
                 flush=True
             )
 
-    return None
+    _EVENT_DAY_CACHE[cache_key] = day
 
+    print(
+        f"[DAY-FETCH] {venue} -> "
+        f"{'初日' if day == 1 else str(day) + '日目' if day else '判定不能'}",
+        flush=True
+    )
+
+    return day
 
 def get_event_day(text, venue, race):
     """
     1) Shinsum詳細ページ本文
-    2) BOATRACE公式
-    の順で開催日を判定。
+    2) 場単位キャッシュ済みのBOATRACE公式開催日
+    の順で判定。
     """
     day = parse_event_day(text)
     if day is not None:
@@ -165,7 +197,7 @@ def get_event_day(text, venue, race):
     if race_no:
         day = fetch_event_day_official(venue, race_no)
         if day is not None:
-            return day, "official"
+            return day, "official-cache"
 
     return None, "unknown"
 
@@ -1453,6 +1485,11 @@ def cycle(page, initial=False):
 
     print(
         f"詳細候補リンク数: {len(links)}",
+        flush=True
+    )
+    print(
+        f"[DAY-CACHE-STATUS] 当日キャッシュ済み場数="
+        f"{sum(1 for k in _EVENT_DAY_CACHE if k.startswith(now().strftime('%Y%m%d') + '|'))}",
         flush=True
     )
 
