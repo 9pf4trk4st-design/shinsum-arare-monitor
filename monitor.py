@@ -1,16 +1,11 @@
-# V35: 初日・2日目限定 + スリット補正 + 1号艇1着予想時の2着率100%配分 + シンsumチェッカー2着補正【実反映修正】
 import os
 import re
 import time
-import csv
-import json
-import html
-import subprocess
-from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
-from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
+from html.parser import HTMLParser
+import html
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -24,60 +19,6 @@ NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 JST = ZoneInfo("Asia/Tokyo")
 
-# -----------------------------
-# 通知後の結果自動追跡
-# -----------------------------
-RESULT_CHECK_DELAY_MIN = int(os.getenv("RESULT_CHECK_DELAY_MIN", "3"))
-RESULT_DATA_DIR = Path(os.getenv("SHINSUM_DATA_DIR", "data"))
-RESULTS_CSV = RESULT_DATA_DIR / "shinsum_results.csv"
-PENDING_JSON = RESULT_DATA_DIR / "shinsum_pending.json"
-SECOND_ANALYSIS_CSV = RESULT_DATA_DIR / "shinsum_second_place_analysis.csv"
-AUTO_GIT_SAVE = os.getenv("AUTO_GIT_SAVE", "1") == "1"
-
-# BOAT RACE オフィシャルの場コード
-VENUE_JCD = {
-    "戸田": "02",
-    "平和島": "04",
-    "多摩川": "05",
-    "蒲郡": "07",
-    "三国": "10",
-    "びわこ": "11",
-    "住之江": "12",
-    "鳴門": "14",
-    "児島": "16",
-    "宮島": "17",
-    "徳山": "18",
-    "下関": "19",
-    "若松": "20",
-    "芦屋": "21",
-    "唐津": "23",
-    "大村": "24",
-}
-
-# BOATERS の会場URLスラッグ
-BOATERS_VENUE_SLUG = {
-    "桐生": "kiryu", "戸田": "toda", "江戸川": "edogawa", "平和島": "heiwajima",
-    "多摩川": "tamagawa", "浜名湖": "hamanako", "蒲郡": "gamagori", "常滑": "tokoname",
-    "津": "tsu", "三国": "mikuni", "びわこ": "biwako", "住之江": "suminoe",
-    "尼崎": "amagasaki", "鳴門": "naruto", "丸亀": "marugame", "児島": "kojima",
-    "宮島": "miyajima", "徳山": "tokuyama", "下関": "shimonoseki", "若松": "wakamatsu",
-    "芦屋": "ashiya", "福岡": "fukuoka", "唐津": "karatsu", "大村": "omura",
-}
-
-# 2着率モデル。値は環境変数で後から調整可能。
-SECOND_W_LEAD2 = float(os.getenv("SECOND_W_LEAD2", "0.30"))
-SECOND_W_RECENT2 = float(os.getenv("SECOND_W_RECENT2", "0.22"))
-SECOND_W_ONE_X = float(os.getenv("SECOND_W_ONE_X", "0.20"))
-SECOND_W_RECENT1 = float(os.getenv("SECOND_W_RECENT1", "0.05"))
-SECOND_W_RECENT3 = float(os.getenv("SECOND_W_RECENT3", "0.05"))
-SECOND_W_ST = float(os.getenv("SECOND_W_ST", "0.08"))
-SECOND_W_DIFF = float(os.getenv("SECOND_W_DIFF", "0.06"))
-SECOND_W_SLIT = float(os.getenv("SECOND_W_SLIT", "0.04"))
-SECOND_THEORY2_MULT = float(os.getenv("SECOND_THEORY2_MULT", "1.00"))
-SECOND_CHECKER2_MULT = float(os.getenv("SECOND_CHECKER2_MULT", "1.00"))
-SECOND_F1_MULT = float(os.getenv("SECOND_F1_MULT", "0.82"))
-SECOND_F2_MULT = float(os.getenv("SECOND_F2_MULT", "0.70"))
-
 TARGET_VENUES = [
     "平和島", "児島", "戸田", "多摩川",
     "蒲郡", "びわこ", "三国", "鳴門",
@@ -85,550 +26,43 @@ TARGET_VENUES = [
     "芦屋", "唐津", "大村", "住之江"
 ]
 
+
+VENUE_CODES = {
+    "戸田": 2, "平和島": 4, "多摩川": 5, "蒲郡": 7,
+    "三国": 10, "びわこ": 11, "住之江": 12, "鳴門": 14,
+    "児島": 16, "宮島": 17, "徳山": 18, "下関": 19,
+    "若松": 20, "芦屋": 21, "唐津": 23, "大村": 24,
+}
+NIGHT_VENUES = {"蒲郡", "住之江", "下関", "若松", "大村"}
+
+_http = requests.Session()
+_http.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; shinsum-monitor-image/1.0)"
+})
+
 ALERT_TYPES = ("やや本命", "荒れ注意")
 
 # -----------------------------
 # 選別基準
 # -----------------------------
-# 最終補正1着率で比較する。
-# 最終補正1着率 =
-#   元の1着率
-# + シンsum理論欄の1着補正
-# + シンsumチェッカー該当ゾーンの1着補正
-
 # 1号艇有利
-ONE_MIN = float(os.getenv("ONE_MIN", "8.0"))
-ONE_GAP_VS_34 = float(os.getenv("ONE_GAP_VS_34", "8.0"))
-ONE_GAP_VS_SECOND = float(os.getenv("ONE_GAP_VS_SECOND", "5.0"))
+ONE_MIN = 8.0
+ONE_GAP_VS_34 = 8.0
+ONE_GAP_VS_SECOND = 5.0
 
 # 3・4号艇有利
-OUT_MIN = float(os.getenv("OUT_MIN", "10.0"))
-OUT_GAP_VS_1 = float(os.getenv("OUT_GAP_VS_1", "8.0"))
-OUT_GAP_VS_OTHER = float(os.getenv("OUT_GAP_VS_OTHER", "5.0"))
+OUT_MIN = 10.0
+OUT_GAP_VS_1 = 8.0
+OUT_GAP_VS_OTHER = 5.0
 
-# 独立バフ検知
-BUFF_TARGET_BOATS = (2, 3, 4)
-
-# 最終比較のため1〜6号艇すべてチェッカー解析
-CHECKER_PARSE_BOATS = (1, 2, 3, 4, 5, 6)
-
-# 「理論補正 + チェッカー補正」がこの値を超えた2〜4号艇をバフ候補にする
-BUFF_MIN_TOTAL = float(os.getenv("BUFF_MIN_TOTAL", "0.0"))
-
-# 1号艇の「理論補正 + チェッカー補正」が0未満なら弱化扱い
-ONE_WEAK_TOTAL_THRESHOLD = float(os.getenv("ONE_WEAK_TOTAL_THRESHOLD", "0.0"))
-
-# 1号艇の逃げ強化 / 逃げ崩れ判定
-# 逃げ強化:
-#   元より上昇し、最終1着率が75%以上
-#   かつ、最終1着率が判明している2〜6号艇に15%以上がいない
-ESCAPE_FINAL_MIN = float(os.getenv("ESCAPE_FINAL_MIN", "75.0"))
-
-# 他艇の「強い対抗」判定
-RIVAL_FINAL_MIN = float(os.getenv("RIVAL_FINAL_MIN", "15.0"))
-
-# 逃げ崩れ:
-#   1号艇が元1着率から15pt以上低下し、
-#   2〜6号艇のどれかが最終1着率15%以上
-ONE_BIG_DROP_MIN = float(os.getenv("ONE_BIG_DROP_MIN", "15.0"))
-
-# 1号艇逃げ強化時の「対抗艇注意」判定
-# 元1着率が表示されていない艇でも、
-# 理論補正 + チェッカー補正 が15pt以上なら注意表示する。
-RIVAL_WARNING_BOOST_MIN = float(os.getenv("RIVAL_WARNING_BOOST_MIN", "15.0"))
+# 独立バフ検知（やや本命/荒れ注意が出ていないレースも対象）
+BUFF_TARGET_BOATS = (1, 2, 3, 4)
+BUFF_MIN_CURRENT_DIFF = 0.50
+BUFF_MIN_THEORY_1ST = 10.0
+BUFF_MIN_CHECKER_1ST = 5.0
 
 seen = set()
-pending_results = {}
 
-# -----------------------------
-# 通知対象の開催日
-# -----------------------------
-# 全通知を「初日・2日目」だけに限定する。
-# BOAT RACE オフィシャルの本日のレース一覧から開催日を判定し、
-# 3日目以降・判定不能時は通知しない（誤通知防止のため fail-closed）。
-NOTIFY_MEETING_DAYS = (1, 2)
-_meeting_day_cache = {}
-
-
-
-
-def _ensure_result_dir():
-    RESULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _load_pending_results():
-    """前回実行から残っている未確定通知を読み込む。"""
-    global pending_results
-    _ensure_result_dir()
-
-    if not PENDING_JSON.exists():
-        pending_results = {}
-        return
-
-    try:
-        data = json.loads(PENDING_JSON.read_text(encoding="utf-8"))
-        pending_results = data if isinstance(data, dict) else {}
-        print(
-            f"結果追跡pending読込: {len(pending_results)}件",
-            flush=True
-        )
-    except Exception as e:
-        pending_results = {}
-        print(
-            f"結果追跡pending読込失敗: {repr(e)}",
-            flush=True
-        )
-
-
-def _save_pending_results():
-    _ensure_result_dir()
-    PENDING_JSON.write_text(
-        json.dumps(
-            pending_results,
-            ensure_ascii=False,
-            indent=2
-        ),
-        encoding="utf-8"
-    )
-
-
-def _git_persist_result_files():
-    """
-    GitHub Actions上なら結果CSV/pendingをリポジトリへ自動保存する。
-    workflowに contents: write がない場合はpush失敗ログだけ出し、監視は継続。
-    """
-    if not AUTO_GIT_SAVE:
-        return
-
-    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
-        return
-
-    try:
-        subprocess.run(
-            ["git", "config", "user.name", "github-actions[bot]"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        paths = [str(RESULTS_CSV), str(PENDING_JSON), str(SECOND_ANALYSIS_CSV)]
-        subprocess.run(["git", "add", *paths], check=True)
-
-        diff = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            check=False
-        )
-        if diff.returncode == 0:
-            return
-
-        subprocess.run(
-            ["git", "commit", "-m", "chore: save shinsum race results"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        pushed = subprocess.run(
-            ["git", "push"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        if pushed.returncode == 0:
-            print("結果ログをGitHubへ保存", flush=True)
-        else:
-            print(
-                "結果ログGitHub保存失敗: "
-                + (pushed.stderr or pushed.stdout).strip(),
-                flush=True
-            )
-
-    except Exception as e:
-        print(
-            f"結果ログGitHub保存処理失敗: {repr(e)}",
-            flush=True
-        )
-
-
-def _race_datetime(date_str, deadline_value):
-    h, m = map(int, deadline_value.split(":"))
-    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(
-        hour=h,
-        minute=m,
-        second=0,
-        microsecond=0,
-        tzinfo=JST,
-    )
-    return dt
-
-
-def register_result_tracking(
-    venue,
-    race,
-    deadline_value,
-    alert,
-    final_rates,
-    classification,
-):
-    """通知したレースを結果確認待ちとして保存する。"""
-    if venue not in VENUE_JCD:
-        return
-
-    race_no_match = re.search(r"([1-9]|1[0-2])", race)
-    if not race_no_match:
-        return
-
-    date_str = f"{now():%Y-%m-%d}"
-    key = f"{date_str}|{venue}|{race}"
-
-    snapshot_rates = {
-        str(boat): {
-            "base": x.get("base"),
-            "theory": x.get("theory"),
-            "checker": x.get("checker"),
-            "final": x.get("final"),
-        }
-        for boat, x in final_rates.items()
-    }
-
-    pending_results[key] = {
-        "date": date_str,
-        "venue": venue,
-        "race": race,
-        "race_no": int(race_no_match.group(1)),
-        "deadline": deadline_value,
-        "alert": alert or "通常レース",
-        "classification": classification.get("type", ""),
-        "focus": classification.get("focus", []),
-        "final_rates": snapshot_rates,
-        "current_diffs": classification.get("current_diffs", {}),
-        "one_x_rates": classification.get("one_x_rates", {}),
-        "notified_at": now().isoformat(),
-    }
-
-    _save_pending_results()
-
-    print(
-        f"結果追跡登録: {venue} / {race} / "
-        f"締切 {deadline_value} / "
-        f"注目 {classification.get('focus', [])}",
-        flush=True
-    )
-
-
-
-def fetch_official_result(item):
-    """
-    BOAT RACE オフィシャル結果ページから1着・2着艇を取得。
-    未確定ならNone。
-    """
-    jcd = VENUE_JCD.get(item["venue"])
-    if not jcd:
-        return None
-
-    hd = item["date"].replace("-", "")
-    url = (
-        "https://www.boatrace.jp/owpc/pc/race/raceresult"
-        f"?hd={hd}&jcd={jcd}&rno={item['race_no']}"
-    )
-
-    try:
-        r = requests.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) "
-                    "AppleWebKit/537.36 Chrome/131 Safari/537.36"
-                )
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-
-        html = r.text
-        plain = re.sub(r"<[^>]+>", " ", html)
-        plain = re.sub(r"&nbsp;|&#160;", " ", plain)
-        plain = re.sub(r"\s+", " ", plain)
-
-        m1 = re.search(
-            r"(?:１|1)\s*([1-6])\s*\d{4}",
-            plain
-        )
-        m2 = re.search(
-            r"(?:２|2)\s*([1-6])\s*\d{4}",
-            plain
-        )
-
-        if not m1:
-            return None
-
-        return {
-            "winner": int(m1.group(1)),
-            "second": int(m2.group(1)) if m2 else None,
-        }
-
-    except Exception as e:
-        print(
-            f"公式結果取得失敗: {item['venue']} / "
-            f"{item['race']} / {repr(e)}",
-            flush=True
-        )
-        return None
-
-
-
-def _append_result_csv(item, winner):
-    _ensure_result_dir()
-
-    rates = {
-        int(k): v
-        for k, v in item.get("final_rates", {}).items()
-    }
-    focus = [int(x) for x in item.get("focus", [])]
-
-    ranked = sorted(
-        rates.items(),
-        key=lambda kv: (
-            kv[1].get("final")
-            if kv[1].get("final") is not None
-            else -999
-        ),
-        reverse=True,
-    )
-
-    predicted_top = ranked[0][0] if ranked else None
-    predicted_top_rate = (
-        ranked[0][1].get("final") if ranked else None
-    )
-    winner_final = (
-        rates.get(winner, {}).get("final")
-        if winner in rates
-        else None
-    )
-
-    row = {
-        "date": item["date"],
-        "venue": item["venue"],
-        "race": item["race"],
-        "deadline": item["deadline"],
-        "alert": item.get("alert", ""),
-        "classification": item.get("classification", ""),
-        "focus_boats": "-".join(map(str, focus)),
-        "winner": winner,
-        "focus_hit": 1 if winner in focus else 0,
-        "predicted_top": predicted_top or "",
-        "top_hit": 1 if predicted_top == winner else 0,
-        "predicted_top_rate": (
-            f"{predicted_top_rate:.1f}"
-            if predicted_top_rate is not None else ""
-        ),
-        "winner_final_rate": (
-            f"{winner_final:.1f}"
-            if winner_final is not None else ""
-        ),
-        "resolved_at": now().isoformat(),
-    }
-
-    fields = list(row.keys())
-    exists = RESULTS_CSV.exists()
-
-    with RESULTS_CSV.open("a", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
-
-    print(
-        f"結果ログ保存: {item['venue']} / {item['race']} / "
-        f"1着{winner}号艇 / 注目的中={row['focus_hit']} / "
-        f"最終値トップ的中={row['top_hit']}",
-        flush=True
-    )
-
-
-def _append_second_place_analysis(item, second_boat):
-    """
-    1号艇が1着だったレースだけ、実際の2着艇と
-    レース前のsum系データを分析用CSVへ保存する。
-    """
-    if second_boat is None:
-        return
-
-    _ensure_result_dir()
-
-    rates = {
-        int(k): v
-        for k, v in item.get("final_rates", {}).items()
-    }
-    diffs = {
-        int(k): v
-        for k, v in item.get("current_diffs", {}).items()
-    }
-    one_x = {
-        int(k): v
-        for k, v in item.get("one_x_rates", {}).items()
-    }
-
-    info = rates.get(second_boat, {})
-
-    # 2〜6号艇を、補正合計が大きい順に並べた順位も残す
-    candidate_rows = []
-    for boat in range(2, 7):
-        x = rates.get(boat)
-        if not x:
-            continue
-        theory = x.get("theory")
-        checker = x.get("checker")
-        if theory is None or checker is None:
-            continue
-        boost = theory + checker
-        candidate_rows.append((boat, boost))
-
-    candidate_rows.sort(key=lambda x: x[1], reverse=True)
-    boost_rank = ""
-    for idx, (boat, _) in enumerate(candidate_rows, start=1):
-        if boat == second_boat:
-            boost_rank = idx
-            break
-
-    # 1-X確率順位
-    one_x_rank = ""
-    ranked_one_x = sorted(
-        one_x.items(),
-        key=lambda kv: kv[1],
-        reverse=True
-    )
-    for idx, (boat, _) in enumerate(ranked_one_x, start=1):
-        if boat == second_boat:
-            one_x_rank = idx
-            break
-
-    row = {
-        "date": item["date"],
-        "venue": item["venue"],
-        "race": item["race"],
-        "classification": item.get("classification", ""),
-        "second_boat": second_boat,
-        "second_current_diff": diffs.get(second_boat, ""),
-        "second_base_1st": info.get("base", ""),
-        "second_theory_1st": info.get("theory", ""),
-        "second_checker_1st": info.get("checker", ""),
-        "second_total_boost": (
-            (info.get("theory") or 0.0) + (info.get("checker") or 0.0)
-            if info else ""
-        ),
-        "second_final_1st": info.get("final", ""),
-        "one_x_probability": one_x.get(second_boat, ""),
-        "boost_rank_2to6": boost_rank,
-        "one_x_rank_2to6": one_x_rank,
-        "resolved_at": now().isoformat(),
-    }
-
-    fields = list(row.keys())
-    exists = SECOND_ANALYSIS_CSV.exists()
-
-    with SECOND_ANALYSIS_CSV.open(
-        "a",
-        encoding="utf-8",
-        newline=""
-    ) as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
-
-    print(
-        f"2着分析ログ保存: {item['venue']} / {item['race']} / "
-        f"1- {second_boat} / "
-        f"補正={row['second_total_boost']} / "
-        f"1-{second_boat}確率={row['one_x_probability']}",
-        flush=True
-    )
-
-
-def check_pending_results():
-    """締切後の通知済みレースを自動で結果確認しCSVへ保存する。"""
-    if not pending_results:
-        return
-
-    resolved = []
-
-    for key, item in list(pending_results.items()):
-        try:
-            race_dt = _race_datetime(
-                item["date"],
-                item["deadline"]
-            )
-        except Exception:
-            continue
-
-        if now() < race_dt + timedelta(minutes=RESULT_CHECK_DELAY_MIN):
-            continue
-
-        result = fetch_official_result(item)
-        if result is None:
-            continue
-
-        winner = result["winner"]
-        second = result.get("second")
-
-        _append_result_csv(item, winner)
-
-        # 2着分析は「1号艇が実際に逃げたレースだけ」
-        if winner == 1:
-            _append_second_place_analysis(
-                item,
-                second
-            )
-
-        resolved.append(key)
-
-    if not resolved:
-        return
-
-    for key in resolved:
-        pending_results.pop(key, None)
-
-    _save_pending_results()
-    _git_persist_result_files()
-
-
-def print_result_stats():
-    """保存済み結果の簡単な自動集計をログへ表示。"""
-    if not RESULTS_CSV.exists():
-        return
-
-    try:
-        rows = list(csv.DictReader(
-            RESULTS_CSV.open("r", encoding="utf-8")
-        ))
-        if not rows:
-            return
-
-        n = len(rows)
-        focus_hits = sum(
-            1 for r in rows if r.get("focus_hit") == "1"
-        )
-        top_hits = sum(
-            1 for r in rows if r.get("top_hit") == "1"
-        )
-
-        print(
-            f"結果統計: {n}件 / "
-            f"注目艇1着 {focus_hits}件({focus_hits / n * 100:.1f}%) / "
-            f"最終値トップ1着 {top_hits}件({top_hits / n * 100:.1f}%)",
-            flush=True
-        )
-    except Exception as e:
-        print(f"結果統計読込失敗: {repr(e)}", flush=True)
 
 def now():
     return datetime.now(JST)
@@ -637,130 +71,6 @@ def now():
 def active():
     return 8 <= now().hour < 23
 
-
-
-def _strip_official_html(raw):
-    """BOAT RACE オフィシャルHTMLを開催日判定用の簡易テキストへ変換。"""
-    # 会場名がimg altだけに入る場合もあるので、altを先に文字列化する。
-    raw = re.sub(
-        r'<img\b[^>]*\balt=["\']([^"\']+)["\'][^>]*>',
-        r' \1 ',
-        raw,
-        flags=re.I,
-    )
-    raw = re.sub(r'<script\b[^>]*>.*?</script>', ' ', raw, flags=re.I | re.S)
-    raw = re.sub(r'<style\b[^>]*>.*?</style>', ' ', raw, flags=re.I | re.S)
-    raw = re.sub(r'<[^>]+>', ' ', raw)
-    raw = html.unescape(raw)
-    return re.sub(r'\s+', ' ', raw).strip()
-
-
-def _to_ascii_digits(s):
-    return str(s).translate(str.maketrans('０１２３４５６７８９', '0123456789'))
-
-
-def meeting_day(venue):
-    """
-    現在日の開催何日目かを返す。初日=1、2日目=2。
-    判定不能・非開催は None。結果は当日/場ごとにキャッシュする。
-    """
-    today = now().date()
-    cache_key = (today.isoformat(), venue)
-    if cache_key in _meeting_day_cache:
-        return _meeting_day_cache[cache_key]
-
-    hd = today.strftime('%Y%m%d')
-    url = f'https://www.boatrace.jp/owpc/pc/race/index?hd={hd}'
-
-    try:
-        r = requests.get(
-            url,
-            headers={'User-Agent': 'Mozilla/5.0'},
-            timeout=15,
-        )
-        r.raise_for_status()
-        text = _strip_official_html(r.text)
-
-        pos = text.find(venue)
-        if pos < 0:
-            print(f'開催日判定: {venue} は本日開催一覧に見つからず', flush=True)
-            _meeting_day_cache[cache_key] = None
-            return None
-
-        # 1会場カード内に収まる程度を切り出す。
-        block = _to_ascii_digits(text[pos:pos + 1800])
-
-        # 公式一覧は通常「8/19-8/24 初日」の形で表示される。
-        m = re.search(
-            r'(\d{1,2})\s*/\s*(\d{1,2})\s*[-～〜~－ー]\s*'
-            r'(\d{1,2})\s*/\s*(\d{1,2})',
-            block,
-        )
-
-        if m:
-            sm, sd, em, ed = map(int, m.groups())
-            start_year = today.year
-            end_year = today.year
-
-            # 年またぎ（12月開始→1月終了）にも対応。
-            if sm == 12 and today.month == 1:
-                start_year -= 1
-            if em == 1 and sm == 12:
-                end_year = start_year + 1
-
-            start = datetime(start_year, sm, sd).date()
-            end = datetime(end_year, em, ed).date()
-
-            if start <= today <= end:
-                day_no = (today - start).days + 1
-                _meeting_day_cache[cache_key] = day_no
-                print(
-                    f'開催日判定: {venue} {day_no}日目 '
-                    f'({sm}/{sd}-{em}/{ed})',
-                    flush=True,
-                )
-                return day_no
-
-        # 日付範囲が取れない場合は、同じ会場カード内の表示を補助的に使う。
-        if '初日' in block:
-            _meeting_day_cache[cache_key] = 1
-            print(f'開催日判定: {venue} 初日', flush=True)
-            return 1
-
-        dm = re.search(r'([2-9])\s*日目', block)
-        if dm:
-            day_no = int(dm.group(1))
-            _meeting_day_cache[cache_key] = day_no
-            print(f'開催日判定: {venue} {day_no}日目', flush=True)
-            return day_no
-
-        if '最終日' in block:
-            # 最終日が2日目という特殊短期開催を誤って通さないため、
-            # 日数不明の最終日は対象外とする。
-            _meeting_day_cache[cache_key] = None
-            print(f'開催日判定: {venue} 最終日（日数不明）→対象外', flush=True)
-            return None
-
-    except Exception as e:
-        print(f'開催日判定失敗: {venue} / {repr(e)}', flush=True)
-
-    _meeting_day_cache[cache_key] = None
-    return None
-
-
-def notify_day_allowed(venue):
-    day_no = meeting_day(venue)
-    allowed = day_no in NOTIFY_MEETING_DAYS
-
-    if not allowed:
-        label = f'{day_no}日目' if day_no is not None else '判定不能'
-        print(
-            f'通知対象外: {venue} / {label} / '
-            f'初日・2日目のみ通知',
-            flush=True,
-        )
-
-    return allowed
 
 def deadline(text):
     m = re.search(
@@ -820,14 +130,14 @@ def candidate_links(page):
 
             try:
                 txt = a.inner_text(timeout=250) or ""
-            except Exception:
+            except:
                 pass
 
             try:
                 txt += "\n" + a.locator(
                     "xpath=ancestor::*[self::div or self::td or self::li or self::section][1]"
                 ).inner_text(timeout=250)
-            except Exception:
+            except:
                 pass
 
             if (
@@ -839,7 +149,7 @@ def candidate_links(page):
             ):
                 out.append(full)
 
-        except Exception:
+        except:
             pass
 
     return list(dict.fromkeys(out))
@@ -888,1204 +198,92 @@ def alert_near_deadline(text, d):
     )
 
 
-
-def parse_base_1st_rates_dom(page):
+def parse_theory_1st(text):
     """
-    画面上の位置(Y座標)を使って「選手名・1着率」欄だけから元1着率を取る。
+    シンsum理論の「1着」変化率を6艇全部取得。
 
-    inner_text の並びや「←シンsum理論に戻る」等には依存しない。
-    「選手名・1着率」見出しより下、
-    「危険艇 / 戦法別上昇率 / スリット隊形 / シンsum理論」より上に
-    実際に表示されている符号なし%だけを取得する。
-    """
-    try:
-        data = page.evaluate(
-            r"""
-            () => {
-              const norm = (s) =>
-                (s || "")
-                  .replace(/\u00a0/g, " ")
-                  .replace(/\s+/g, " ")
-                  .trim();
-
-              const visible = (el) => {
-                const r = el.getBoundingClientRect();
-                const st = getComputedStyle(el);
-                return (
-                  r.width > 0 &&
-                  r.height > 0 &&
-                  st.display !== "none" &&
-                  st.visibility !== "hidden"
-                );
-              };
-
-              const els = Array.from(document.querySelectorAll("body *"))
-                .filter(visible);
-
-              // できるだけ小さい要素で「選手名・1着率」見出しを探す。
-              let headers = els.filter((el) => {
-                const t = norm(el.innerText);
-                return (
-                  t.length <= 30 &&
-                  /選手名\s*[・･]\s*1着率/.test(t)
-                );
-              });
-
-              if (!headers.length) {
-                // 見出しが「選手名」「1着率」に分かれている場合の保険。
-                headers = els.filter((el) => {
-                  const t = norm(el.innerText);
-                  return t === "選手名";
-                });
-              }
-
-              if (!headers.length) {
-                return {
-                  ok: false,
-                  reason: "header_not_found",
-                  values: []
-                };
-              }
-
-              // ページ上部側の最初の候補を使う。
-              headers.sort(
-                (a, b) =>
-                  a.getBoundingClientRect().top -
-                  b.getBoundingClientRect().top
-              );
-
-              const header = headers[0];
-              const hr = header.getBoundingClientRect();
-              const startY = hr.bottom;
-
-              // 次セクションの開始Yを探す。
-              const endWords = [
-                "危険艇",
-                "戦法別上昇率",
-                "スリット隊形",
-                "シンsum理論"
-              ];
-
-              const endYs = [];
-
-              for (const el of els) {
-                const r = el.getBoundingClientRect();
-                if (r.top <= startY + 2) continue;
-
-                const t = norm(el.innerText);
-
-                // 親要素全体を誤検出しないよう短いラベルだけを見る。
-                if (t.length > 40) continue;
-
-                if (endWords.some((w) => t === w || t.startsWith(w))) {
-                  endYs.push(r.top);
-                }
-              }
-
-              const endY = endYs.length
-                ? Math.min(...endYs)
-                : startY + 1400;
-
-              const raw = [];
-
-              for (const el of els) {
-                const r = el.getBoundingClientRect();
-                if (r.top < startY - 2 || r.bottom > endY + 2) {
-                  continue;
-                }
-
-                const t = norm(el.innerText);
-
-                // 元1着率は符号なし xx% だけ。
-                if (!/^\d+(?:\.\d+)?%$/.test(t)) continue;
-
-                raw.push({
-                  text: t,
-                  value: parseFloat(t),
-                  x: r.left,
-                  y: r.top,
-                  h: r.height,
-                  tag: el.tagName
-                });
-              }
-
-              // 入れ子要素で同じ%が重複することがあるため、
-              // 同一Y付近・同一値は1件にする。
-              raw.sort((a, b) => a.y - b.y || a.x - b.x);
-
-              const dedup = [];
-              for (const item of raw) {
-                const dup = dedup.some(
-                  (x) =>
-                    Math.abs(x.y - item.y) < 3 &&
-                    x.value === item.value
-                );
-                if (!dup) dedup.push(item);
-              }
-
-              // 選手一覧は上から1〜6号艇。
-              const values = dedup.slice(0, 6).map((x) => x.value);
-
-              return {
-                ok: values.length > 0,
-                reason: values.length ? "ok" : "no_percent_in_section",
-                startY,
-                endY,
-                values,
-                raw: dedup.slice(0, 12)
-              };
-            }
-            """
-        )
-
-        values = data.get("values", []) if isinstance(data, dict) else []
-
-        result = {
-            boat: float(values[boat - 1])
-            for boat in range(1, len(values) + 1)
-        }
-
-        print(
-            f"元1着率候補(DOM/V19): {values} -> {result}",
-            flush=True
-        )
-
-        if not result:
-            print(
-                f"元1着率DOM取得失敗: {data}",
-                flush=True
-            )
-
-        return result
-
-    except Exception as e:
-        print(
-            f"元1着率DOM解析例外: {repr(e)}",
-            flush=True
-        )
-        return {}
-
-def parse_base_1st_rates(text):
-    """
-    ページ上部の「選手名・1着率」欄から、明示された元1着率だけを取得する。
-
-    V18の重要修正:
-    ページ上部には「←シンsum理論に戻る」があるため、
-    ページ先頭から最初の「シンsum理論」を終了位置にすると
-    選手一覧より前で切れてしまう。
-
-    そこで、
-      1. 締切表示より後にある最初の「選手名」を開始点
-      2. その開始点より後にある
-         「危険艇 / 戦法別上昇率 / スリット隊形 / シンsum理論」
-         の最初を終了点
-    として、選手一覧だけを切り出す。
-
-    切り出した範囲の符号なし%を上から順に1〜6号艇へ割り当てる。
-    「危険艇」以降の12/13/14/15/16の組み合わせ確率は含めない。
-    """
-
-    # 締切表示より後から選手一覧を探す。
-    deadline_pos = -1
-    m_deadline = re.search(
-        r"締切\s*[：:]?\s*(?:[01]?\d|2[0-3]):[0-5]\d",
-        text
-    )
-    if m_deadline:
-        deadline_pos = m_deadline.end()
-
-    # 「選手名・1着率」でも「選手名」単独でも対応。
-    search_from = max(0, deadline_pos)
-    m_header = re.search(
-        r"選手名(?:\s*[・･]\s*1着率)?",
-        text[search_from:]
-    )
-
-    if not m_header:
-        print(
-            "元1着率: 選手一覧開始位置を検出できず",
-            flush=True
-        )
-        return {}
-
-    section_start = search_from + m_header.start()
-
-    # 必ず section_start より後だけを検索する。
-    tail = text[section_start:]
-    end_candidates = []
-
-    for pattern in (
-        r"危険艇",
-        r"戦法別上昇率",
-        r"スリット隊形",
-        r"シン\s*sum理論",
-    ):
-        m = re.search(pattern, tail[1:])
-        if m:
-            end_candidates.append(
-                section_start + 1 + m.start()
-            )
-
-    section_end = (
-        min(end_candidates)
-        if end_candidates
-        else min(len(text), section_start + 7000)
-    )
-
-    section = text[section_start:section_end]
-
-    # 元1着率は符号なしの%。
-    # +11% / -8% のような上昇率・補正値は除外。
-    values = [
-        float(x)
-        for x in re.findall(
-            r"(?<![+\-\d.])(\d+(?:\.\d+)?)\s*%",
-            section
-        )
-    ][:6]
-
-    result = {
-        boat: values[boat - 1]
-        for boat in range(1, len(values) + 1)
+    戻り値例:
+    {
+        1: -2.0,
+        2: 5.0,
+        3: 23.0,
+        4: 12.0,
+        5: -1.0,
+        6: 3.0
     }
-
-    print(
-        f"元1着率候補(V18): {values} -> {result}",
-        flush=True
-    )
-
-    # 取得失敗時は切り出した本文も一部出して原因確認できるようにする。
-    if not result:
-        print(
-            "元1着率解析section:",
-            repr(section[:1200]),
-            flush=True
-        )
-
-    return result
-
-
-def parse_one_x_rates(text):
     """
-    「危険艇」欄などに表示される
-      12 = 1-2
-      13 = 1-3
-      14 = 1-4
-      15 = 1-5
-      16 = 1-6
-    の出目確率を取得する。
 
-    ※これは各艇の1着率ではない。
-    2着候補分析専用データとして保存する。
-    """
+    start = text.find("シンsum理論")
+
+    if start < 0:
+        return {}
+
+    end = text.find("シンsumチェッカー", start)
+
+    section = text[
+        start:(end if end > start else start + 6000)
+    ]
+
+    lines = [
+        x.strip()
+        for x in section.splitlines()
+        if x.strip()
+    ]
+
     result = {}
 
-    # 「危険艇」付近を優先して見る
-    start = text.find("危険艇")
-    if start >= 0:
-        section = text[start:start + 2500]
-    else:
-        section = text[:6000]
+    for boat in range(1, 7):
+        for i, line in enumerate(lines):
 
-    # 改行・空白の揺れに対応
-    compact = re.sub(r"\s+", " ", section)
+            if line != str(boat):
+                continue
 
-    for boat in range(2, 7):
-        token = f"1{boat}"
-        # 例: 14 30% / 1-4 30%
-        patterns = (
-            rf"(?<!\d){token}(?!\d)[^%]{{0,40}}?(\d+(?:\.\d+)?)\s*%",
-            rf"1\s*[-－]\s*{boat}[^%]{{0,40}}?(\d+(?:\.\d+)?)\s*%",
-        )
+            # 1艇分を広めに確認
+            window = "\n".join(lines[i:i + 18])
 
-        for pat in patterns:
-            m = re.search(pat, compact)
-            if m:
-                result[boat] = float(m.group(1))
+            # シンsum理論は
+            # 1着 / 2着 / 3着 / 3連 の順に%が出る想定。
+            pcts = re.findall(
+                r"([+-]?\d+(?:\.\d+)?)\s*%",
+                window
+            )
+
+            if pcts:
+                result[boat] = float(pcts[0])
                 break
 
     return result
 
 
-def extract_theory_section(text):
-    """
-    実際のシンsum理論表だけを切り出す。
-
-    ページ上部の「←シンsum理論に戻る」を誤認しないため、
-    text内のすべての「シンsum理論」候補を調べ、
-    その後に4桁登録番号が最も多く並ぶ候補を本表として採用する。
-    """
-    starts = [m.start() for m in re.finditer(r"シン\s*sum理論", text)]
-
-    best_section = ""
-    best_score = -1
-
-    for start in starts:
-        end = text.find("シンsumチェッカー", start)
-        section = text[start:(end if end > start else min(len(text), start + 10000))]
-
-        regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
-        regs_unique = list(dict.fromkeys(regs))
-
-        diff_like = re.findall(
-            r"(?<![\d.])([+-]\d+(?:\.\d+)?)(?!\s*%)",
-            section
-        )
-
-        score = len(regs_unique) * 100 + len(diff_like)
-
-        if score > best_score:
-            best_score = score
-            best_section = section
-
-    return best_section
-
-def parse_theory_adjustments(text):
-    """
-    シンsum理論表の「1着」補正を6艇全部取得。
-
-    各4桁登録番号を起点に、その艇ブロック内で最初に出る
-    %付き数値を1着補正として読む。
-    """
-    section = extract_theory_section(text)
-    if not section:
-        return {}
-
-    regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
-    regs = list(dict.fromkeys(regs))
-
-    if len(regs) < 6:
-        return {}
-
-    regs = regs[:6]
-    result = {}
-
-    for boat, reg in enumerate(regs, start=1):
-        mreg = re.search(
-            rf"(?<!\d){re.escape(reg)}(?!\d)",
-            section
-        )
-        if not mreg:
-            continue
-
-        next_pos = len(section)
-        if boat < 6:
-            next_reg = regs[boat]
-            mn = re.search(
-                rf"(?<!\d){re.escape(next_reg)}(?!\d)",
-                section[mreg.end():]
-            )
-            if mn:
-                next_pos = mreg.end() + mn.start()
-
-        block = section[mreg.end():next_pos]
-
-        pcts = re.findall(
-            r"([+-]?\d+(?:\.\d+)?)\s*%",
-            block
-        )
-
-        if pcts:
-            result[boat] = float(pcts[0])
-
-    return result
-
-
-
-def parse_theory_place_adjustments(text, place_index):
-    """
-    シンsum理論表の着順補正を6艇分取得する。
-    place_index: 0=1着, 1=2着, 2=3着
-    """
-    section = extract_theory_section(text)
-    if not section:
-        return {}
-
-    regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
-    regs = list(dict.fromkeys(regs))[:6]
-    if len(regs) < 6:
-        return {}
-
-    result = {}
-    for boat, reg in enumerate(regs, start=1):
-        mreg = re.search(rf"(?<!\d){re.escape(reg)}(?!\d)", section)
-        if not mreg:
-            continue
-
-        next_pos = len(section)
-        if boat < 6:
-            next_reg = regs[boat]
-            mn = re.search(rf"(?<!\d){re.escape(next_reg)}(?!\d)", section[mreg.end():])
-            if mn:
-                next_pos = mreg.end() + mn.start()
-
-        block = section[mreg.end():next_pos]
-        pcts = re.findall(r"([+-]?\d+(?:\.\d+)?)\s*%", block)
-        if len(pcts) > place_index:
-            result[boat] = float(pcts[place_index])
-
-    return result
-
-
-class _SimpleTableParser(HTMLParser):
-    """外部サイトのHTML表を依存ライブラリなしで読む簡易パーサ。"""
-    def __init__(self):
-        super().__init__()
-        self.tables = []
-        self._table_depth = 0
-        self._table = None
-        self._row = None
-        self._cell = None
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag == "table":
-            self._table_depth += 1
-            if self._table_depth == 1:
-                self._table = []
-        elif self._table_depth and tag == "tr":
-            self._row = []
-        elif self._table_depth and tag in ("td", "th"):
-            self._cell = []
-        elif self._cell is not None and tag == "br":
-            self._cell.append(" ")
-
-    def handle_data(self, data):
-        if self._cell is not None:
-            self._cell.append(data)
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if self._table_depth and tag in ("td", "th") and self._cell is not None:
-            text = re.sub(r"\s+", " ", "".join(self._cell)).strip()
-            if self._row is not None:
-                self._row.append(text)
-            self._cell = None
-        elif self._table_depth and tag == "tr":
-            if self._table is not None and self._row:
-                self._table.append(self._row)
-            self._row = None
-        elif tag == "table" and self._table_depth:
-            self._table_depth -= 1
-            if self._table_depth == 0:
-                if self._table:
-                    self.tables.append(self._table)
-                self._table = None
-
-
-def _html_tables(html_text):
-    parser = _SimpleTableParser()
-    parser.feed(html_text)
-    return parser.tables
-
-
-def _row_boat_no(row):
-    for cell in row[:3]:
-        m = re.fullmatch(r"\s*([1-6])\s*", cell)
-        if m:
-            return int(m.group(1))
-    return None
-
-
-def _percent_values(row):
-    vals = []
-    for cell in row:
-        for m in re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)\s*%", cell):
-            vals.append(float(m.group(1)))
-    return vals
-
-
-def fetch_boaters_second_data(venue, race, date_value=None):
-    """
-    BOATERS の race/.../data から
-      ・直近10走 1/2/3着率
-      ・1号艇先頭時の2着率/3着率
-      ・直近10走の平均ST/平均ST順位
-    を取得する。
-    取得失敗時は空dictで返し、通知本体は止めない。
-    """
-    slug = BOATERS_VENUE_SLUG.get(venue)
-    if not slug:
-        return {}
-
-    date_value = date_value or now().date()
-    if hasattr(date_value, "strftime"):
-        date_str = date_value.strftime("%Y-%m-%d")
-    else:
-        date_str = str(date_value)
-
-    race_no = int(re.sub(r"\D", "", str(race)) or 0)
-    if not race_no:
-        return {}
-
-    url = f"https://boaters-boatrace.com/race/{slug}/{date_str}/{race_no}R/data"
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; shinsum-monitor/33)"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        tables = _html_tables(resp.text)
-    except Exception as e:
-        print(f"BOATERS取得失敗: {venue} / {race} / {repr(e)}", flush=True)
-        return {}
-
-    recent = {}
-    lead = {}
-    st = {}
-
-    for table in tables:
-        flat = " ".join(" ".join(row) for row in table)
-
-        # 直近10走の枠別場別実績。AI値が出ていても、末尾4つが
-        # 3連対率/1着率/2着率/3着率になる構造を利用する。
-        if all(k in flat for k in ("3連対率", "1着率", "2着率", "3着率")):
-            for row in table:
-                boat = _row_boat_no(row)
-                pcts = _percent_values(row)
-                if boat and len(pcts) >= 4:
-                    last4 = pcts[-4:]
-                    recent[boat] = {
-                        "three_rate": last4[0],
-                        "first_rate": last4[1],
-                        "second_rate": last4[2],
-                        "third_rate": last4[3],
-                    }
-
-        # 先頭艇別連対率。1号艇を先頭としたデフォルト表示を使用。
-        if all(k in flat for k in ("先頭", "着取率", "2着率", "3着率")):
-            for row in table:
-                boat = _row_boat_no(row)
-                pcts = _percent_values(row)
-                if boat and boat >= 2 and len(pcts) >= 3:
-                    lead[boat] = {
-                        "take_rate": pcts[-3],
-                        "second_rate": pcts[-2],
-                        "third_rate": pcts[-1],
-                    }
-
-        if all(k in flat for k in ("平均ST", "平均ST順位")):
-            for row in table:
-                boat = _row_boat_no(row)
-                if not boat:
-                    continue
-                row_text = " ".join(row)
-                mst = re.search(r"(?<!\d)(0\.\d{2})(?!\d)", row_text)
-                mrank = re.search(r"(\d+(?:\.\d+)?)\s*位", row_text)
-                if mst:
-                    st[boat] = {
-                        "avg_st": float(mst.group(1)),
-                        "avg_st_rank": float(mrank.group(1)) if mrank else None,
-                    }
-
-    print(
-        f"BOATERS2着材料: {venue} / {race} / "
-        f"直近{len(recent)}艇 先頭別{len(lead)}艇 ST{len(st)}艇",
-        flush=True,
-    )
-    return {"recent": recent, "lead": lead, "st": st, "url": url}
-
-
-def fetch_official_f_st(venue, race, date_value=None):
-    """BOAT RACE公式出走表から今期F数と平均STを取得。"""
-    jcd = VENUE_JCD.get(venue)
-    if not jcd:
-        return {}
-
-    date_value = date_value or now().date()
-    hd = date_value.strftime("%Y%m%d") if hasattr(date_value, "strftime") else str(date_value).replace("-", "")
-    race_no = int(re.sub(r"\D", "", str(race)) or 0)
-    url = f"https://www.boatrace.jp/owpc/pc/race/racelist?hd={hd}&jcd={jcd}&rno={race_no}"
-
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; shinsum-monitor/33)"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        tables = _html_tables(resp.text)
-    except Exception as e:
-        print(f"公式F/ST取得失敗: {venue} / {race} / {repr(e)}", flush=True)
-        return {}
-
-    result = {}
-    for table in tables:
-        flat = " ".join(" ".join(row) for row in table)
-        if "F数" not in flat or "平均ST" not in flat:
-            continue
-        for row in table:
-            boat = _row_boat_no(row)
-            if not boat:
-                continue
-            row_text = re.sub(r"\s+", " ", " ".join(row))
-            mf = re.search(r"F\s*([0-9])", row_text)
-            # F/L表示の直後に出る平均STを優先
-            mst = re.search(r"F\s*[0-9].{0,25}?L\s*[0-9].{0,25}?(0\.\d{2})", row_text)
-            if not mst:
-                mst = re.search(r"(?<!\d)(0\.\d{2})(?!\d)", row_text)
-            if mf or mst:
-                result[boat] = {
-                    "f_count": int(mf.group(1)) if mf else 0,
-                    "official_avg_st": float(mst.group(1)) if mst else None,
-                }
-        if result:
-            break
-
-    print(f"公式F/ST材料: {venue} / {race} / {len(result)}艇", flush=True)
-    return result
-
-
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-
-def _integer_percentages(raw):
-    """正の重みを整数%にし、必ず合計100にする。"""
-    positive = {b: max(0.0001, float(v)) for b, v in raw.items()}
-    total = sum(positive.values())
-    exact = {b: positive[b] * 100.0 / total for b in positive}
-    floors = {b: int(exact[b]) for b in exact}
-    remain = 100 - sum(floors.values())
-    order = sorted(exact, key=lambda b: (exact[b] - floors[b], exact[b]), reverse=True)
-    for b in order[:remain]:
-        floors[b] += 1
-    return floors
-
-
-def build_second_place_prediction(item):
-    """
-    1号艇1着予想時だけ、2〜6号艇の2着率を合計100%で配分する。
-
-    主材料:
-      BOATERS: 1号艇先頭時2着率 / 直近10走1・2・3着率 / 平均ST
-      シンsum: 1-X出目率 / 理論2着補正 / チェッカー2着補正 / 平均差 / スリット
-      公式: 今期F数 / 平均ST
-
-    外部サイト取得に失敗した項目はその艇の重みから外して再正規化する。
-    F持ちは最後に明確な減点を掛ける。
-    """
-    c = item.get("classification", {})
-    if c.get("type") not in ("1号艇有利", "1号艇逃げ強化", "1号艇逃げ強化・対抗艇注意"):
-        return None
-
-    venue = item["venue"]
-    race = item["race"]
-    boaters = fetch_boaters_second_data(venue, race)
-    official = fetch_official_f_st(venue, race)
-    recent = boaters.get("recent", {})
-    lead = boaters.get("lead", {})
-    st_data = boaters.get("st", {})
-    one_x = c.get("one_x_rates", {}) or item.get("one_x_rates", {}) or {}
-    theory2 = item.get("theory_2nd", {}) or {}
-    final_rates = item.get("final_rates", {})
-
-    # STはBOATERS優先、無ければ公式平均ST。
-    sts = {}
-    for b in range(2, 7):
-        val = (st_data.get(b) or {}).get("avg_st")
-        if val is None:
-            val = (official.get(b) or {}).get("official_avg_st")
-        if val is not None:
-            sts[b] = float(val)
-    if sts:
-        best_st = min(sts.values())
-        worst_st = max(sts.values())
-    else:
-        best_st = worst_st = None
-
-    raw_scores = {}
-    details = {}
-
-    for b in range(2, 7):
-        features = []
-
-        lead2 = (lead.get(b) or {}).get("second_rate")
-        recent2 = (recent.get(b) or {}).get("second_rate")
-        recent1 = (recent.get(b) or {}).get("first_rate")
-        recent3 = (recent.get(b) or {}).get("third_rate")
-        one_x_val = one_x.get(b)
-
-        if lead2 is not None:
-            features.append((SECOND_W_LEAD2, float(lead2)))
-        if recent2 is not None:
-            features.append((SECOND_W_RECENT2, float(recent2)))
-        if one_x_val is not None:
-            features.append((SECOND_W_ONE_X, float(one_x_val)))
-        if recent1 is not None:
-            features.append((SECOND_W_RECENT1, float(recent1)))
-        if recent3 is not None:
-            features.append((SECOND_W_RECENT3, float(recent3)))
-
-        st_val = sts.get(b)
-        st_score = None
-        if st_val is not None:
-            if worst_st == best_st:
-                st_score = 50.0
-            else:
-                st_score = (worst_st - st_val) / (worst_st - best_st) * 100.0
-            features.append((SECOND_W_ST, st_score))
-
-        info = final_rates.get(b, {})
-        adj_diff = info.get("adjusted_diff")
-        slit = info.get("slit_alarm")
-        diff_score = None
-        slit_score = None
-        if adj_diff is not None:
-            # -0.50以下=0点、+0.50以上=100点として連続評価
-            diff_score = _clamp((float(adj_diff) + 0.50) * 100.0, 0.0, 100.0)
-            features.append((SECOND_W_DIFF, diff_score))
-        if slit is not None:
-            # -0.3〜+0.3を0〜100点に変換。左隣より展示が良いほど加点。
-            slit_score = _clamp((float(slit) + 0.30) / 0.60 * 100.0, 0.0, 100.0)
-            features.append((SECOND_W_SLIT, slit_score))
-
-        if features:
-            wsum = sum(w for w, _ in features)
-            score = sum(w * v for w, v in features) / wsum
-        else:
-            score = 1.0
-
-        # シンsum2着補正はpt加算。
-        # V34: 理論2着 + チェッカー2着を合算して、そのまま2着評価へ反映。
-        # 例: 理論 +6.0 / チェッカー +3.8 → 合計 +9.8pt。
-        theory2_val = float(theory2.get(b, 0.0) or 0.0)
-        checker2_val = float(info.get("checker_2nd", 0.0) or 0.0)
-        total_second_adj = (
-            theory2_val * SECOND_THEORY2_MULT
-            + checker2_val * SECOND_CHECKER2_MULT
-        )
-        score += total_second_adj
-
-        # 今期F数は公式のF数だけで判定。F持ちST欄などでは判定しない。
-        f_count = int((official.get(b) or {}).get("f_count", 0) or 0)
-        if f_count >= 2:
-            score *= SECOND_F2_MULT
-        elif f_count == 1:
-            score *= SECOND_F1_MULT
-
-        score = max(score, 0.1)
-        raw_scores[b] = score
-        details[b] = {
-            "lead2": lead2,
-            "recent2": recent2,
-            "recent1": recent1,
-            "recent3": recent3,
-            "one_x": one_x_val,
-            "theory2": theory2_val,
-            "checker2": checker2_val,
-            "total_second_adj": total_second_adj,
-            "st": st_val,
-            "f_count": f_count,
-            "adjusted_diff": adj_diff,
-            "slit": slit,
-            "score": score,
-        }
-
-    percents = _integer_percentages(raw_scores)
-    ranking = sorted(percents, key=lambda b: (percents[b], raw_scores[b]), reverse=True)
-
-    print(
-        f"2着率100%配分: {venue} / {race} / "
-        + " | ".join(f"{b}号艇 {percents[b]}%" for b in ranking),
-        flush=True,
-    )
-
-    return {
-        "percents": percents,
-        "ranking": ranking,
-        "details": details,
-        "boaters_url": boaters.get("url"),
-    }
-
-
-def attach_second_place_prediction(item):
-    try:
-        item["second_prediction"] = build_second_place_prediction(item)
-    except Exception as e:
-        print(
-            f"2着率計算失敗（通知本体は継続）: {item.get('venue')} / {item.get('race')} / {repr(e)}",
-            flush=True,
-        )
-        item["second_prediction"] = None
-    return item
-
-
 def parse_current_diffs(text):
     """
     シンsum理論表の「平均との差」を6艇分取得する。
-
-    重要:
-    艇番の数字(1,2,3...)やヘッダーの「1着/2着/3着」を起点にしない。
-    各艇の4桁登録番号を起点に、その直後に出る
-    「符号付き・%なし」の数値を平均との差として読む。
-
-    例:
-      4836 -> +0.87
-      3807 -> +0.03
-      4419 -> +0.18
+    例: {1: +0.24, 2: -0.31, 3: +0.61, ...}
     """
-    section = extract_theory_section(text)
-    if not section:
-        return {}
-
-    # 登録番号を出現順に拾う。シンsum理論では上から1〜6号艇。
-    regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
-
-    regs = list(dict.fromkeys(regs))
-
-    if len(regs) < 6:
-        return {}
-
-    regs = regs[:6]
-    result = {}
-
-    for boat, reg in enumerate(regs, start=1):
-        mreg = re.search(
-            rf"(?<!\d){re.escape(reg)}(?!\d)",
-            section
-        )
-        if not mreg:
-            continue
-
-        # 次の登録番号までをその艇の範囲にする。
-        next_pos = len(section)
-        if boat < 6:
-            next_reg = regs[boat]
-            mn = re.search(
-                rf"(?<!\d){re.escape(next_reg)}(?!\d)",
-                section[mreg.end():]
-            )
-            if mn:
-                next_pos = mreg.end() + mn.start()
-
-        block = section[mreg.end():next_pos]
-
-        # +0.87 / -0.02 のような符号付き数値。
-        # %付きの理論補正は除外する。
-        candidates = re.findall(
-            r"(?<![\d.])([+-]\d+(?:\.\d+)?)(?!\s*%)",
-            block
-        )
-
-        if not candidates:
-            continue
-
-        # 最初に出る値が平均との差。
-        value = float(candidates[0])
-
-        # 誤取得防止
-        if -5.0 <= value <= 5.0:
-            result[boat] = value
-
-    return result
-
-
-
-def parse_slit_alarms(text):
-    """
-    シンsum理論表の「スリットアラーム」を6艇分取得する。
-
-    スリットアラームは左隣艇との展示タイム差をもとに表示される値。
-    例: 3号艇 6.98 / 4号艇 6.77 -> 4号艇 +0.2
-
-    理論表では各艇ブロック内に
-      1) 平均との差 (+1.60 / -0.22 など)
-      2) スリットアラーム (+0.2 / -0.1 など。表示がある艇のみ)
-    の順で符号付き・%なし数値が出るため、2個目を採用する。
-    表示がない艇は 0.0 とする。
-    """
-    section = extract_theory_section(text)
-    if not section:
-        return {}
-
-    regs = re.findall(r"(?<!\d)([3-5]\d{3})(?!\d)", section)
-    regs = list(dict.fromkeys(regs))
-    if len(regs) < 6:
-        return {}
-    regs = regs[:6]
-
-    result = {}
-    for boat, reg in enumerate(regs, start=1):
-        mreg = re.search(
-            rf"(?<!\d){re.escape(reg)}(?!\d)",
-            section
-        )
-        if not mreg:
-            result[boat] = 0.0
-            continue
-
-        next_pos = len(section)
-        if boat < 6:
-            next_reg = regs[boat]
-            mn = re.search(
-                rf"(?<!\\d){re.escape(next_reg)}(?!\\d)",
-                section[mreg.end():]
-            )
-            if mn:
-                next_pos = mreg.end() + mn.start()
-
-        block = section[mreg.end():next_pos]
-
-        # %値（理論補正）を絶対に拾わないよう、
-        # inner_text上で「その行全体が符号付き数値」のものだけを候補にする。
-        # 例: -0.22 / +0.2 は対象、+1% / -3% は対象外。
-        candidates = []
-        for line in block.splitlines():
-            t = line.strip()
-            if re.fullmatch(r"[+-]\d+(?:\.\d+)?", t):
-                candidates.append(t)
-
-        # 1個目=平均との差、2個目=スリットアラーム。
-        value = 0.0
-        if len(candidates) >= 2:
-            try:
-                value = float(candidates[1])
-            except Exception:
-                value = 0.0
-
-        # 表示上あり得る範囲だけ採用。異常値は0扱いにして誤判定防止。
-        if -2.0 <= value <= 2.0:
-            result[boat] = value
-        else:
-            result[boat] = 0.0
-
-    return result
-
-
-def build_adjusted_diffs(current_diffs, slit_alarms):
-    """
-    チェッカーのゾーン判定に使う平均との差を、
-    「元の平均との差 + スリットアラーム」で補正する。
-
-    例: 4号艇 平均との差 -0.22 / スリット +0.2 -> 補正後 -0.02
-    """
-    adjusted = {}
-    for boat in range(1, 7):
-        if boat not in current_diffs:
-            continue
-        raw = float(current_diffs[boat])
-        slit = float(slit_alarms.get(boat, 0.0) or 0.0)
-        adjusted[boat] = raw + slit
-    return adjusted
-
-def parse_registration_numbers(text):
-    """
-    シンsum理論欄の4桁登録番号を上から6個取得し、
-    1〜6号艇に割り当てる。
-
-    艇番の単独行を探さないため、
-    ヘッダー数字を誤認しない。
-    """
-    section = extract_theory_section(text)
-    if not section:
-        return {}
-
-    regs = re.findall(
-        r"(?<!\d)([3-5]\d{3})(?!\d)",
-        section
-    )
-
-    # 出現順を維持したまま重複除外
-    regs = list(dict.fromkeys(regs))
-
-    if len(regs) < 6:
-        print(
-            f"登録番号候補不足: {regs}",
-            flush=True
-        )
-        return {}
-
-    regs = regs[:6]
-
-    return {
-        boat: regs[boat - 1]
-        for boat in range(1, 7)
-    }
-
-
-def parse_single_checker_1st(text, boat, current_diff):
-    """
-    現在表示中のシンsumチェッカーから、指定艇の該当ゾーン1着率を取得する。
-    """
-    start = text.find("シンsumチェッカー")
+    start = text.find("シンsum理論")
     if start < 0:
-        return None
+        return {}
 
-    section = text[start:]
-    compact = re.sub(r"\s+", "", section)
+    end = text.find("シンsumチェッカー", start)
+    section = text[start:(end if end > start else start + 6000)]
+    lines = [x.strip() for x in section.splitlines() if x.strip()]
 
-    token = f"{boat}号艇"
-    pos = compact.find(token)
-    if pos < 0:
-        return None
-
-    # 選択中のカードだけ取れればよいので、次の艇カードか十分な長さまで
-    next_positions = []
-    for other in range(1, 7):
-        if other == boat:
-            continue
-        p = compact.find(f"{other}号艇", pos + len(token))
-        if p >= 0:
-            next_positions.append(p)
-
-    end = min(next_positions) if next_positions else min(len(compact), pos + 5000)
-    card = compact[pos:end]
-
-    zone = checker_zone(current_diff)
-    zpos = -1
-    matched = None
-
-    for variant in _zone_variants(zone):
-        zpos = card.find(variant)
-        if zpos >= 0:
-            matched = variant
-            break
-
-    if zpos < 0:
-        return None
-
-    row = card[zpos:zpos + 420]
-    pcts = re.findall(r"([+-]?\d+(?:\.\d+)?)%", row)
-
-    if not pcts:
-        return None
-
-    return {
-        "zone": zone,
-        "matched_zone_text": matched,
-        "checker_1st": float(pcts[0]),
-        # 該当ゾーン行は 1着率 / 2着率 / 3着率 / 3連対率 の順。
-        # 2着率が無い場合は0.0として扱う。
-        "checker_2nd": float(pcts[1]) if len(pcts) >= 2 else 0.0,
-    }
-
-
-def collect_checker_1st(page, current_diffs, registrations):
-    """
-    1〜6号艇の登録番号を順番にクリックしてチェッカーを取得する。
-
-    V9:
-    - クリック後450ms固定待ちを廃止
-    - 最大4秒、250ms間隔で表示完了を待つ
-    - 1回で出なければ最大3回まで再クリック
-    - 「データが見つかりません」は正式なデータなしとして区別
-    """
     result = {}
+    for boat in range(1, 7):
+        for i, line in enumerate(lines):
+            if line != str(boat):
+                continue
 
-    for boat in CHECKER_PARSE_BOATS:
-        diff = current_diffs.get(boat)
-        reg = registrations.get(boat)
-
-        if diff is None or not reg:
-            print(
-                f"チェッカー前提データ不足: {boat}号艇 / "
-                f"差={diff} / 登録番号={reg}",
-                flush=True
-            )
-            continue
-
-        got = None
-        no_data = False
-
-        for attempt in range(1, 4):
-            try:
-                loc = page.locator("a").filter(
-                    has_text=re.compile(
-                        rf"^\s*{re.escape(reg)}\s*$"
-                    )
-                )
-
-                if loc.count() == 0:
-                    loc = page.get_by_text(reg, exact=True)
-
-                if loc.count() == 0:
-                    print(
-                        f"登録番号リンク未検出: "
-                        f"{boat}号艇 / {reg}",
-                        flush=True
-                    )
+            # 艇番の直後に出る「+0.61」「-0.31」等を拾う。
+            # %付きの理論値は除外する。
+            for candidate in lines[i + 1:i + 12]:
+                if "%" in candidate:
+                    continue
+                m = re.fullmatch(r"([+-]\d+(?:\.\d+)?)", candidate)
+                if m:
+                    result[boat] = float(m.group(1))
                     break
-
-                try:
-                    loc.first.scroll_into_view_if_needed(timeout=2000)
-                except Exception:
-                    pass
-
-                loc.first.click(
-                    timeout=4000,
-                    force=(attempt >= 2)
-                )
-
-                # 固定450msではなく、チェッカー表示を最大4秒待つ
-                for _ in range(16):
-                    page.wait_for_timeout(250)
-
-                    body = page.locator("body").inner_text(
-                        timeout=10000
-                    )
-
-                    # サイト側が明示的に「データなし」と返した場合
-                    if (
-                        f"{boat}号艇のデータが見つかりません" in body
-                        or "データが見つかりません" in body[
-                            max(0, body.find("シンsumチェッカー")):
-                        ]
-                    ):
-                        no_data = True
-                        break
-
-                    info = parse_single_checker_1st(
-                        body,
-                        boat,
-                        diff
-                    )
-
-                    if info:
-                        got = info
-                        break
-
-                if got or no_data:
-                    break
-
-                print(
-                    f"チェッカー表示待ち再試行: "
-                    f"{boat}号艇 / {reg} / "
-                    f"{attempt}回目",
-                    flush=True
-                )
-
-            except Exception as e:
-                print(
-                    f"チェッカークリック再試行: "
-                    f"{boat}号艇 / {reg} / "
-                    f"{attempt}回目 / {repr(e)}",
-                    flush=True
-                )
-
-        if got:
-            result[boat] = got
-            print(
-                f"チェッカー取得成功: {boat}号艇 / "
-                f"{reg} / 差{diff:+.2f} / "
-                f"{got['zone']} / "
-                f"1着{got['checker_1st']:+.1f}% / 2着{got.get('checker_2nd', 0.0):+.1f}%",
-                flush=True
-            )
-        elif no_data:
-            print(
-                f"チェッカーデータなし: "
-                f"{boat}号艇 / {reg} / 差{diff:+.2f}",
-                flush=True
-            )
-        else:
-            print(
-                f"チェッカー取得失敗: "
-                f"{boat}号艇 / {reg} / 差{diff:+.2f} / "
-                f"3回再試行しても表示確認できず",
-                flush=True
-            )
+            break
 
     return result
 
@@ -2100,39 +298,12 @@ def checker_zone(current_diff):
     return "-0.5未満"
 
 
-def _zone_variants(zone):
-    variants = {
-        "+0.5以上": (
-            "+0.5以上",
-            "0.5以上",
-        ),
-        "0〜+0.5": (
-            "0〜+0.5",
-            "0～+0.5",
-            "0~+0.5",
-            "0～0.5",
-            "0〜0.5",
-            "0~0.5",
-        ),
-        "-0.5〜0": (
-            "-0.5〜0",
-            "-0.5～0",
-            "-0.5~0",
-        ),
-        "-0.5未満": (
-            "-0.5未満",
-        ),
-    }
-    return variants.get(zone, (zone,))
-
-
 def parse_checker_1st(text, current_diffs):
     """
-    各艇のシンsumチェッカーから、
-    現在の「平均との差」が属するゾーンの1着率補正を取得。
+    各艇のシンsumチェッカーから、現在の「平均との差」が属するゾーンの
+    1着率変化を取得する。
 
-    例:
-    1号艇 差+0.52 → +0.5以上 → +24.1%
+    例: 3号艇が +0.61 なら「+0.5以上」行の1着率（例 +6.4%）を返す。
     """
     start = text.find("シンsumチェッカー")
     if start < 0:
@@ -2142,568 +313,198 @@ def parse_checker_1st(text, current_diffs):
     compact = re.sub(r"\s+", "", section)
     result = {}
 
-    for boat in CHECKER_PARSE_BOATS:
+    for boat in BUFF_TARGET_BOATS:
         if boat not in current_diffs:
             continue
 
         token = f"{boat}号艇"
         pos = compact.find(token)
-
         if pos < 0:
             continue
 
-        # 次の艇カードまで
+        # 次の艇カードまでをこの艇の範囲とする。
         next_positions = []
-
         for other in range(1, 7):
             if other == boat:
                 continue
-
-            p = compact.find(
-                f"{other}号艇",
-                pos + len(token)
-            )
-
+            p = compact.find(f"{other}号艇", pos + len(token))
             if p >= 0:
                 next_positions.append(p)
 
-        end = (
-            min(next_positions)
-            if next_positions
-            else min(len(compact), pos + 4500)
-        )
-
+        end = min(next_positions) if next_positions else min(len(compact), pos + 3500)
         card = compact[pos:end]
+
         zone = checker_zone(current_diffs[boat])
-
-        zpos = -1
-        matched_zone_text = None
-
-        for variant in _zone_variants(zone):
-            zpos = card.find(variant)
-            if zpos >= 0:
-                matched_zone_text = variant
-                break
+        zpos = card.find(zone)
+        if zpos < 0:
+            # 表記ゆれ対策（波ダッシュ/全角チルダ等）
+            variants = {
+                "0〜+0.5": ("0~+0.5", "0～+0.5"),
+                "-0.5〜0": ("-0.5~0", "-0.5～0"),
+            }.get(zone, ())
+            for v in variants:
+                zpos = card.find(v)
+                if zpos >= 0:
+                    break
 
         if zpos < 0:
             continue
 
-        # 該当行の後ろ側を確認
-        row = card[zpos:zpos + 320]
-
-        # 「件数」の数字を%と誤認しないよう、%付きだけを拾う
-        pcts = re.findall(
-            r"([+-]?\d+(?:\.\d+)?)%",
-            row
-        )
-
+        # 該当行は「件数」の後に 1着率 / 2着率 / 3着率 / 3連対率 の順。
+        row = card[zpos:zpos + 220]
+        pcts = re.findall(r"([+-]?\d+(?:\.\d+)?)%", row)
         if not pcts:
             continue
 
         result[boat] = {
             "zone": zone,
-            "matched_zone_text": matched_zone_text,
             "checker_1st": float(pcts[0]),
-            "checker_2nd": float(pcts[1]) if len(pcts) >= 2 else 0.0,
         }
 
     return result
 
 
-
-def build_final_rates(base_rates, theory_adj, checker):
+def classify_buff(theory, current_diffs, checker):
     """
-    元1着率が明示されている艇:
-      最終補正1着率 = 元1着率 + 理論補正 + チェッカー補正
+    やや本命/荒れ注意が無くても通知する独立バフ判定。
 
-    元1着率が表示されていない艇:
-      最終補正1着率は作らず、
-      理論補正 + チェッカー補正 = 総合バフ/デバフ として保持する。
-    """
-    result = {}
-
-    for boat in range(1, 7):
-        theory = theory_adj.get(boat)
-        checker_info = checker.get(boat)
-
-        if theory is None or not checker_info:
-            continue
-
-        base = base_rates.get(boat)
-        checker_1st = checker_info["checker_1st"]
-        # V35: 2着率予測でも同じチェッカー行の2着補正を使うため、
-        # checker_2nd を final_rates に保持する。
-        # 例: 理論2着 +6.0 / チェッカー2着 +3.8 → 合計 +9.8pt。
-        checker_2nd = float(checker_info.get("checker_2nd", 0.0) or 0.0)
-        total_adjustment = theory + checker_1st
-
-        result[boat] = {
-            "base": base,
-            "base_known": base is not None,
-            "theory": theory,
-            "checker": checker_1st,
-            "checker_2nd": checker_2nd,
-            "zone": checker_info["zone"],
-            "total_adjustment": total_adjustment,
-            "final": (
-                base + total_adjustment
-                if base is not None
-                else None
-            ),
-        }
-
-    return result
-
-
-def classify_buff(final_rates, current_diffs):
-    """
-    2・3・4号艇の独立バフ判定。
-
-    元1着率が分かる艇:
-      最終1着率まで計算。
-
-    元1着率が分からない艇:
-      「理論補正 + チェッカー補正」の総合バフだけで評価。
-      元1着率を勝手に補完しない。
+    条件:
+      - 1〜4号艇
+      - 現在の平均との差が +0.50以上
+      - シンsum理論の1着補正が +10%以上
+      - シンsumチェッカーの現在ゾーンの1着率が +5%以上
     """
     buffs = []
 
-    one = final_rates.get(1)
-
-    if one:
-        one_total_adjustment = one["total_adjustment"]
-        one_final = one["final"]
-        one_weak = (
-            one_total_adjustment < ONE_WEAK_TOTAL_THRESHOLD
-        )
-    else:
-        one_total_adjustment = None
-        one_final = None
-        one_weak = False
-
     for boat in BUFF_TARGET_BOATS:
-        info = final_rates.get(boat)
         diff = current_diffs.get(boat)
+        theory_1st = theory.get(boat)
+        c = checker.get(boat)
 
-        if not info or diff is None:
+        if diff is None or theory_1st is None or not c:
             continue
 
-        total_boost = info["total_adjustment"]
+        checker_1st = c["checker_1st"]
 
-        if total_boost <= BUFF_MIN_TOTAL:
-            continue
-
-        edge_vs_one_final = (
-            info["final"] - one_final
-            if info["final"] is not None and one_final is not None
-            else None
-        )
-
-        buffs.append({
-            "boat": boat,
-            "current_diff": diff,
-            "zone": info["zone"],
-            "base_1st": info["base"],
-            "base_known": info["base_known"],
-            "theory_1st": info["theory"],
-            "checker_1st": info["checker"],
-            "total_boost": total_boost,
-            "final_1st": info["final"],
-            "one_final_1st": one_final,
-            "one_total_adjustment": one_total_adjustment,
-            "one_weak": one_weak,
-            "edge_vs_one_final": edge_vs_one_final,
-        })
+        if (
+            diff >= BUFF_MIN_CURRENT_DIFF
+            and theory_1st >= BUFF_MIN_THEORY_1ST
+            and checker_1st >= BUFF_MIN_CHECKER_1ST
+        ):
+            buffs.append({
+                "boat": boat,
+                "current_diff": diff,
+                "theory_1st": theory_1st,
+                "checker_1st": checker_1st,
+                "zone": c["zone"],
+            })
 
     if not buffs:
         return None
 
+    # 強い順（チェッカー1着率 → 理論1着率）
     buffs.sort(
-        key=lambda x: (
-            1 if x["one_weak"] else 0,
-            x["total_boost"],
-            x["final_1st"] if x["final_1st"] is not None else -999.0,
-        ),
+        key=lambda x: (x["checker_1st"], x["theory_1st"]),
         reverse=True
     )
 
-    best = buffs[0]
     focus = [x["boat"] for x in buffs]
-
-    if best["base_known"]:
-        reason = (
-            f"{best['boat']}号艇: 元 {best['base_1st']:.1f}% "
-            f"+ 理論 {best['theory_1st']:+.1f}% "
-            f"+ チェッカー {best['checker_1st']:+.1f}% "
-            f"= 最終 {best['final_1st']:.1f}%"
-        )
-    else:
-        reason = (
-            f"{best['boat']}号艇: 元1着率は表示なし。"
-            f"理論 {best['theory_1st']:+.1f}% "
-            f"+ チェッカー {best['checker_1st']:+.1f}% "
-            f"= 総合バフ {best['total_boost']:+.1f}pt"
-        )
-
-    if one:
-        if one["final"] is not None:
-            reason += (
-                f"。1号艇は 元 {one['base']:.1f}% "
-                f"+ 理論 {one['theory']:+.1f}% "
-                f"+ チェッカー {one['checker']:+.1f}% "
-                f"= 最終 {one['final']:.1f}%"
-            )
-        else:
-            reason += (
-                f"。1号艇は元1着率表示なし、"
-                f"補正合計 {one['total_adjustment']:+.1f}pt"
-            )
-
-    if best["edge_vs_one_final"] is not None:
-        reason += f"。最終1着率の差 {best['edge_vs_one_final']:+.1f}pt"
-
-    if one_weak:
-        reason += (
-            f"。1号艇の補正合計 "
-            f"{one_total_adjustment:+.1f}ptで弱化"
-        )
+    best = buffs[0]
 
     return {
         "type": "独立バフ",
         "focus": focus,
         "buffs": buffs,
-        "one": one,
-        "one_weak": one_weak,
-        "reason": reason,
-    }
-
-def classify_escape_boost(final_rates):
-    """
-    1号艇逃げ強化:
-      - 1号艇の元1着率と最終1着率が取得できる
-      - 最終1着率が75%以上
-      - 元より最終が上昇している（元80→最終76のような弱化は除外）
-      - 2〜6号艇で、最終1着率が判明している艇に15%以上がいない
-    """
-    one = final_rates.get(1)
-    if not one or one.get("base") is None or one.get("final") is None:
-        return None
-
-    base = one["base"]
-    final = one["final"]
-    rise = final - base
-
-    if final < ESCAPE_FINAL_MIN or rise <= 0:
-        return None
-
-    strong_rivals = []
-    for boat in range(2, 7):
-        info = final_rates.get(boat)
-        if not info or info.get("final") is None:
-            continue
-        if info["final"] >= RIVAL_FINAL_MIN:
-            strong_rivals.append({
-                "boat": boat,
-                "final": info["final"],
-            })
-
-    if strong_rivals:
-        return None
-
-    # 元1着率が表示されていない艇でも、
-    # 「理論 + チェッカー」の補正合計が大きい場合は注意艇として残す。
-    warning_boats = []
-
-    for boat in range(2, 7):
-        info = final_rates.get(boat)
-        if not info:
-            continue
-
-        theory = info.get("theory")
-        checker = info.get("checker")
-
-        if theory is None or checker is None:
-            continue
-
-        boost = theory + checker
-
-        if boost >= RIVAL_WARNING_BOOST_MIN:
-            warning_boats.append({
-                "boat": boat,
-                "boost": boost,
-                "theory": theory,
-                "checker": checker,
-                "base": info.get("base"),
-                "final": info.get("final"),
-            })
-
-    warning_boats.sort(
-        key=lambda x: x["boost"],
-        reverse=True
-    )
-
-    kind = (
-        "1号艇逃げ強化・対抗艇注意"
-        if warning_boats
-        else "1号艇逃げ強化"
-    )
-
-    focus = [1] + [x["boat"] for x in warning_boats]
-
-    if warning_boats:
-        warning_text = " / ".join(
-            f"{x['boat']}号艇 補正合計{x['boost']:+.1f}pt"
-            for x in warning_boats
+        "reason": (
+            f"{best['boat']}号艇を中心にバフ検知。"
+            f"平均との差 {best['current_diff']:+.2f}、"
+            f"理論1着 {best['theory_1st']:+.1f}%、"
+            f"チェッカー1着 {best['checker_1st']:+.1f}%"
         )
-        reason = (
-            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
-            f"（{rise:+.1f}pt）。最終75%以上かつ上昇。"
-            f"確認できる2〜6号艇に最終15%以上なし。"
-            f"ただし {warning_text} のため展示気配要確認"
-        )
-    else:
-        reason = (
-            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
-            f"（{rise:+.1f}pt）。最終75%以上かつ上昇。"
-            f"確認できる2〜6号艇に最終15%以上なし"
-        )
-
-    return {
-        "type": kind,
-        "focus": focus,
-        "one_base": base,
-        "one_final": final,
-        "one_change": rise,
-        "strong_rivals": [],
-        "warning_boats": warning_boats,
-        "reason": reason,
     }
 
 
-def classify_escape_collapse(final_rates):
+def classify_theory(values):
     """
-    1号艇逃げ崩れ:
-      - 1号艇の元/最終が取得できる
-      - 最終が元から大幅低下（初期値15pt以上）
-      - 2〜6号艇のどれかが最終1着率15%以上
+    6艇全部を比較して、
+    1号艇有利 or 3・4号艇有利 のどちらかだけ返す。
     """
-    one = final_rates.get(1)
-    if not one or one.get("base") is None or one.get("final") is None:
+
+    if len(values) < 6:
         return None
-
-    base = one["base"]
-    final = one["final"]
-    drop = base - final
-
-    if drop < ONE_BIG_DROP_MIN:
-        return None
-
-    strong_rivals = []
-    for boat in range(2, 7):
-        info = final_rates.get(boat)
-        if not info or info.get("final") is None:
-            continue
-        if info["final"] >= RIVAL_FINAL_MIN:
-            strong_rivals.append({
-                "boat": boat,
-                "final": info["final"],
-                "base": info.get("base"),
-                "change": (
-                    info["final"] - info["base"]
-                    if info.get("base") is not None
-                    else None
-                ),
-            })
-
-    strong_rivals.sort(key=lambda x: x["final"], reverse=True)
-
-    # V28:
-    # 1号艇が15pt以上低下した時点で「イン逃げ低下」として通知。
-    # 他艇に最終15%以上がいる場合は、より強い「逃げ崩れ」として表示する。
-    if strong_rivals:
-        kind = "1号艇逃げ崩れ"
-        focus = [1] + [x["boat"] for x in strong_rivals]
-        rival_text = " / ".join(
-            f"{x['boat']}号艇 最終{x['final']:.1f}%"
-            for x in strong_rivals
-        )
-        reason = (
-            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
-            f"（{final-base:+.1f}pt）と15pt以上低下。"
-            f"{rival_text} が15%以上"
-        )
-    else:
-        kind = "1号艇イン逃げ低下"
-        focus = [1]
-        reason = (
-            f"1号艇が元 {base:.1f}% → 最終 {final:.1f}% "
-            f"（{final-base:+.1f}pt）と15pt以上低下。"
-            f"他艇の最終1着率15%以上は確認できなくても、"
-            f"イン逃げ信頼度低下として通知"
-        )
-
-    return {
-        "type": kind,
-        "focus": focus,
-        "one_base": base,
-        "one_final": final,
-        "one_change": final - base,
-        "strong_rivals": strong_rivals,
-        "reason": reason,
-    }
-
-
-def classify_final_rates(final_rates):
-    """
-    取得できた艇だけで「最終補正1着率」を比較する。
-
-    ・6艇全部あれば通常どおり6艇比較
-    ・チェッカー履歴がまだ無い若い選手などが1艇だけいる場合は、
-      その艇を除外して残り5艇で判定する
-    ・2艇以上欠けて4艇以下になった場合は、誤判定防止のため判定しない
-    """
-    available = sorted(
-        boat
-        for boat, info in final_rates.items()
-        if info.get("final") is not None
-    )
-
-    if len(available) < 5:
-        return None
-
-    values = {
-        boat: final_rates[boat]["final"]
-        for boat in available
-    }
 
     vals = list(values.values())
+
+    b1 = values[1]
+    b3 = values[3]
+    b4 = values[4]
+
     best_all = max(vals)
     second_best = sorted(vals, reverse=True)[1]
 
     # -----------------------------
     # 1号艇有利
-    # 1号艇のチェッカーデータが無い場合は判定不能なのでスキップ
     # -----------------------------
-    if 1 in values:
-        b1 = values[1]
+    best34 = max(b3, b4)
 
-        # 3・4号艇のうち取得できているもの
-        vals34 = [
-            values[b]
-            for b in (3, 4)
-            if b in values
-        ]
-
-        if vals34:
-            best34 = max(vals34)
-
-            if (
-                b1 == best_all
-                and b1 >= ONE_MIN
-                and (b1 - best34) >= ONE_GAP_VS_34
-                and (b1 - second_best) >= ONE_GAP_VS_SECOND
-            ):
-                missing = [
-                    str(b)
-                    for b in range(1, 7)
-                    if b not in values
-                ]
-                missing_text = (
-                    f"（{','.join(missing)}号艇はチェッカーデータなしで除外）"
-                    if missing else ""
-                )
-
-                return {
-                    "type": "1号艇有利",
-                    "focus": [1],
-                    "reason": (
-                        f"最終補正1着率で1号艇が取得艇中トップ。"
-                        f"3・4号艇の最大値より {b1 - best34:+.1f}pt、"
-                        f"2番手より {b1 - second_best:+.1f}pt 優勢"
-                        f"{missing_text}"
-                    )
-                }
+    if (
+        b1 == best_all
+        and b1 >= ONE_MIN
+        and (b1 - best34) >= ONE_GAP_VS_34
+        and (b1 - second_best) >= ONE_GAP_VS_SECOND
+    ):
+        return {
+            "type": "1号艇有利",
+            "focus": [1],
+            "reason": (
+                f"1号艇が6艇中トップ。"
+                f"3・4号艇の最大値より {b1 - best34:+.1f}pt、"
+                f"2番手より {b1 - second_best:+.1f}pt 優勢"
+            )
+        }
 
     # -----------------------------
     # 3・4号艇有利
-    # 取得できている3・4号艇だけを候補にする
     # -----------------------------
-    candidates34 = [
-        b for b in (3, 4)
-        if b in values
-    ]
-
-    if not candidates34:
-        return None
-
-    best_boat = max(
-        candidates34,
-        key=lambda b: values[b]
-    )
+    best_boat = 3 if b3 >= b4 else 4
     best_value = values[best_boat]
 
-    # 3・4以外の取得済み艇
-    other_values = [
-        values[b]
-        for b in available
-        if b not in (3, 4)
-    ]
-
-    if not other_values:
-        return None
-
-    best_other = max(other_values)
-
-    # 1号艇が取得できている時だけ「1号艇との差」を条件に使う。
-    # 1号艇がデータ不足なら、残り5艇比較なのでこの条件は課さない。
-    gap_vs_1_ok = True
-    gap_vs_1_text = ""
-
-    if 1 in values:
-        gap_vs_1 = best_value - values[1]
-        gap_vs_1_ok = gap_vs_1 >= OUT_GAP_VS_1
-        gap_vs_1_text = f"1号艇より {gap_vs_1:+.1f}pt、"
-    else:
-        gap_vs_1_text = "1号艇はチェッカーデータなしで比較除外、"
+    # 3・4以外の最大値
+    best_other = max(
+        values[1],
+        values[2],
+        values[5],
+        values[6]
+    )
 
     if (
         best_value == best_all
         and best_value >= OUT_MIN
-        and gap_vs_1_ok
+        and (best_value - b1) >= OUT_GAP_VS_1
         and (best_value - best_other) >= OUT_GAP_VS_OTHER
     ):
         focus = [best_boat]
 
+        # 3号艇・4号艇の両方が強く、
+        # 数値も近ければ両方注目表示
         other_boat = 4 if best_boat == 3 else 3
 
         if (
-            other_boat in values
-            and values[other_boat] >= OUT_MIN
+            values[other_boat] >= OUT_MIN
             and abs(
                 values[best_boat] - values[other_boat]
             ) <= 8
         ):
             focus = [3, 4]
 
-        missing = [
-            str(b)
-            for b in range(1, 7)
-            if b not in values
-        ]
-        missing_text = (
-            f"（{','.join(missing)}号艇を除外した{len(values)}艇比較）"
-            if missing else ""
-        )
-
         return {
             "type": "3・4号艇有利",
             "focus": focus,
             "reason": (
-                f"最終補正1着率で{best_boat}号艇が取得艇中トップ。"
-                f"{gap_vs_1_text}"
+                f"{best_boat}号艇が6艇中トップ。"
+                f"1号艇より {best_value - b1:+.1f}pt、"
                 f"3・4以外の最上位より "
                 f"{best_value - best_other:+.1f}pt 優勢"
-                f"{missing_text}"
             )
         }
 
@@ -2711,281 +512,579 @@ def classify_final_rates(final_rates):
 
 
 
+class _TableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self.table = None
+        self.row = None
+        self.cell = None
+        self.depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "table":
+            self.depth += 1
+            if self.depth == 1:
+                self.table = []
+        elif self.depth and tag == "tr":
+            self.row = []
+        elif self.depth and tag in ("td", "th"):
+            self.cell = []
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self.depth and tag in ("td", "th") and self.cell is not None:
+            if self.row is not None:
+                self.row.append(re.sub(r"\s+", " ", "".join(self.cell)).strip())
+            self.cell = None
+        elif self.depth and tag == "tr":
+            if self.table is not None and self.row:
+                self.table.append(self.row)
+            self.row = None
+        elif tag == "table" and self.depth:
+            self.depth -= 1
+            if self.depth == 0:
+                if self.table:
+                    self.tables.append(self.table)
+                self.table = None
+
+
+def _tables(raw):
+    p = _TableParser()
+    p.feed(raw)
+    return p.tables
+
+
+def _clean_html(raw):
+    raw = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw, flags=re.I | re.S)
+    raw = re.sub(r"<style\b[^>]*>.*?</style>", " ", raw, flags=re.I | re.S)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    return re.sub(r"\s+", " ", html.unescape(raw)).strip()
+
+
+def _parse_st_token(s):
+    s = str(s).strip().upper().replace(" ", "")
+    m = re.search(r"F\.?(\d{1,2})", s)
+    if m:
+        return -int(m.group(1)) / 100.0
+    m = re.search(r"0\.(\d{2})", s)
+    if m:
+        return int(m.group(1)) / 100.0
+    m = re.search(r"(?<!\d)\.?(\d{2})(?!\d)", s)
+    if m:
+        return int(m.group(1)) / 100.0
+    return None
+
+
+def _num_or_none(s, lo=None, hi=None):
+    s = re.sub(r"\s+", "", str(s))
+    if s in ("", "-", "－", "—"):
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except Exception:
+        return None
+    if lo is not None and v < lo:
+        return None
+    if hi is not None and v > hi:
+        return None
+    return v
+
+
+def fetch_official_exhibition(venue, race_no):
+    """公式直前情報から展示タイムとスタート展示を取得。"""
+    jcd = VENUE_CODES.get(venue)
+    if not jcd:
+        return {}
+
+    hd = now().strftime("%Y%m%d")
+    url = (
+        "https://www.boatrace.jp/owpc/pc/race/beforeinfo"
+        f"?hd={hd}&jcd={jcd:02d}&rno={race_no}"
+    )
+
+    try:
+        r = _http.get(url, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[IMAGE] 展示取得失敗 {venue}{race_no}R {e!r}", flush=True)
+        return {}
+
+    out = {i: {} for i in range(1, 7)}
+
+    for tb in _tables(r.text):
+        flat = " ".join(" ".join(row) for row in tb)
+
+        if "展示タイム" in flat:
+            for row in tb:
+                s = " ".join(row)
+                bm = re.search(r"(?<!\d)([1-6])(?!\d)", s)
+                tm = re.search(r"(?<!\d)(6\.\d{2}|7\.\d{2})(?!\d)", s)
+                if bm and tm:
+                    out[int(bm.group(1))]["ex_time"] = float(tm.group(1))
+
+        if "スタート展示" in flat or ("ST" in flat and "進入" in flat):
+            for row in tb:
+                s = " ".join(row)
+                bm = re.search(r"(?<!\d)([1-6])(?!\d)", s)
+                if not bm:
+                    continue
+                st = _parse_st_token(s)
+                if st is not None:
+                    out[int(bm.group(1))]["ex_st"] = st
+
+    return out
+
+
+def fetch_official_f(venue, race_no):
+    """現在のF有無だけは公式BOATRACEを正とする。"""
+    jcd = VENUE_CODES.get(venue)
+    if not jcd:
+        return {}
+
+    hd = now().strftime("%Y%m%d")
+    url = (
+        "https://www.boatrace.jp/owpc/pc/race/racelist"
+        f"?hd={hd}&jcd={jcd:02d}&rno={race_no}"
+    )
+
+    try:
+        r = _http.get(url, timeout=15)
+        r.raise_for_status()
+    except Exception:
+        return {}
+
+    out = {i: {"f_count": 0} for i in range(1, 7)}
+    for tb in _tables(r.text):
+        flat = " ".join(" ".join(row) for row in tb)
+        if "平均ST" not in flat:
+            continue
+        for row in tb:
+            s = " ".join(row)
+            bm = re.search(r"^\s*([1-6])(?:\s|$)", s)
+            if not bm:
+                continue
+            b = int(bm.group(1))
+            fm = re.search(r"F\s*([0-9])", s)
+            out[b]["f_count"] = int(fm.group(1)) if fm else 0
+    return out
+
+
+def fetch_hiyori_st(parent_page, venue, race_no):
+    """
+    ボートレース日和の描画後DOMからST順位を取得。
+    当地・初日・ナイター(該当場)・F持ち順位を使用。
+    """
+    jcd = VENUE_CODES.get(venue)
+    if not jcd:
+        return {}
+
+    hd = now().strftime("%Y%m%d")
+    url = (
+        "https://kyoteibiyori.com/race_shusso.php"
+        f"?place_no={jcd}&race_no={race_no}&hiduke={hd}"
+    )
+
+    out = {i: {} for i in range(1, 7)}
+    hp = parent_page.context.new_page()
+
+    try:
+        hp.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            hp.wait_for_function(
+                """() => {
+                    const t = document.body?.innerText || '';
+                    return t.includes('ST順位');
+                }""",
+                timeout=10000,
+            )
+        except Exception:
+            hp.wait_for_timeout(2500)
+
+        rows = hp.locator("tr").evaluate_all(
+            """els => els.map(tr =>
+                Array.from(tr.querySelectorAll('th,td'))
+                    .map(x => (x.innerText || x.textContent || '').trim())
+            )"""
+        )
+
+        for cells in rows:
+            if not cells:
+                continue
+
+            label = re.sub(r"\s+", "", cells[0])
+
+            def six_values(lo=1.0, hi=6.0):
+                vals = [_num_or_none(x, lo, hi) for x in cells[1:7]]
+                return vals if len(vals) == 6 else None
+
+            key = None
+            if label == "当地" or label.startswith("当地ST"):
+                key = "local_rank"
+            elif label == "初日" or label.startswith("初日ST"):
+                key = "firstday_rank"
+            elif venue in NIGHT_VENUES and (
+                label == "ナイター" or label.startswith("ナイターST")
+            ):
+                key = "night_rank"
+            elif label == "F持" or label == "F持ち" or label.startswith("F持"):
+                key = "f_rank"
+
+            if key:
+                vals = six_values()
+                if vals:
+                    for b, v in enumerate(vals, 1):
+                        if v is not None:
+                            out[b][key] = float(v)
+
+        return out
+
+    except Exception as e:
+        print(f"[IMAGE] 日和ST取得失敗 {venue}{race_no}R {e!r}", flush=True)
+        return {}
+    finally:
+        hp.close()
+
+
+def merge_slit_data(official_ex, official_f, hiyori):
+    out = {i: {} for i in range(1, 7)}
+    for b in range(1, 7):
+        out[b].update(hiyori.get(b, {}))
+        out[b].update(official_ex.get(b, {}))
+        # F有無だけは公式を最後に上書き
+        out[b]["f_count"] = int(official_f.get(b, {}).get("f_count", 0))
+    return out
+
+
+def slit_rank(d):
+    vals = [d.get("local_rank"), d.get("firstday_rank")]
+
+    if d.get("night_rank") is not None:
+        vals.append(d.get("night_rank"))
+
+    if d.get("f_count", 0) >= 1 and d.get("f_rank") is not None:
+        vals.append(d.get("f_rank"))
+
+    vals = [float(v) for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def predicted_st(d):
+    """
+    スリット図のための相対予測ST。
+    数字は確定予測ではなく、6艇の前後関係を描くための指標。
+    """
+    rank = slit_rank(d)
+
+    if rank is None:
+        p = 0.15
+    else:
+        p = 0.15 + (rank - 3.5) * 0.012
+
+    exst = d.get("ex_st")
+    if exst is not None:
+        if exst >= 0:
+            # 展示STは単発なので35%反映
+            p = p * 0.65 + float(exst) * 0.35
+        else:
+            # 展示Fをそのまま本番Fとして扱わない
+            fdepth = abs(float(exst))
+            if rank is not None and rank <= 2.8 and fdepth <= 0.03:
+                p -= 0.012
+            else:
+                p += 0.006
+
+    # F持ち艇はF持ち順位が悪い時だけ少し慎重にする
+    if d.get("f_count", 0) >= 1 and d.get("f_rank") is not None:
+        if d["f_rank"] >= 4.0:
+            p += 0.008
+        elif d["f_rank"] <= 2.5:
+            p -= 0.004
+
+    return max(0.04, min(0.24, p))
+
+
+def build_shinsum_image(page, venue, race, deadline_value, theory_values, classification):
+    """
+    Shinsum Monitor専用の画像通知。
+    予測スリット + シンsum理論 + 注目艇を1枚にする。
+    """
+    race_no = int(re.sub(r"\D", "", str(race)) or 0)
+    if not race_no:
+        raise ValueError("race number parse failed")
+
+    ex = fetch_official_exhibition(venue, race_no)
+    official_f = fetch_official_f(venue, race_no)
+    hiyori = fetch_hiyori_st(page, venue, race_no)
+    data = merge_slit_data(ex, official_f, hiyori)
+
+    pred = {b: predicted_st(data[b]) for b in range(1, 7)}
+    vals = list(pred.values())
+    lo, hi = min(vals), max(vals)
+    spread = max(hi - lo, 0.05)
+
+    focus = set(classification.get("focus", []))
+
+    lanes = []
+    for b in range(1, 7):
+        rel = (hi - pred[b]) / spread
+        x = 24 + max(0.0, min(1.0, rel)) * 54
+
+        d = data[b]
+        exst = d.get("ex_st")
+        if exst is None:
+            exst_txt = "-"
+        elif exst < 0:
+            exst_txt = f"F{abs(exst):.02f}"
+        else:
+            exst_txt = f"{exst:.02f}"
+
+        ext = d.get("ex_time")
+        ext_txt = f"{ext:.2f}" if ext is not None else "-"
+        hot = " hot" if b in focus else ""
+        fire = "🔥" if b in focus else ""
+
+        lanes.append(f"""
+        <div class="lane{hot}">
+          <div class="num">{b}</div>
+          <div class="track">
+            <div class="start"></div>
+            <div class="boat" style="left:{x:.1f}%">⛵▶ {fire}</div>
+          </div>
+          <div class="stat">
+            <b>予測 {pred[b]:.02f}</b>
+            <span>展示ST {exst_txt}</span>
+            <span>展示 {ext_txt}</span>
+          </div>
+        </div>
+        """)
+
+    theory_rows = []
+    for b in range(1, 7):
+        mark = " ← 注目" if b in focus else ""
+        theory_rows.append(
+            f'<div class="trow"><b>{b}号艇</b>'
+            f'<span>{theory_values.get(b, 0):+g}%{mark}</span></div>'
+        )
+
+    buff_rows = []
+    if classification.get("type") == "独立バフ":
+        for x in classification.get("buffs", []):
+            buff_rows.append(
+                f'<div class="buff"><b>{x["boat"]}号艇</b>'
+                f'<span>平均との差 {x["current_diff"]:+.2f} / '
+                f'理論 {x["theory_1st"]:+.1f}% / '
+                f'チェッカー {x["checker_1st"]:+.1f}%</span></div>'
+            )
+
+    kind = classification.get("type", "注目")
+    reason = classification.get("reason", "")
+
+    doc = f"""
+    <html><head><meta charset="utf-8">
+    <style>
+      *{{box-sizing:border-box}}
+      body{{
+        margin:0;padding:30px;width:920px;background:#08111f;color:#eef4ff;
+        font-family:"Noto Sans CJK JP","Noto Sans JP","Yu Gothic",sans-serif;
+      }}
+      .top{{display:flex;justify-content:space-between;align-items:flex-end;
+        padding-bottom:18px;border-bottom:1px solid #283850}}
+      .race{{font-size:30px;font-weight:900}}
+      .kind{{font-size:30px;font-weight:900;color:#ffcf63}}
+      .sub{{font-size:15px;color:#90a4c2;margin-top:4px}}
+      .card{{margin-top:24px;background:#0d192a;border:1px solid #263957;
+        border-radius:18px;padding:20px}}
+      .title{{font-size:21px;font-weight:900;margin-bottom:14px}}
+      .lane{{display:grid;grid-template-columns:42px 1fr 175px;
+        gap:10px;align-items:center;min-height:66px;border-top:1px solid #1d2c42}}
+      .lane:first-of-type{{border-top:none}}
+      .lane.hot{{background:linear-gradient(90deg,rgba(255,190,0,.10),transparent)}}
+      .num{{width:34px;height:34px;border-radius:50%;border:1px solid #607798;
+        display:flex;align-items:center;justify-content:center;font-weight:900}}
+      .track{{position:relative;height:46px}}
+      .track:before{{content:"";position:absolute;left:0;right:0;top:23px;height:2px;background:#263956}}
+      .start{{position:absolute;left:84%;top:2px;bottom:2px;width:3px;background:#ff5252}}
+      .boat{{position:absolute;top:8px;transform:translateX(-50%);font-size:25px;
+        white-space:nowrap;font-weight:900}}
+      .stat{{display:flex;flex-direction:column;font-size:13px;color:#99acc7}}
+      .stat b{{font-size:16px;color:#f2f6ff}}
+      .arrow{{text-align:center;margin-top:10px;color:#a6b8d1;font-weight:800}}
+      .note{{margin-top:12px;color:#8fa5c4;font-size:13px}}
+      .trow,.buff{{display:grid;grid-template-columns:85px 1fr;gap:10px;
+        padding:10px 0;border-top:1px solid #22324a}}
+      .trow:first-of-type,.buff:first-of-type{{border-top:none}}
+      .trow span,.buff span{{color:#c5d1e2}}
+      .reason{{font-size:15px;line-height:1.6;color:#c5d1e2}}
+      .foot{{margin-top:16px;color:#6f83a2;font-size:12px;text-align:right}}
+    </style></head>
+    <body>
+      <div class="top">
+        <div>
+          <div class="race">{html.escape(venue)} {html.escape(str(race))}</div>
+          <div class="sub">締切 {html.escape(str(deadline_value))}</div>
+        </div>
+        <div class="kind">{html.escape(kind)}</div>
+      </div>
+
+      <div class="card">
+        <div class="title">本番予測スリット</div>
+        {''.join(lanes)}
+        <div class="arrow">進行方向 →　　STARTは赤線</div>
+        <div class="note">右に出ているほど本番先行予測 / 🔥は注目艇</div>
+      </div>
+
+      <div class="card">
+        <div class="title">シンsum理論・1着</div>
+        {''.join(theory_rows)}
+      </div>
+
+      {f'<div class="card"><div class="title">シンsumチェッカー</div>{"".join(buff_rows)}</div>' if buff_rows else ''}
+
+      <div class="card">
+        <div class="title">判定理由</div>
+        <div class="reason">{html.escape(reason)}</div>
+      </div>
+
+      <div class="foot">
+        ※予測STは当地/初日/ナイター/F持ち順位とスタート展示から算出した相対予測
+      </div>
+    </body></html>
+    """
+
+    ip = page.context.new_page()
+    try:
+        ip.set_viewport_size({"width": 920, "height": 1200})
+        ip.set_content(doc, wait_until="load")
+        ip.wait_for_timeout(300)
+        path = f"/tmp/shinsum_{venue}_{race_no}_{int(time.time())}.png"
+        ip.screenshot(path=path, full_page=True)
+        return path
+    finally:
+        ip.close()
+
+
+def send_image_ntfy(image_path, message):
+    """
+    ntfy画像添付。
+    HTTPヘッダーに日本語を入れずUnicodeEncodeErrorを防ぐ。
+    """
+    filename = os.path.basename(image_path)
+    with open(image_path, "rb") as f:
+        r = requests.put(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            params={
+                "filename": filename,
+                "title": "Shinsum Monitor",
+                "message": message,
+                "priority": "5",
+                "tags": "ship",
+            },
+            data=f,
+            headers={"Content-Type": "image/png"},
+            timeout=30,
+        )
+    r.raise_for_status()
+
+
 def notify_selected(
+    page,
     alert,
     venue,
     race,
     deadline_value,
-    final_rates,
-    classification,
-    second_prediction=None
+    theory_values,
+    classification
 ):
     kind = classification["type"]
-    # V27安全弁: 旧ロジックから独立バフが渡ってきても絶対に送信しない。
-    if kind == "独立バフ":
-        print(
-            f"独立バフ単独通知を抑止: {venue} / {race}",
-            flush=True
-        )
-        return
-
     focus = set(classification["focus"])
 
-    secondary_buffs = classification.get("secondary_buffs", [])
-    secondary_focus = {
-        x["boat"] for x in secondary_buffs
-        if x["boat"] not in focus
-    }
-
-    if kind in ("1号艇有利", "1号艇逃げ強化"):
+    if kind == "1号艇有利":
         symbol = "🟢"
-    elif kind == "1号艇逃げ強化・対抗艇注意":
-        symbol = "🟢⚠️"
-    elif kind == "1号艇逃げ崩れ":
-        symbol = "🔴"
-    elif kind == "1号艇イン逃げ低下":
-        symbol = "⚠️"
     elif kind == "独立バフ":
         symbol = "🚀"
     else:
         symbol = "🔥"
 
-    rate_lines = []
-
+    lines = []
     for boat in range(1, 7):
-        x = final_rates.get(boat)
-        if not x:
-            continue
+        mark = " ←注目" if boat in focus else ""
+        lines.append(
+            f"{boat}号艇 "
+            f"{theory_values[boat]:+g}%"
+            f"{mark}"
+        )
 
-        if boat in focus:
-            mark = " ←主注目"
-        elif boat in secondary_focus:
-            mark = " ←バフ注目"
-        else:
-            mark = ""
-
-        if x["base"] is not None:
-            line = (
-                f"{boat}号艇 "
-                f"{x['base']:.1f}% "
-                f"+ 理論{x['theory']:+.1f}% "
-                f"+ チェッカー{x['checker']:+.1f}% "
-                f"= {x['final']:.1f}%"
-            )
-        else:
-            line = (
-                f"{boat}号艇 元1着率表示なし / "
-                f"理論{x['theory']:+.1f}% "
-                f"+ チェッカー{x['checker']:+.1f}% "
-                f"= 補正合計{x['total_adjustment']:+.1f}pt"
-            )
-
-        raw_diff = x.get("raw_diff")
-        slit = x.get("slit_alarm", 0.0) or 0.0
-        adj_diff = x.get("adjusted_diff")
-        if raw_diff is not None and adj_diff is not None:
-            line += (
-                f" / 平均差 {raw_diff:+.2f}"
-                f" + スリット {slit:+.1f}"
-                f" = {adj_diff:+.2f}"
-            )
-
-        rate_lines.append(line + mark)
-
-    if kind in ("1号艇逃げ強化", "1号艇逃げ強化・対抗艇注意"):
-        one = final_rates.get(1, {})
-
-        body_lines = [
-            f"{symbol} {kind}",
-            f"{venue} {race}",
-            "",
-            "全艇・評価",
-        ]
-
-        for boat in range(1, 7):
-            info = final_rates.get(boat)
-            if not info:
-                continue
-
-            mark = " ←主注目" if boat == 1 else ""
-            if classification.get("warning_boats"):
-                if any(x["boat"] == boat for x in classification["warning_boats"]):
-                    mark = " ←⚠️注意"
-
-            if info.get("base") is not None and info.get("final") is not None:
-                diff_text = ""
-                if info.get("raw_diff") is not None and info.get("adjusted_diff") is not None:
-                    diff_text = (
-                        f" / 平均差 {info['raw_diff']:+.2f}"
-                        f" + スリット {info.get('slit_alarm', 0.0):+.1f}"
-                        f" = {info['adjusted_diff']:+.2f}"
-                    )
-                body_lines.append(
-                    f"{boat}号艇 {info['base']:.1f}% + "
-                    f"理論 {info.get('theory', 0.0):+.1f}% + "
-                    f"チェッカー {info.get('checker', 0.0):+.1f}% "
-                    f"= {info['final']:.1f}%{diff_text}{mark}"
-                )
-            else:
-                boost = (
-                    (info.get("theory") or 0.0)
-                    + (info.get("checker") or 0.0)
-                )
-                diff_text = ""
-                if info.get("raw_diff") is not None and info.get("adjusted_diff") is not None:
-                    diff_text = (
-                        f" / 平均差 {info['raw_diff']:+.2f}"
-                        f" + スリット {info.get('slit_alarm', 0.0):+.1f}"
-                        f" = {info['adjusted_diff']:+.2f}"
-                    )
-                body_lines.append(
-                    f"{boat}号艇 元1着率表示なし / "
-                    f"理論 {info.get('theory', 0.0):+.1f}% + "
-                    f"チェッカー {info.get('checker', 0.0):+.1f}% "
-                    f"= 補正合計 {boost:+.1f}pt{diff_text}{mark}"
-                )
-
-        if second_prediction and second_prediction.get("percents"):
-            pcts = second_prediction["percents"]
-            ranking = second_prediction.get("ranking", sorted(pcts, key=pcts.get, reverse=True))
-            body_lines += ["", "🥈 1号艇1着予想時・2着率"]
-            marks = ["◎", "○", "▲", "△", ""]
-            for i, boat in enumerate(ranking):
-                mark = marks[i] if i < len(marks) else ""
-                detail = second_prediction.get("details", {}).get(boat, {})
-                extras = []
-                if detail.get("lead2") is not None:
-                    extras.append(f"先頭別2着{detail['lead2']:.1f}")
-                if detail.get("recent2") is not None:
-                    extras.append(f"直近2着{detail['recent2']:.1f}")
-                if detail.get("theory2") is not None:
-                    extras.append(f"理論2着{detail['theory2']:+.1f}")
-                if detail.get("checker2") is not None:
-                    extras.append(f"チェッカー2着{detail['checker2']:+.1f}")
-                if detail.get("total_second_adj") is not None:
-                    extras.append(f"合計{detail['total_second_adj']:+.1f}")
-                if detail.get("f_count"):
-                    extras.append(f"F{detail['f_count']}")
-                extra_text = " / " + " ".join(extras) if extras else ""
-                body_lines.append(f"{boat}号艇 {pcts[boat]}% {mark}{extra_text}")
-
-        body_lines += [
-            "",
-            classification["reason"],
-            f"締切 {deadline_value}",
-        ]
-
-        body = "\n".join(body_lines)
-
-    elif kind == "独立バフ":
+    if kind == "独立バフ":
         buff_lines = []
-
         for b in classification["buffs"]:
-            extra = ""
-
-            if b["edge_vs_one_final"] is not None:
-                extra = (
-                    f" / 1号艇最終 {b['one_final_1st']:.1f}%"
-                    f" / 差 {b['edge_vs_one_final']:+.1f}pt"
-                )
-
-                if b["one_weak"]:
-                    extra += " ←1号艇弱化"
-
-            if b["base_known"]:
-                value_text = (
-                    f"元 {b['base_1st']:.1f}% "
-                    f"+ 理論 {b['theory_1st']:+.1f}% "
-                    f"+ チェッカー {b['checker_1st']:+.1f}% "
-                    f"= 最終 {b['final_1st']:.1f}%"
-                )
-            else:
-                value_text = (
-                    f"元1着率表示なし / "
-                    f"理論 {b['theory_1st']:+.1f}% "
-                    f"+ チェッカー {b['checker_1st']:+.1f}% "
-                    f"= 総合バフ {b['total_boost']:+.1f}pt"
-                )
-
             buff_lines.append(
                 f"{b['boat']}号艇 "
-                f"平均との差 {b['current_diff']:+.2f} ({b['zone']})\n"
-                f"{value_text}"
-                f"{extra}"
+                f"平均との差 {b['current_diff']:+.2f} / "
+                f"理論1着 {b['theory_1st']:+.1f}% / "
+                f"チェッカー1着 {b['checker_1st']:+.1f}%"
             )
 
         body = (
             f"{symbol} シンsum独立バフ検知\n"
             f"{venue} {race}\n\n"
-            + "\n\n".join(buff_lines)
-            + "\n\n全艇・評価\n"
-            + "\n".join(rate_lines)
+            + "\n".join(buff_lines)
+            + "\n\n"
+            + "シンsum理論・1着\n"
+            + "\n".join(lines)
             + "\n\n"
             + f"{classification['reason']}\n"
             + f"締切 {deadline_value}"
         )
     else:
-        secondary_text = ""
-
-        if secondary_buffs:
-            secondary_lines = []
-
-            for b in secondary_buffs:
-                if b["final_1st"] is not None:
-                    ending = f" / 最終 {b['final_1st']:.1f}%"
-                else:
-                    ending = " / 元1着率表示なし"
-
-                secondary_lines.append(
-                    f"{b['boat']}号艇 "
-                    f"平均との差 {b['current_diff']:+.2f} ({b['zone']}) / "
-                    f"理論 {b['theory_1st']:+.1f}% + "
-                    f"チェッカー {b['checker_1st']:+.1f}% "
-                    f"= 補正 {b['total_boost']:+.1f}pt"
-                    f"{ending}"
-                )
-
-            secondary_text = (
-                "\n\n🚀 2・3・4号艇のバフも確認\n"
-                + "\n".join(secondary_lines)
-            )
-
-        second_text = ""
-        if second_prediction and second_prediction.get("percents"):
-            pcts = second_prediction["percents"]
-            ranking = second_prediction.get("ranking", sorted(pcts, key=pcts.get, reverse=True))
-            marks = ["◎", "○", "▲", "△", ""]
-            second_lines = ["🥈 1号艇1着予想時・2着率"]
-            for i, boat in enumerate(ranking):
-                mark = marks[i] if i < len(marks) else ""
-                detail = second_prediction.get("details", {}).get(boat, {})
-                extras = []
-                if detail.get("lead2") is not None:
-                    extras.append(f"先頭別2着{detail['lead2']:.1f}")
-                if detail.get("recent2") is not None:
-                    extras.append(f"直近2着{detail['recent2']:.1f}")
-                if detail.get("theory2") is not None:
-                    extras.append(f"理論2着{detail['theory2']:+.1f}")
-                if detail.get("checker2") is not None:
-                    extras.append(f"チェッカー2着{detail['checker2']:+.1f}")
-                if detail.get("total_second_adj") is not None:
-                    extras.append(f"合計{detail['total_second_adj']:+.1f}")
-                if detail.get("f_count"):
-                    extras.append(f"F{detail['f_count']}")
-                extra_text = " / " + " ".join(extras) if extras else ""
-                second_lines.append(f"{boat}号艇 {pcts[boat]}% {mark}{extra_text}")
-            second_text = "\n\n" + "\n".join(second_lines)
-
         body = (
             f"{symbol} {kind}\n"
             f"{venue} {race}【{alert}】\n\n"
-            f"全艇・評価\n"
-            + "\n".join(rate_lines)
-            + secondary_text
-            + second_text
+            f"シンsum理論・1着\n"
+            + "\n".join(lines)
             + "\n\n"
             + f"{classification['reason']}\n"
             + f"締切 {deadline_value}"
+        )
+
+    # まず画像付き通知を試す。失敗した時だけ従来のテキスト通知へ。
+    try:
+        image_path = build_shinsum_image(
+            page,
+            venue,
+            race,
+            deadline_value,
+            theory_values,
+            classification,
+        )
+        send_image_ntfy(
+            image_path,
+            f"{venue} {race} / {kind}"
+        )
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+
+        print(
+            f"画像付き選別通知送信: {kind} / {venue} / {race}",
+            flush=True
+        )
+        return
+
+    except Exception as e:
+        print(
+            f"画像通知失敗: {venue} / {race} / {repr(e)} "
+            "→ テキスト通知へフォールバック",
+            flush=True
         )
 
     x = requests.post(
@@ -3000,15 +1099,6 @@ def notify_selected(
 
     x.raise_for_status()
 
-    register_result_tracking(
-        venue,
-        race,
-        deadline_value,
-        alert,
-        final_rates,
-        classification,
-    )
-
     print(
         f"選別通知送信: "
         f"{kind} / "
@@ -3018,6 +1108,7 @@ def notify_selected(
         f"締切 {deadline_value}",
         flush=True
     )
+
 
 def inspect(page):
     text = page.locator("body").inner_text(
@@ -3030,261 +1121,96 @@ def inspect(page):
     if not v or not r:
         return None
 
-    # V31: 全種類の通知を「初日・2日目」だけに限定。
-    # 逃げ強化、逃げ崩れ、やや本命、荒れ注意など、
-    # inspect()から発生する通知すべてに共通で適用する。
-    if not notify_day_allowed(v):
-        return None
-
     if not within15(text):
         return None
 
     d = deadline(text)
     a = alert_near_deadline(text, d)
 
-    # -----------------------------
-    # 3種類のデータを取得
-    # -----------------------------
-    # DOM方式とテキスト方式を両方実行し、
-    # より多く「明示された元1着率」を取れた方を採用する。
-    #
-    # 理由:
-    # - DOM方式は画面構造に強いが、レイアウトによって1艇分だけ拾うことがある
-    # - テキスト方式は別レースで6艇分を正しく取れることが確認できている
-    # - 1〜2艇しか本当に表示されないレースでは、両方式ともその範囲に留まる
-    base_dom = parse_base_1st_rates_dom(page)
-    base_text = parse_base_1st_rates(text)
+    theory = parse_theory_1st(text)
 
-    # V21:
-    # TEXT方式を優先する。
-    # V20では DOM=6艇 / TEXT=6艇 の同数時にDOMを採用してしまい、
-    # DOM側の入れ子要素重複（例: 34,34,25,25,22,22）を誤採用した。
-    #
-    # TEXT方式は
-    #   34,25,22,11,2,4
-    # のように正しい6艇を取得できているため、
-    # TEXTが1艇以上取れている場合はTEXTを採用。
-    # TEXTが0艇の時だけDOMへフォールバックする。
-    if len(base_text) > 0:
-        base_rates = base_text
+    # 6艇全部取れないレースは誤判定防止のため除外
+    if len(theory) < 6:
         print(
-            f"元1着率採用(V21): TEXT {len(base_text)}艇 "
-            f"(DOM {len(base_dom)}艇は参考のみ)",
+            f"シンsum理論6艇取得失敗: "
+            f"{v} / {r} / "
+            f"取得 {len(theory)}艇",
             flush=True
         )
-    else:
-        base_rates = base_dom
-        print(
-            f"元1着率採用(V21): TEXT 0艇のためDOM {len(base_dom)}艇を採用",
-            flush=True
-        )
+        return None
 
-    theory_adj = parse_theory_adjustments(text)
-    theory_2nd = parse_theory_place_adjustments(text, 1)
+    # -----------------------------
+    # A. 従来: やや本命 / 荒れ注意から選別
+    # -----------------------------
+    if a:
+        classification = classify_theory(theory)
+
+        if not classification:
+            print(
+                f"選別対象外: "
+                f"{a} / {v} / {r} / "
+                f"1={theory[1]:+g}% "
+                f"2={theory[2]:+g}% "
+                f"3={theory[3]:+g}% "
+                f"4={theory[4]:+g}% "
+                f"5={theory[5]:+g}% "
+                f"6={theory[6]:+g}%",
+                flush=True
+            )
+            return None
+
+        return {
+            "venue": v,
+            "race": r,
+            "deadline": d,
+            "alert": a,
+            "theory": theory,
+            "classification": classification,
+            "key": (
+                f"{now():%Y-%m-%d}|"
+                f"{v}|{r}|{a}|{classification['type']}"
+            )
+        }
+
+    # -----------------------------
+    # B. 新規: 通常レースでも1〜4号艇の独立バフを検知
+    # -----------------------------
     current_diffs = parse_current_diffs(text)
-    slit_alarms = parse_slit_alarms(text)
-    adjusted_diffs = build_adjusted_diffs(current_diffs, slit_alarms)
-    one_x_rates = parse_one_x_rates(text)
-    registrations = parse_registration_numbers(text)
-
-    print(
-        f"平均との差＋スリット補正: {v} / {r} / "
-        + " | ".join(
-            f"{boat}号艇 {current_diffs.get(boat, 0.0):+.2f}"
-            f" + slit{slit_alarms.get(boat, 0.0):+.1f}"
-            f" = {adjusted_diffs.get(boat, current_diffs.get(boat, 0.0)):+.2f}"
-            for boat in range(1, 7)
-        ),
-        flush=True
-    )
-
-    # V32: シンsumチェッカーのゾーン判定は
-    # 「元の平均との差 + スリットアラーム」の補正後値を使う。
-    checker = collect_checker_1st(
-        page,
-        adjusted_diffs,
-        registrations
-    )
-
-    if len(base_rates) < 6:
-        missing_base = [
-            b for b in range(1, 7)
-            if b not in base_rates
-        ]
-        print(
-            f"元1着率は明示分のみ使用: "
-            f"{v} / {r} / "
-            f"取得 {len(base_rates)}艇 {base_rates} / "
-            f"元1着率表示なし {missing_base}号艇",
-            flush=True
-        )
-
-    if len(theory_adj) < 6:
-        print(
-            f"シンsum理論1着補正6艇取得失敗: "
-            f"{v} / {r} / "
-            f"取得 {len(theory_adj)}艇 / {theory_adj}",
-            flush=True
-        )
-        return None
-
-    if len(current_diffs) < 6:
-        print(
-            f"平均との差6艇取得失敗: "
-            f"{v} / {r} / "
-            f"取得 {len(current_diffs)}艇 / {current_diffs}",
-            flush=True
-        )
-        return None
-
-    if len(registrations) < 6:
-        print(
-            f"登録番号6艇取得失敗: "
-            f"{v} / {r} / "
-            f"取得 {len(registrations)}艇 / {registrations}",
-            flush=True
-        )
-        return None
-
-    if len(checker) < 6:
-        missing_checker = [
-            b for b in range(1, 7)
-            if b not in checker
-        ]
-        print(
-            f"チェッカー一部データなし(V29): "
-            f"{v} / {r} / "
-            f"取得 {len(checker)}艇 / "
-            f"データなし {missing_checker}号艇 "
-            f"→ データなし艇は除外し、取得済み艇だけで判定続行",
-            flush=True
-        )
-
-    # データなし艇は0%扱い・推測・補完をしない。
-    # build_final_ratesは、必要なチェッカー値が取得できた艇だけを評価する。
-    final_rates = build_final_rates(
-        base_rates,
-        theory_adj,
+    checker = parse_checker_1st(text, current_diffs)
+    classification = classify_buff(
+        theory,
+        current_diffs,
         checker
     )
 
-    # 通知表示・結果ログ用に、元平均との差 / スリット / 補正後差を保持。
-    for boat, info in final_rates.items():
-        info["raw_diff"] = current_diffs.get(boat)
-        info["slit_alarm"] = slit_alarms.get(boat, 0.0)
-        info["adjusted_diff"] = adjusted_diffs.get(boat)
-
-    if not final_rates:
-        print(
-            f"評価データ取得なし: {v} / {r}",
-            flush=True
-        )
+    if not classification:
         return None
 
     print(
-        f"艇別評価: {v} / {r} / "
-        + " | ".join(
-            (
-                f"{boat}号艇 "
-                f"{final_rates[boat]['base']:.1f}"
-                f"{final_rates[boat]['theory']:+.1f}"
-                f"{final_rates[boat]['checker']:+.1f}"
-                f"={final_rates[boat]['final']:.1f}%"
-                if final_rates[boat]["base"] is not None
-                else
-                f"{boat}号艇 元不明 "
-                f"補正{final_rates[boat]['theory']:+.1f}"
-                f"{final_rates[boat]['checker']:+.1f}"
-                f"={final_rates[boat]['total_adjustment']:+.1f}pt"
-            )
-            for boat in sorted(final_rates.keys())
+        f"独立バフ候補: {v} / {r} / "
+        + ", ".join(
+            f"{x['boat']}号艇 "
+            f"差{x['current_diff']:+.2f} "
+            f"理論{x['theory_1st']:+.1f}% "
+            f"チェッカー{x['checker_1st']:+.1f}%"
+            for x in classification["buffs"]
         ),
         flush=True
     )
 
-    # V27: 独立バフの単独判定・通知は完全廃止。
-    # 対抗艇の大幅補正は「1号艇逃げ強化・対抗艇注意」の中だけで使用する。
-    buff_classification = None
-
-    # -----------------------------
-    # NEW: 1号艇の逃げ強化 / 逃げ崩れ
-    # -----------------------------
-    escape = classify_escape_boost(final_rates)
-    collapse = classify_escape_collapse(final_rates)
-
-    # 逃げ崩れを優先。1号艇大幅低下＋15%以上の他艇があるケース。
-    if collapse:
-        collapse["current_diffs"] = adjusted_diffs
-        collapse["one_x_rates"] = one_x_rates
-        return {
-            "venue": v,
-            "race": r,
-            "deadline": d,
-            "alert": a or "",
-            "final_rates": final_rates,
-            "theory_2nd": theory_2nd,
-            "one_x_rates": one_x_rates,
-            "classification": collapse,
-            "key": (
-                f"{now():%Y-%m-%d}|{v}|{r}|ESCAPE_COLLAPSE"
-            )
-        }
-
-    # 1号艇が元より上昇し、最終75%以上。
-    # かつ確認できる他艇に最終15%以上がいないケース。
-    if escape:
-        escape["current_diffs"] = adjusted_diffs
-        escape["one_x_rates"] = one_x_rates
-        return {
-            "venue": v,
-            "race": r,
-            "deadline": d,
-            "alert": a or "",
-            "final_rates": final_rates,
-            "theory_2nd": theory_2nd,
-            "one_x_rates": one_x_rates,
-            "classification": escape,
-            "key": (
-                f"{now():%Y-%m-%d}|{v}|{r}|ESCAPE_BOOST"
-            )
-        }
-
-    # -----------------------------
-    # A. やや本命 / 荒れ注意
-    #    → 最終補正1着率で主判定
-    #    ＋ 2〜4号艇のバフを副注目として同時表示
-    # -----------------------------
-    if a:
-        classification = classify_final_rates(
-            final_rates
+    return {
+        "venue": v,
+        "race": r,
+        "deadline": d,
+        "alert": "",
+        "theory": theory,
+        "classification": classification,
+        "key": (
+            f"{now():%Y-%m-%d}|"
+            f"{v}|{r}|BUFF|"
+            + "-".join(str(x["boat"]) for x in classification["buffs"])
         )
-
-        if classification:
-            classification["current_diffs"] = adjusted_diffs
-            classification["one_x_rates"] = one_x_rates
-            return {
-                "venue": v,
-                "race": r,
-                "deadline": d,
-                "alert": a,
-                "final_rates": final_rates,
-                "theory_2nd": theory_2nd,
-                "one_x_rates": one_x_rates,
-                "classification": classification,
-                "key": (
-                    f"{now():%Y-%m-%d}|"
-                    f"{v}|{r}|{a}|{classification['type']}"
-                )
-            }
-
-        print(
-            f"最終補正で主選別は対象外: "
-            f"{a} / {v} / {r}",
-            flush=True
-        )
-
-    # V27: 独立バフ単独通知は完全廃止
-    return None
+    }
 
 
 def cycle(page, initial=False):
@@ -3320,20 +1246,21 @@ def cycle(page, initial=False):
                 flush=True
             )
 
-    # 起動直後でも、締切15分以内で現在条件を満たす候補は通知する。
-    # その後 seen に登録するため、同一実行中の重複通知は防止される。
+    # 起動直後に既に存在している通知を
+    # 大量送信しないため既読登録
     if initial:
+        seen.update(current.keys())
+
         print(
-            f"初回候補通知対象: {len(current)}件",
+            f"初期既読登録: {len(current)}件",
             flush=True
         )
 
         for x in current.values():
-            attach_second_place_prediction(x)
             c = x["classification"]
 
             print(
-                f"初回通知: "
+                f"既読: "
                 f"{c['type']} / "
                 f"{x['alert'] or '通常レース'} / "
                 f"{x['venue']} / "
@@ -3342,17 +1269,6 @@ def cycle(page, initial=False):
                 flush=True
             )
 
-            notify_selected(
-                x["alert"],
-                x["venue"],
-                x["race"],
-                x["deadline"],
-                x["final_rates"],
-                x["classification"],
-                x.get("second_prediction")
-            )
-
-        seen.update(current.keys())
         return
 
     new_items = [
@@ -3368,15 +1284,14 @@ def cycle(page, initial=False):
         )
 
     for x in new_items:
-        attach_second_place_prediction(x)
         notify_selected(
+            page,
             x["alert"],
             x["venue"],
             x["race"],
             x["deadline"],
-            x["final_rates"],
-            x["classification"],
-            x.get("second_prediction")
+            x["theory"],
+            x["classification"]
         )
 
     seen.update(
@@ -3399,10 +1314,6 @@ def main():
 
         page = c.new_page()
 
-        _load_pending_results()
-        print_result_stats()
-        check_pending_results()
-
         if not active():
             print(
                 "監視時間外（23:00〜08:00 JST）。終了します。",
@@ -3411,18 +1322,9 @@ def main():
             return
 
         print(
-            f"逃げ判定設定: "
-            f"逃げ強化最終>={ESCAPE_FINAL_MIN:.1f}% / "
-            f"対抗艇>={RIVAL_FINAL_MIN:.1f}% / "
-            f"逃げ崩れ低下>={ONE_BIG_DROP_MIN:.1f}pt",
-            flush=True
-        )
-
-        print(
             f"[{now():%Y-%m-%d %H:%M:%S}] "
-            f"最終補正1着率 "
-            f"(元1着率 + 理論補正 + チェッカー補正) "
-            f"監視開始 [V30 second-place-analysis]",
+            f"やや本命/荒れ注意選別 + "
+            f"1〜4号艇 独立バフ監視開始",
             flush=True
         )
 
@@ -3430,7 +1332,6 @@ def main():
             page,
             initial=True
         )
-        check_pending_results()
 
         while active():
             print(
@@ -3452,7 +1353,6 @@ def main():
                 page,
                 initial=False
             )
-            check_pending_results()
 
 
 if __name__ == "__main__":
