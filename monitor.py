@@ -80,6 +80,47 @@ def deadline(text):
     return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
 
 
+
+def parse_event_day(text):
+    """
+    シンsum詳細ページ本文から開催何日目かを判定。
+    対象は初日・2日目のみ。
+
+    返り値:
+      1 = 初日
+      2 = 2日目
+      3以上 = それ以降
+      None = 判定不能
+    """
+    t = re.sub(r"\s+", "", str(text))
+
+    # 「初日」
+    if "初日" in t:
+        return 1
+
+    # 「2日目」「２日目」
+    if re.search(r"(?:2|２)日目", t):
+        return 2
+
+    # その他の日数
+    m = re.search(r"([3-9]|1[0-2])日目", t)
+    if m:
+        return int(m.group(1))
+
+    # 「第○日」表記にも対応
+    m = re.search(r"第([1-9]|1[0-2])日", t)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
+def allowed_event_day(text):
+    """初日・2日目だけTrue。判定不能は誤通知防止でFalse。"""
+    day = parse_event_day(text)
+    return day in (1, 2)
+
+
 def within15(text):
     d = deadline(text)
     if not d:
@@ -198,61 +239,174 @@ def alert_near_deadline(text, d):
     )
 
 
-def parse_theory_1st(text):
+def parse_base_1st(text):
     """
-    シンsum理論の「1着」変化率を6艇全部取得。
-
-    戻り値例:
-    {
-        1: -2.0,
-        2: 5.0,
-        3: 23.0,
-        4: 12.0,
-        5: -1.0,
-        6: 3.0
-    }
+    ページ上部の「選手名・1着率」から元1着率を6艇分取得。
+    例: {1: 34.0, 2: 16.0, ...}
     """
-
-    start = text.find("シンsum理論")
-
+    start = text.find("選手名・1着率")
     if start < 0:
         return {}
 
-    end = text.find("シンsumチェッカー", start)
-
-    section = text[
-        start:(end if end > start else start + 6000)
+    end_candidates = [
+        p for p in (
+            text.find("戦法別上昇率", start),
+            text.find("スリット隊形", start),
+        )
+        if p > start
     ]
+    end = min(end_candidates) if end_candidates else min(len(text), start + 5000)
 
-    lines = [
-        x.strip()
-        for x in section.splitlines()
-        if x.strip()
-    ]
-
+    section = text[start:end]
+    lines = [x.strip() for x in section.splitlines() if x.strip()]
     result = {}
 
     for boat in range(1, 7):
         for i, line in enumerate(lines):
-
             if line != str(boat):
                 continue
 
-            # 1艇分を広めに確認
-            window = "\n".join(lines[i:i + 18])
-
-            # シンsum理論は
-            # 1着 / 2着 / 3着 / 3連 の順に%が出る想定。
-            pcts = re.findall(
-                r"([+-]?\d+(?:\.\d+)?)\s*%",
-                window
-            )
-
+            window = "\n".join(lines[i:i + 10])
+            pcts = re.findall(r"(\d+(?:\.\d+)?)\s*%", window)
             if pcts:
                 result[boat] = float(pcts[0])
                 break
 
     return result
+
+
+def parse_theory_1st(text):
+    """
+    「シンsum理論」表そのものの1着補正を6艇全部取得する。
+    上部の「← シンsum理論に戻る」を誤って拾わないよう、
+    「シンsumチェッカー」の直前にある最後のシンsum理論を使う。
+
+    例:
+      1号艇 -1%
+      2号艇 -8%
+      3号艇 +1%
+    """
+    checker_pos = text.find("シンsumチェッカー")
+    if checker_pos < 0:
+        checker_pos = len(text)
+
+    start = text.rfind("シンsum理論", 0, checker_pos)
+    if start < 0:
+        return {}
+
+    section = text[start:checker_pos]
+    lines = [x.strip() for x in section.splitlines() if x.strip()]
+    result = {}
+
+    for boat in range(1, 7):
+        for i, line in enumerate(lines):
+            if line != str(boat):
+                continue
+
+            # 艇番→登録番号→型→平均との差→1着/2着/3着...
+            window = "\n".join(lines[i:i + 18])
+            pcts = re.findall(
+                r"([+-]?\d+(?:\.\d+)?)\s*%",
+                window
+            )
+            if pcts:
+                result[boat] = float(pcts[0])
+                break
+
+    return result
+
+
+def parse_checker_1st_all(text, current_diffs):
+    """
+    1〜6号艇すべてについて、現在の「平均との差」ゾーンの
+    シンsumチェッカー1着補正を取得する。
+    """
+    start = text.find("シンsumチェッカー")
+    if start < 0:
+        return {}
+
+    section = text[start:]
+    compact = re.sub(r"\s+", "", section)
+    result = {}
+
+    for boat in range(1, 7):
+        if boat not in current_diffs:
+            continue
+
+        token = f"{boat}号艇"
+        pos = compact.find(token)
+        if pos < 0:
+            continue
+
+        next_positions = []
+        for other in range(1, 7):
+            if other == boat:
+                continue
+            p = compact.find(f"{other}号艇", pos + len(token))
+            if p >= 0:
+                next_positions.append(p)
+
+        end = min(next_positions) if next_positions else min(len(compact), pos + 3500)
+        card = compact[pos:end]
+
+        zone = checker_zone(current_diffs[boat])
+        variants = {
+            "+0.5以上": ("+0.5以上",),
+            "0〜+0.5": ("0〜+0.5", "0~+0.5", "0～+0.5"),
+            "-0.5〜0": ("-0.5〜0", "-0.5~0", "-0.5～0"),
+            "-0.5未満": ("-0.5未満",),
+        }[zone]
+
+        zpos = -1
+        for v in variants:
+            zpos = card.find(v)
+            if zpos >= 0:
+                break
+
+        if zpos < 0:
+            continue
+
+        row = card[zpos:zpos + 260]
+        pcts = re.findall(r"([+-]?\d+(?:\.\d+)?)%", row)
+        if not pcts:
+            continue
+
+        result[boat] = {
+            "zone": zone,
+            "checker_1st": float(pcts[0]),
+        }
+
+    return result
+
+
+def build_final_1st_rates(base_1st, theory_1st, checker_all):
+    """
+    最終1着率 = 元1着率 + シンsum理論1着補正 + シンsumチェッカー1着補正
+    """
+    out = {}
+    for boat in range(1, 7):
+        base = base_1st.get(boat)
+        theory = theory_1st.get(boat)
+        checker_row = checker_all.get(boat)
+        checker = checker_row.get("checker_1st") if checker_row else None
+
+        if base is None or theory is None or checker is None:
+            out[boat] = {
+                "base": base,
+                "theory": theory,
+                "checker": checker,
+                "final": None,
+            }
+            continue
+
+        out[boat] = {
+            "base": float(base),
+            "theory": float(theory),
+            "checker": float(checker),
+            "final": float(base) + float(theory) + float(checker),
+        }
+
+    return out
 
 
 def parse_current_diffs(text):
@@ -300,68 +454,15 @@ def checker_zone(current_diff):
 
 def parse_checker_1st(text, current_diffs):
     """
-    各艇のシンsumチェッカーから、現在の「平均との差」が属するゾーンの
-    1着率変化を取得する。
-
-    例: 3号艇が +0.61 なら「+0.5以上」行の1着率（例 +6.4%）を返す。
+    既存の独立バフ判定用。
+    全艇を取得した後、BUFF_TARGET_BOATSだけ返す。
     """
-    start = text.find("シンsumチェッカー")
-    if start < 0:
-        return {}
-
-    section = text[start:]
-    compact = re.sub(r"\s+", "", section)
-    result = {}
-
-    for boat in BUFF_TARGET_BOATS:
-        if boat not in current_diffs:
-            continue
-
-        token = f"{boat}号艇"
-        pos = compact.find(token)
-        if pos < 0:
-            continue
-
-        # 次の艇カードまでをこの艇の範囲とする。
-        next_positions = []
-        for other in range(1, 7):
-            if other == boat:
-                continue
-            p = compact.find(f"{other}号艇", pos + len(token))
-            if p >= 0:
-                next_positions.append(p)
-
-        end = min(next_positions) if next_positions else min(len(compact), pos + 3500)
-        card = compact[pos:end]
-
-        zone = checker_zone(current_diffs[boat])
-        zpos = card.find(zone)
-        if zpos < 0:
-            # 表記ゆれ対策（波ダッシュ/全角チルダ等）
-            variants = {
-                "0〜+0.5": ("0~+0.5", "0～+0.5"),
-                "-0.5〜0": ("-0.5~0", "-0.5～0"),
-            }.get(zone, ())
-            for v in variants:
-                zpos = card.find(v)
-                if zpos >= 0:
-                    break
-
-        if zpos < 0:
-            continue
-
-        # 該当行は「件数」の後に 1着率 / 2着率 / 3着率 / 3連対率 の順。
-        row = card[zpos:zpos + 220]
-        pcts = re.findall(r"([+-]?\d+(?:\.\d+)?)%", row)
-        if not pcts:
-            continue
-
-        result[boat] = {
-            "zone": zone,
-            "checker_1st": float(pcts[0]),
-        }
-
-    return result
+    all_rows = parse_checker_1st_all(text, current_diffs)
+    return {
+        b: all_rows[b]
+        for b in BUFF_TARGET_BOATS
+        if b in all_rows
+    }
 
 
 def classify_buff(theory, current_diffs, checker):
@@ -812,7 +913,7 @@ def predicted_st(d):
     return max(0.04, min(0.24, p))
 
 
-def build_shinsum_image(page, venue, race, deadline_value, theory_values, classification):
+def build_shinsum_image(page, venue, race, deadline_value, theory_values, classification, final_rates):
     """
     Shinsum Monitor専用の画像通知。
     予測スリット + シンsum理論 + 注目艇を1枚にする。
@@ -870,9 +971,27 @@ def build_shinsum_image(page, venue, race, deadline_value, theory_values, classi
     theory_rows = []
     for b in range(1, 7):
         mark = " ← 注目" if b in focus else ""
+        fr = final_rates.get(b, {})
+        base = fr.get("base")
+        th = fr.get("theory")
+        ck = fr.get("checker")
+        final = fr.get("final")
+
+        if final is None:
+            detail = (
+                f"元{base:.1f}% / 理論{th:+.1f}% / チェッカー未取得"
+                if base is not None and th is not None
+                else "最終1着率 計算データ不足"
+            )
+        else:
+            detail = (
+                f"<strong>{final:.1f}%</strong>　"
+                f"= 元{base:.1f}% + 理論{th:+.1f}% + チェッカー{ck:+.1f}%"
+            )
+
         theory_rows.append(
             f'<div class="trow"><b>{b}号艇</b>'
-            f'<span>{theory_values.get(b, 0):+g}%{mark}</span></div>'
+            f'<span>{detail}{mark}</span></div>'
         )
 
     buff_rows = []
@@ -943,7 +1062,7 @@ def build_shinsum_image(page, venue, race, deadline_value, theory_values, classi
       </div>
 
       <div class="card">
-        <div class="title">シンsum理論・1着</div>
+        <div class="title">最終1着率（元1着率＋シンsum理論＋シンsumチェッカー）</div>
         {''.join(theory_rows)}
       </div>
 
@@ -1002,7 +1121,8 @@ def notify_selected(
     race,
     deadline_value,
     theory_values,
-    classification
+    classification,
+    final_rates
 ):
     kind = classification["type"]
     focus = set(classification["focus"])
@@ -1017,11 +1137,19 @@ def notify_selected(
     lines = []
     for boat in range(1, 7):
         mark = " ←注目" if boat in focus else ""
-        lines.append(
-            f"{boat}号艇 "
-            f"{theory_values[boat]:+g}%"
-            f"{mark}"
-        )
+        fr = final_rates.get(boat, {})
+        final = fr.get("final")
+
+        if final is None:
+            lines.append(f"{boat}号艇 最終1着率=取得不足{mark}")
+        else:
+            lines.append(
+                f"{boat}号艇 {final:.1f}% "
+                f"(元{fr['base']:.1f} "
+                f"+理論{fr['theory']:+.1f} "
+                f"+チェッカー{fr['checker']:+.1f})"
+                f"{mark}"
+            )
 
     if kind == "独立バフ":
         buff_lines = []
@@ -1038,7 +1166,7 @@ def notify_selected(
             f"{venue} {race}\n\n"
             + "\n".join(buff_lines)
             + "\n\n"
-            + "シンsum理論・1着\n"
+            + "最終1着率（元＋理論＋チェッカー）\n"
             + "\n".join(lines)
             + "\n\n"
             + f"{classification['reason']}\n"
@@ -1048,7 +1176,7 @@ def notify_selected(
         body = (
             f"{symbol} {kind}\n"
             f"{venue} {race}【{alert}】\n\n"
-            f"シンsum理論・1着\n"
+            f"最終1着率（元＋理論＋チェッカー）\n"
             + "\n".join(lines)
             + "\n\n"
             + f"{classification['reason']}\n"
@@ -1064,6 +1192,7 @@ def notify_selected(
             deadline_value,
             theory_values,
             classification,
+            final_rates,
         )
         send_image_ntfy(
             image_path,
@@ -1121,13 +1250,59 @@ def inspect(page):
     if not v or not r:
         return None
 
+    # 初日・2日目限定
+    event_day = parse_event_day(text)
+    if event_day not in (1, 2):
+        if event_day is not None:
+            print(
+                f"[DAY-SKIP] {v} / {r} / {event_day}日目 → 対象外",
+                flush=True
+            )
+        else:
+            print(
+                f"[DAY-SKIP] {v} / {r} / 開催日判定不能 → 安全側で対象外",
+                flush=True
+            )
+        return None
+
+    print(
+        f"[DAY-OK] {v} / {r} / "
+        + ("初日" if event_day == 1 else "2日目"),
+        flush=True
+    )
+
     if not within15(text):
         return None
 
     d = deadline(text)
     a = alert_near_deadline(text, d)
 
+    base_1st = parse_base_1st(text)
     theory = parse_theory_1st(text)
+    current_diffs = parse_current_diffs(text)
+    checker_all = parse_checker_1st_all(text, current_diffs)
+    final_rates = build_final_1st_rates(
+        base_1st,
+        theory,
+        checker_all,
+    )
+
+    print(
+        "[1ST-RATE] "
+        + " / ".join(
+            (
+                f"{b}号艇="
+                f"{final_rates[b]['final']:.1f}% "
+                f"(元{final_rates[b]['base']:.1f}"
+                f"+理論{final_rates[b]['theory']:+.1f}"
+                f"+CHK{final_rates[b]['checker']:+.1f})"
+            )
+            if final_rates.get(b, {}).get("final") is not None
+            else f"{b}号艇=計算不足"
+            for b in range(1, 7)
+        ),
+        flush=True,
+    )
 
     # 6艇全部取れないレースは誤判定防止のため除外
     if len(theory) < 6:
@@ -1165,6 +1340,7 @@ def inspect(page):
             "deadline": d,
             "alert": a,
             "theory": theory,
+            "final_rates": final_rates,
             "classification": classification,
             "key": (
                 f"{now():%Y-%m-%d}|"
@@ -1175,8 +1351,11 @@ def inspect(page):
     # -----------------------------
     # B. 新規: 通常レースでも1〜4号艇の独立バフを検知
     # -----------------------------
-    current_diffs = parse_current_diffs(text)
-    checker = parse_checker_1st(text, current_diffs)
+    checker = {
+        b: checker_all[b]
+        for b in BUFF_TARGET_BOATS
+        if b in checker_all
+    }
     classification = classify_buff(
         theory,
         current_diffs,
@@ -1204,6 +1383,7 @@ def inspect(page):
         "deadline": d,
         "alert": "",
         "theory": theory,
+        "final_rates": final_rates,
         "classification": classification,
         "key": (
             f"{now():%Y-%m-%d}|"
@@ -1291,7 +1471,8 @@ def cycle(page, initial=False):
             x["race"],
             x["deadline"],
             x["theory"],
-            x["classification"]
+            x["classification"],
+            x["final_rates"]
         )
 
     seen.update(
