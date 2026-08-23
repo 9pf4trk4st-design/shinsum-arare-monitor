@@ -1332,23 +1332,9 @@ def inspect(page):
     if not v or not r:
         return None
 
-    # 開催日縛りは撤廃。
-    # 開催日は参考ログとしてだけ取得し、初日〜最終日まで全日対象にする。
-    event_day, day_source = get_event_day(text, v, r)
-
-    if event_day is None:
-        print(
-            f"[DAY-INFO] {v} / {r} / 開催日判定不能 "
-            f"(source={day_source}) → そのまま監視",
-            flush=True
-        )
-    else:
-        day_label = "初日" if event_day == 1 else f"{event_day}日目"
-        print(
-            f"[DAY-INFO] {v} / {r} / {day_label} "
-            f"(source={day_source}) → 対象",
-            flush=True
-        )
+    # 開催日縛り撤廃版:
+    # 開催日は判定にもログにも使わない。
+    # BOATRACE公式への開催日取得アクセスも完全停止して高速化。
 
     if not within15(text):
         return None
@@ -1377,7 +1363,12 @@ def inspect(page):
                 f"+CHK{final_rates[b]['checker']:+.1f})"
             )
             if final_rates.get(b, {}).get("final") is not None
-            else f"{b}号艇=計算不足"
+            else (
+                f"{b}号艇=計算不足"
+                f"(元={final_rates.get(b, {}).get('base')},"
+                f"理論={final_rates.get(b, {}).get('theory')},"
+                f"CHK={final_rates.get(b, {}).get('checker')})"
+            )
             for b in range(1, 7)
         ),
         flush=True,
@@ -1477,11 +1468,6 @@ def cycle(page, initial=False):
 
     print(
         f"詳細候補リンク数: {len(links)}",
-        flush=True
-    )
-    print(
-        f"[DAY-CACHE-STATUS] 当日キャッシュ済み場数="
-        f"{sum(1 for k in _EVENT_DAY_CACHE if k.startswith(now().strftime('%Y%m%d') + '|'))}",
         flush=True
     )
 
