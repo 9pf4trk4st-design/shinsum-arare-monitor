@@ -1332,29 +1332,21 @@ def inspect(page):
     if not v or not r:
         return None
 
-    # 初日・2日目限定
+    # 開催日縛りは撤廃。
+    # 開催日は参考ログとしてだけ取得し、初日〜最終日まで全日対象にする。
     event_day, day_source = get_event_day(text, v, r)
 
-    if event_day not in (1, 2):
-        if event_day is not None:
-            print(
-                f"[DAY-SKIP] {v} / {r} / {event_day}日目 "
-                f"(source={day_source}) → 対象外",
-                flush=True
-            )
-        else:
-            # ここで全レースを落とすと監視不能になるので、
-            # 判定不能時はログを出して監視継続。通知直前でも再確認できる。
-            print(
-                f"[DAY-WARN] {v} / {r} / 開催日判定不能 "
-                f"(source={day_source}) → 監視継続",
-                flush=True
-            )
-    else:
+    if event_day is None:
         print(
-            f"[DAY-OK] {v} / {r} / "
-            + ("初日" if event_day == 1 else "2日目")
-            + f" (source={day_source})",
+            f"[DAY-INFO] {v} / {r} / 開催日判定不能 "
+            f"(source={day_source}) → そのまま監視",
+            flush=True
+        )
+    else:
+        day_label = "初日" if event_day == 1 else f"{event_day}日目"
+        print(
+            f"[DAY-INFO] {v} / {r} / {day_label} "
+            f"(source={day_source}) → 対象",
             flush=True
         )
 
