@@ -83,42 +83,92 @@ def deadline(text):
 
 def parse_event_day(text):
     """
-    シンsum詳細ページ本文から開催何日目かを判定。
-    対象は初日・2日目のみ。
-
-    返り値:
-      1 = 初日
-      2 = 2日目
-      3以上 = それ以降
-      None = 判定不能
+    ページ本文だけから開催何日目か判定。
     """
     t = re.sub(r"\s+", "", str(text))
 
-    # 「初日」
     if "初日" in t:
         return 1
 
-    # 「2日目」「２日目」
-    if re.search(r"(?:2|２)日目", t):
-        return 2
-
-    # その他の日数
-    m = re.search(r"([3-9]|1[0-2])日目", t)
+    m = re.search(r"(?:第)?([1-9]|1[0-2])日目", t)
     if m:
         return int(m.group(1))
 
-    # 「第○日」表記にも対応
-    m = re.search(r"第([1-9]|1[0-2])日", t)
+    m = re.search(r"第([1-9]|1[0-2])日(?:目)?", t)
     if m:
         return int(m.group(1))
 
     return None
 
 
-def allowed_event_day(text):
-    """初日・2日目だけTrue。判定不能は誤通知防止でFalse。"""
+def fetch_event_day_official(venue, race_no):
+    """
+    BOATRACE公式レースページから開催日(初日=1, 2日目=2...)を取得。
+    Shinsum詳細ページに開催日表記が無い場合の本命フォールバック。
+    """
+    jcd = VENUE_CODES.get(venue)
+    if not jcd:
+        return None
+
+    hd = now().strftime("%Y%m%d")
+    urls = [
+        (
+            "https://www.boatrace.jp/owpc/pc/race/racelist"
+            f"?hd={hd}&jcd={jcd:02d}&rno={race_no}"
+        ),
+        (
+            "https://www.boatrace.jp/owpc/pc/race/beforeinfo"
+            f"?hd={hd}&jcd={jcd:02d}&rno={race_no}"
+        ),
+    ]
+
+    for url in urls:
+        try:
+            r = _http.get(url, timeout=15)
+            r.raise_for_status()
+            plain = _clean_html(r.text)
+            compact = re.sub(r"\s+", "", plain)
+
+            if "初日" in compact:
+                return 1
+
+            # 例: 第2日 / 第2日目 / 2日目
+            for pat in (
+                r"第([1-9]|1[0-2])日目",
+                r"第([1-9]|1[0-2])日",
+                r"(?<!\d)([1-9]|1[0-2])日目",
+            ):
+                m = re.search(pat, compact)
+                if m:
+                    return int(m.group(1))
+
+        except Exception as e:
+            print(
+                f"[DAY-FETCH-ERR] {venue}{race_no}R {e!r}",
+                flush=True
+            )
+
+    return None
+
+
+def get_event_day(text, venue, race):
+    """
+    1) Shinsum詳細ページ本文
+    2) BOATRACE公式
+    の順で開催日を判定。
+    """
     day = parse_event_day(text)
-    return day in (1, 2)
+    if day is not None:
+        return day, "shinsum"
+
+    race_no = int(re.sub(r"\D", "", str(race)) or 0)
+    if race_no:
+        day = fetch_event_day_official(venue, race_no)
+        if day is not None:
+            return day, "official"
+
+    return None, "unknown"
+
 
 
 def within15(text):
@@ -1251,25 +1301,30 @@ def inspect(page):
         return None
 
     # 初日・2日目限定
-    event_day = parse_event_day(text)
+    event_day, day_source = get_event_day(text, v, r)
+
     if event_day not in (1, 2):
         if event_day is not None:
             print(
-                f"[DAY-SKIP] {v} / {r} / {event_day}日目 → 対象外",
+                f"[DAY-SKIP] {v} / {r} / {event_day}日目 "
+                f"(source={day_source}) → 対象外",
                 flush=True
             )
         else:
+            # ここで全レースを落とすと監視不能になるので、
+            # 判定不能時はログを出して監視継続。通知直前でも再確認できる。
             print(
-                f"[DAY-SKIP] {v} / {r} / 開催日判定不能 → 安全側で対象外",
+                f"[DAY-WARN] {v} / {r} / 開催日判定不能 "
+                f"(source={day_source}) → 監視継続",
                 flush=True
             )
-        return None
-
-    print(
-        f"[DAY-OK] {v} / {r} / "
-        + ("初日" if event_day == 1 else "2日目"),
-        flush=True
-    )
+    else:
+        print(
+            f"[DAY-OK] {v} / {r} / "
+            + ("初日" if event_day == 1 else "2日目")
+            + f" (source={day_source})",
+            flush=True
+        )
 
     if not within15(text):
         return None
