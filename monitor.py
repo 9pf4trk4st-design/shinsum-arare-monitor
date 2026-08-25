@@ -13,7 +13,8 @@ from playwright.sync_api import sync_playwright
 # ============================================================
 # 通知対象:
 #   ・指定16場のうち「ボートレース日和で当日が初日または最終日と確認できた場」だけ
-#   ・1R〜12Rすべて
+#   ・1R〜12Rのうち締切前のレースだけ
+#   ・締切済みレースは展示/ST/日和取得をせず完全スキップ
 #   ・展示STが6艇分そろった後に各R 1回だけ通知
 #
 # 本番ST予測に使う材料:
@@ -794,18 +795,78 @@ def send_image(path, venue, race_no, event_day):
 
 def fetch_deadline(page, venue, race_no):
     """
-    公式直前情報本文から締切予定時刻を補助取得。
+    公式直前情報から締切予定時刻を取得。
+    まず requests で高速取得し、失敗時だけ Playwright にフォールバック。
     """
+    url = official_before_url(venue, race_no)
+
+    try:
+        r = _http.get(url, timeout=3)
+        r.raise_for_status()
+        raw = re.sub(r"<script\\b[^>]*>.*?</script>", " ", r.text, flags=re.I | re.S)
+        raw = re.sub(r"<style\\b[^>]*>.*?</style>", " ", raw, flags=re.I | re.S)
+        body = re.sub(r"<[^>]+>", " ", raw)
+        body = html.unescape(body)
+        body = re.sub(r"\\s+", " ", body)
+
+        m = re.search(r"締切予定時刻\\s*([0-2]?\\d:[0-5]\\d)", body)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        print(
+            f"[DEADLINE-HTTP-ERR] {venue} {race_no}R {e!r}",
+            flush=True
+        )
+
     p = page.context.new_page()
     try:
-        p.goto(official_before_url(venue, race_no), wait_until="domcontentloaded", timeout=20000)
-        body = p.locator("body").inner_text(timeout=5000)
-        m = re.search(r"締切予定時刻\s*([0-2]?\d:[0-5]\d)", body)
+        p.goto(url, wait_until="domcontentloaded", timeout=7000)
+        body = p.locator("body").inner_text(timeout=2500)
+        m = re.search(r"締切予定時刻\\s*([0-2]?\\d:[0-5]\\d)", body)
         return m.group(1) if m else ""
-    except Exception:
+    except Exception as e:
+        print(
+            f"[DEADLINE-PW-ERR] {venue} {race_no}R {e!r}",
+            flush=True
+        )
         return ""
     finally:
         p.close()
+
+
+def deadline_datetime(deadline_text):
+    """
+    今日の締切時刻をJSTのdatetimeに変換。
+    """
+    if not deadline_text:
+        return None
+
+    m = re.fullmatch(r"([0-2]?\\d):([0-5]\\d)", str(deadline_text).strip())
+    if not m:
+        return None
+
+    h, minute = map(int, m.groups())
+    if h > 23:
+        return None
+
+    n = now()
+    return n.replace(
+        hour=h,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+
+def race_is_closed(deadline_text):
+    """
+    締切時刻を過ぎたレースは審査対象外。
+    締切時刻ちょうども終了扱い。
+    """
+    dt = deadline_datetime(deadline_text)
+    if dt is None:
+        return False
+    return now() >= dt
 
 
 def race_complete(ex):
@@ -820,58 +881,112 @@ def race_complete(ex):
 
 
 def cycle(page, target_venues):
+    """
+    高速版:
+    - 過去Rを1Rから順番に展示確認しない。
+    - 各場は12R→1Rの締切を見て、現在まだ締切前のRだけを抽出。
+    - 締切済みRでは展示ST/日和データを取得しない。
+    - 全12R締切済みなら、その場は即終了。
+    """
+    n = now()
+
     for venue, event_day in target_venues.items():
+        open_races = []
+
+        # まず締切時刻だけで未終了Rを抽出。
+        # 後半Rから見ることで、全終了場は12Rの締切確認だけで即終了できる。
+        d12 = fetch_deadline(page, venue, 12)
+        if d12 and race_is_closed(d12):
+            print(
+                f"[VENUE-FINISHED] {venue} {event_day} / "
+                f"12R締切 {d12} 済み -> 本日の監視終了",
+                flush=True
+            )
+            for rr in range(1, 13):
+                seen.add(f"{hd()}|{venue}|{rr}|{event_day}")
+            continue
+
+        # 12Rがまだなら、1〜12Rの締切だけ確認して現在以降を抽出。
+        # ここでは展示・日和にはアクセスしない。
+        deadline_map = {}
         for race_no in range(1, 13):
             key = f"{hd()}|{venue}|{race_no}|{event_day}"
             if key in seen:
                 continue
 
-            ex = fetch_official_exhibition(page, venue, race_no)
-            complete, got = race_complete(ex)
+            d = d12 if race_no == 12 else fetch_deadline(page, venue, race_no)
+            deadline_map[race_no] = d
 
-            if not complete:
-                print(
-                    f"[WAIT-EXHIBITION] {venue} {race_no}R "
-                    f"{event_day} / 展示ST取得={got} / 6艇未完了 -> 通知しない",
-                    flush=True
-                )
-                # その場の未来Rを無駄に開かない
-                break
-
-            hdata = fetch_hiyori_data(page, venue, race_no)
-
-            data = {i: {} for i in range(1, 7)}
-            for b in range(1, 7):
-                data[b].update(hdata.get(b, {}))
-                data[b].update(ex.get(b, {}))
-
-            deadline_text = fetch_deadline(page, venue, race_no)
-
-            image_path, pred = build_image(
-                page, venue, race_no, deadline_text, data, event_day
-            )
-
-            try:
-                send_image(image_path, venue, race_no, event_day)
+            if d and race_is_closed(d):
                 seen.add(key)
+                continue
 
-                print(
-                    f"[ST-PREDICT] {venue} {race_no}R / {event_day} / "
-                    + " / ".join(
-                        f"{b}={pred[b]:.02f}"
-                        for b in range(1, 7)
-                    ),
-                    flush=True
-                )
-                print(
-                    f"[NOTIFY] {venue} {race_no}R {event_day} 送信完了",
-                    flush=True
-                )
-            finally:
-                try:
-                    os.remove(image_path)
-                except Exception:
-                    pass
+            # 締切が取得できない古いRを未終了扱いしない。
+            # 公式締切が取れたRだけを候補にする。
+            if d:
+                open_races.append(race_no)
+
+        if not open_races:
+            print(
+                f"[NO-OPEN-RACE] {venue} {event_day} / "
+                "締切前レースを特定できず -> 次周期で再確認",
+                flush=True
+            )
+            continue
+
+        # 一番早い未終了Rだけを見る。
+        race_no = min(open_races)
+        key = f"{hd()}|{venue}|{race_no}|{event_day}"
+        deadline_text = deadline_map.get(race_no, "")
+
+        print(
+            f"[CURRENT-RACE] {venue} {race_no}R {event_day} / "
+            f"締切 {deadline_text}",
+            flush=True
+        )
+
+        ex = fetch_official_exhibition(page, venue, race_no)
+        complete, got = race_complete(ex)
+
+        if not complete:
+            print(
+                f"[WAIT-EXHIBITION] {venue} {race_no}R "
+                f"{event_day} / 締切 {deadline_text} / "
+                f"展示ST取得={got} / 6艇未完了 -> 次周期",
+                flush=True
+            )
+            continue
+
+        hdata = fetch_hiyori_data(page, venue, race_no)
+
+        data = {i: {} for i in range(1, 7)}
+        for b in range(1, 7):
+            data[b].update(hdata.get(b, {}))
+            data[b].update(ex.get(b, {}))
+
+        image_path, pred = build_image(
+            page, venue, race_no, deadline_text, data, event_day
+        )
+
+        try:
+            send_image(image_path, venue, race_no, event_day)
+            seen.add(key)
+
+            print(
+                f"[ST-PREDICT] {venue} {race_no}R / {event_day} / "
+                + " / ".join(f"{b}={pred[b]:.02f}" for b in range(1, 7)),
+                flush=True
+            )
+            print(
+                f"[NOTIFY] {venue} {race_no}R {event_day} 送信完了",
+                flush=True
+            )
+        finally:
+            try:
+                os.remove(image_path)
+            except Exception:
+                pass
+
 
 def main():
     with sync_playwright() as pw:
