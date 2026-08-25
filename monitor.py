@@ -2,6 +2,7 @@ import os
 import re
 import time
 import html
+from html.parser import HTMLParser
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -81,7 +82,16 @@ FINAL_W_EXHIBITION = 0.20
 
 _http = requests.Session()
 _http.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; shinsum-finalday-st/2.0)"
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.5",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "close",
 })
 
 seen = set()
@@ -116,6 +126,17 @@ def official_before_url(venue, race_no):
     """
     return (
         "https://www.boatrace.jp/owsp/sp/race/beforeinfo"
+        f"?hd={hd()}&jcd={VENUE_CODES[venue]:02d}&rno={race_no}"
+        f"&ts={int(time.time())}"
+    )
+
+
+def official_before_pc_url(venue, race_no):
+    """
+    展示取得の予備系としてPC版も用意。
+    """
+    return (
+        "https://www.boatrace.jp/owpc/pc/race/beforeinfo"
         f"?hd={hd()}&jcd={VENUE_CODES[venue]:02d}&rno={race_no}"
         f"&ts={int(time.time())}"
     )
@@ -416,6 +437,162 @@ def fetch_hiyori_data(page, venue, race_no):
         p.close()
 
 
+
+
+class _OfficialTableParser(HTMLParser):
+    """
+    BOATRACE公式HTMLのtable/tr/th/tdを構造のまま取り出す。
+    """
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self._depth = 0
+        self._table = None
+        self._row = None
+        self._cell = None
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "table":
+            self._depth += 1
+            if self._depth == 1:
+                self._table = []
+        elif self._depth and tag == "tr":
+            self._row = []
+        elif self._depth and tag in ("td", "th"):
+            self._cell = []
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self._depth and tag in ("td", "th") and self._cell is not None:
+            if self._row is not None:
+                txt = re.sub(r"\s+", " ", "".join(self._cell)).strip()
+                self._row.append(txt)
+            self._cell = None
+        elif self._depth and tag == "tr":
+            if self._table is not None and self._row:
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._depth:
+            self._depth -= 1
+            if self._depth == 0:
+                if self._table:
+                    self.tables.append(self._table)
+                self._table = None
+
+
+def _official_tables(raw_html):
+    p = _OfficialTableParser()
+    p.feed(raw_html)
+    return p.tables
+
+
+def _extract_exhibition_from_html(raw_html):
+    """
+    BOATRACE公式のraw HTMLをtable構造で解析。
+    艇番と同じ行の値を紐付けるので、単純な「6個順番取り」より安全。
+
+    戻り値:
+      {1: {"ex_st": .16, "ex_time": 6.78}, ...}
+    """
+    out = {i: {} for i in range(1, 7)}
+    tables = _official_tables(raw_html)
+
+    # -------- 展示タイム --------
+    # 「調整重量」「展示タイム」等を含む選手表。
+    for tb in tables:
+        flat = " ".join(" ".join(row) for row in tb)
+        if "展示タイム" not in flat and "調整重量" not in flat:
+            continue
+
+        for row in tb:
+            joined = " ".join(row)
+
+            # 行頭またはセル単体の艇番
+            boat = None
+            for cell in row[:3]:
+                m = re.fullmatch(r"\s*([1-6])\s*", str(cell))
+                if m:
+                    boat = int(m.group(1))
+                    break
+            if boat is None:
+                m = re.match(r"\s*([1-6])(?:\s|$)", joined)
+                if m:
+                    boat = int(m.group(1))
+
+            if boat is None:
+                continue
+
+            vals = re.findall(r"(?<!\d)(6\.\d{2}|7\.\d{2})(?!\d)", joined)
+            if vals:
+                v = float(vals[0])
+                if 6.20 <= v <= 7.80:
+                    out[boat]["ex_time"] = v
+
+    # -------- スタート展示 --------
+    # スタート展示tableだけを選び、各行の艇番とSTを対応づける。
+    for tb in tables:
+        flat = " ".join(" ".join(row) for row in tb)
+        if "スタート展示" not in flat and not ("コース" in flat and "ST" in flat):
+            continue
+
+        for row in tb:
+            joined = " ".join(row)
+
+            boat = None
+            for cell in row[:3]:
+                m = re.fullmatch(r"\s*([1-6])\s*", str(cell))
+                if m:
+                    boat = int(m.group(1))
+                    break
+            if boat is None:
+                m = re.match(r"\s*([1-6])(?:\s|$)", joined)
+                if m:
+                    boat = int(m.group(1))
+
+            if boat is None:
+                continue
+
+            # 艇番の数字をSTと誤認しないよう .xx / 0.xx / F.xx だけ許可
+            m = re.search(
+                r"F\.?\d{1,2}|0\.\d{2}|(?<!\d)\.\d{2}(?!\d)",
+                joined,
+                flags=re.I,
+            )
+            if not m:
+                continue
+
+            v = _st(m.group(0))
+            if v is not None:
+                out[boat]["ex_st"] = float(v)
+
+    return out
+
+
+def _html_to_text(raw):
+    raw = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw, flags=re.I | re.S)
+    raw = re.sub(r"<style\b[^>]*>.*?</style>", " ", raw, flags=re.I | re.S)
+    raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
+    raw = re.sub(r"</(?:tr|td|th|div|p|li|section|table)>", "\n", raw, flags=re.I)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = html.unescape(raw)
+    raw = raw.replace("\r", "")
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r"\n\s*\n+", "\n", raw)
+    return raw.strip()
+
+
+def _exhibition_complete(parsed):
+    return all(
+        parsed.get(b, {}).get("ex_st") is not None
+        for b in range(1, 7)
+    )
+
+
 def _extract_exhibition_from_text(body):
     """
     BOATRACE公式スマホ版の表示済み本文から
@@ -483,94 +660,220 @@ def _extract_exhibition_from_text(body):
 
 def fetch_official_exhibition(page, venue, race_no):
     """
-    BOATRACE公式スマホ版の直前情報から展示ST/展示タイムを取得。
+    6艇取得を最優先にした展示情報取得。
 
-    6艇すべての展示STが揃うまで未完了扱い。
-    PC版テーブル依存をやめ、スマホ版の描画後本文を本命にする。
+    順番:
+      1) PC版 requests × 最大3回
+      2) スマホ版 requests × 最大2回
+      3) PC版 Playwright × 1回
+
+    「6艇の展示STが揃った」時だけ READY。
+    1〜5艇しか取れていない場合は絶対に通知へ進めない。
     """
-    p = page.context.new_page()
     out = {i: {} for i in range(1, 7)}
 
-    try:
-        url = official_before_url(venue, race_no)
-
-        p.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=20000,
-        )
-
-        # 展示更新直後の描画待ち。
-        try:
-            p.wait_for_function(
-                """() => {
-                    const t = document.body?.innerText || '';
-                    return t.includes('スタート展示') && t.includes('展示タイム');
-                }""",
-                timeout=6000,
-            )
-        except Exception:
-            p.wait_for_timeout(1200)
-
-        body = p.locator("body").inner_text(timeout=5000)
-
-        if "スタート展示" not in body:
-            print(
-                f"[EXHIBITION-NOT-READY] {venue} {race_no}R / "
-                "スタート展示欄なし",
-                flush=True,
-            )
-            return out
-
-        parsed = _extract_exhibition_from_text(body)
-
-        got_st = []
-        got_time = []
-
+    def merge(parsed):
         for boat in range(1, 7):
-            if parsed.get(boat, {}).get("ex_st") is not None:
-                out[boat]["ex_st"] = parsed[boat]["ex_st"]
-                got_st.append(boat)
+            row = parsed.get(boat, {})
+            if row.get("ex_st") is not None:
+                out[boat]["ex_st"] = row["ex_st"]
+            if row.get("ex_time") is not None:
+                out[boat]["ex_time"] = row["ex_time"]
 
-            if parsed.get(boat, {}).get("ex_time") is not None:
-                out[boat]["ex_time"] = parsed[boat]["ex_time"]
-                got_time.append(boat)
+    def got_st():
+        return [b for b in range(1, 7) if out[b].get("ex_st") is not None]
 
+    def got_time():
+        return [b for b in range(1, 7) if out[b].get("ex_time") is not None]
+
+    def log(source):
         print(
-            f"[EXHIBITION] {venue} {race_no}R / "
-            f"ST={got_st} / TIME={got_time}",
+            f"[EXHIBITION-{source}] {venue} {race_no}R / "
+            f"ST={got_st()} ({len(got_st())}/6) / "
+            f"TIME={got_time()} ({len(got_time())}/6)",
             flush=True,
         )
 
-        # 6艇STが揃っていれば展示完了。
-        if len(got_st) == 6:
+    # --------------------------------------------------------
+    # 1. PC版 requests
+    # BOATRACE公式のbeforeinfoはPC版も展示STをHTMLに持っている。
+    # Playwrightより軽く、GitHub Actionsでもまずこちらを試す。
+    # --------------------------------------------------------
+    for attempt in range(1, 4):
+        url = official_before_pc_url(venue, race_no)
+        try:
+            r = _http.get(
+                url,
+                timeout=(4, 8),
+                headers={
+                    "Referer": "https://www.boatrace.jp/",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            )
+            r.raise_for_status()
+
+            raw = r.text
+            parsed = _extract_exhibition_from_html(raw)
+            merge(parsed)
+
+            # table構造で取れないサイト差分に備えて本文方式も併用
+            if len(got_st()) < 6:
+                text_parsed = _extract_exhibition_from_text(_html_to_text(raw))
+                merge(text_parsed)
+
+            log(f"PC-HTTP-{attempt}")
+
+            if len(got_st()) == 6:
+                break
+
+        except Exception as e:
             print(
-                f"[EXHIBITION-READY] {venue} {race_no}R / "
-                + " / ".join(
-                    (
-                        f"{b}="
-                        + (
-                            f"F{abs(out[b]['ex_st']):.02f}"
-                            if out[b]["ex_st"] < 0
-                            else f"{out[b]['ex_st']:.02f}"
-                        )
-                    )
-                    for b in range(1, 7)
-                ),
+                f"[EXHIBITION-PC-HTTP-{attempt}-ERR] "
+                f"{venue} {race_no}R {e!r}",
                 flush=True,
             )
 
-        return out
+        if attempt < 3:
+            time.sleep(0.6)
 
-    except Exception as e:
+    # --------------------------------------------------------
+    # 2. スマホ版 requests
+    # --------------------------------------------------------
+    if len(got_st()) < 6:
+        for attempt in range(1, 3):
+            url = official_before_url(venue, race_no)
+            try:
+                r = _http.get(
+                    url,
+                    timeout=(4, 8),
+                    headers={
+                        "Referer": "https://www.boatrace.jp/",
+                        "Cache-Control": "no-cache",
+                        "Pragma": "no-cache",
+                    },
+                )
+                r.raise_for_status()
+
+                raw = r.text
+                parsed = _extract_exhibition_from_html(raw)
+                merge(parsed)
+
+                if len(got_st()) < 6:
+                    text_parsed = _extract_exhibition_from_text(_html_to_text(raw))
+                    merge(text_parsed)
+
+                log(f"MOBILE-HTTP-{attempt}")
+
+                if len(got_st()) == 6:
+                    break
+
+            except Exception as e:
+                print(
+                    f"[EXHIBITION-MOBILE-HTTP-{attempt}-ERR] "
+                    f"{venue} {race_no}R {e!r}",
+                    flush=True,
+                )
+
+            if attempt < 2:
+                time.sleep(0.6)
+
+    # --------------------------------------------------------
+    # 3. 最終手段: PC版Playwright
+    # gotoの完全ロードを待たず、表示されたDOMから直接tableを読む。
+    # --------------------------------------------------------
+    if len(got_st()) < 6:
+        p = page.context.new_page()
+        try:
+            url = official_before_pc_url(venue, race_no)
+
+            try:
+                p.goto(
+                    url,
+                    wait_until="commit",
+                    timeout=9000,
+                )
+            except Exception as e:
+                print(
+                    f"[EXHIBITION-PC-PW-GOTO] {venue} {race_no}R "
+                    f"{e!r} / DOM確認続行",
+                    flush=True,
+                )
+
+            try:
+                p.wait_for_selector("body", timeout=3500)
+            except Exception:
+                pass
+
+            # 「スタート展示」がDOMに現れるのを短時間だけ待つ
+            try:
+                p.wait_for_function(
+                    """() => {
+                        const t = document.body?.innerText || '';
+                        return t.includes('スタート展示');
+                    }""",
+                    timeout=4500,
+                )
+            except Exception:
+                pass
+
+            # DOMそのもののHTMLを解析
+            try:
+                raw = p.content()
+            except Exception:
+                raw = ""
+
+            if raw:
+                merge(_extract_exhibition_from_html(raw))
+
+            if len(got_st()) < 6:
+                try:
+                    body = p.locator("body").inner_text(timeout=2500)
+                except Exception:
+                    body = ""
+                if body:
+                    merge(_extract_exhibition_from_text(body))
+
+            log("PC-PW")
+
+        except Exception as e:
+            print(
+                f"[EXHIBITION-PC-PW-ERR] {venue} {race_no}R {e!r}",
+                flush=True,
+            )
+        finally:
+            p.close()
+
+    # --------------------------------------------------------
+    # 厳格判定
+    # --------------------------------------------------------
+    if len(got_st()) == 6:
         print(
-            f"[OFFICIAL-EX-ERR] {venue}{race_no}R {e!r}",
+            f"[EXHIBITION-READY] {venue} {race_no}R / "
+            + " / ".join(
+                f"{b}="
+                + (
+                    f"F{abs(out[b]['ex_st']):.02f}"
+                    if out[b]["ex_st"] < 0
+                    else f"{out[b]['ex_st']:.02f}"
+                )
+                for b in range(1, 7)
+            )
+            + f" / 展示TIME={len(got_time())}/6",
             flush=True,
         )
-        return out
+    else:
+        missing = [b for b in range(1, 7) if out[b].get("ex_st") is None]
+        print(
+            f"[EXHIBITION-INCOMPLETE] {venue} {race_no}R / "
+            f"ST={got_st()} ({len(got_st())}/6) / "
+            f"不足艇={missing} / "
+            f"TIME={got_time()} ({len(got_time())}/6) "
+            "-> 通知しない",
+            flush=True,
+        )
 
-    finally:
-        p.close()
+    return out
 
 
 # ============================================================
@@ -1002,9 +1305,6 @@ def race_is_closed(deadline_text):
 
 
 def race_complete(ex):
-    """
-    6艇すべての展示STが取れて初めて「展示完了」。
-    """
     got = [
         b for b in range(1, 7)
         if ex.get(b, {}).get("ex_st") is not None
