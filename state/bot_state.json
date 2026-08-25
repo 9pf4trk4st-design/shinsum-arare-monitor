@@ -1,0 +1,9 @@
+{
+  "paper_balance": 100000.0,
+  "position": null,
+  "pending": null,
+  "last_notified": null,
+  "daily_date": null,
+  "daily_start_balance": 100000.0,
+  "consecutive_losses": 0
+}
