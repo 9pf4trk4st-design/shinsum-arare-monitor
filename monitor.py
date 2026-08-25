@@ -109,9 +109,15 @@ def hiyori_url(venue, race_no):
 
 
 def official_before_url(venue, race_no):
+    """
+    展示情報はスマホ版BOATRACE公式を使用。
+    PC版は展示更新直後に空欄HTMLを返す場合があるため使わない。
+    キャッシュ回避用のtsも付ける。
+    """
     return (
-        "https://www.boatrace.jp/owpc/pc/race/beforeinfo"
+        "https://www.boatrace.jp/owsp/sp/race/beforeinfo"
         f"?hd={hd()}&jcd={VENUE_CODES[venue]:02d}&rno={race_no}"
+        f"&ts={int(time.time())}"
     )
 
 
@@ -412,121 +418,157 @@ def fetch_hiyori_data(page, venue, race_no):
 
 def _extract_exhibition_from_text(body):
     """
-    BOATRACE公式の表示済み本文から展示ST・展示タイムを拾う。
-    HTMLテーブル構造変更に依存しない補助パーサ。
+    BOATRACE公式スマホ版の表示済み本文から
+    6艇分の展示STと展示タイムを取得する。
+
+    展示ST:
+      「スタート展示」以降だけを対象にし、
+      .16 / F.05 等を順番に6個取得。
+
+    展示タイム:
+      「スタート展示」より前のレーサー表部分から、
+      6.20〜7.80の値を順番に6個取得。
     """
     out = {i: {} for i in range(1, 7)}
+    body = str(body).replace("\r", "")
 
-    # 展示タイムは 6.5x〜7.xx
-    # body全体から「艇番の近く」にあるものを探すのは誤爆しやすいため、
-    # Playwrightの行抽出を本命とし、ここはST抽出の補助だけにする。
-    start_pos = body.find("スタート展示")
-    if start_pos >= 0:
-        section = body[start_pos:start_pos + 3000]
-        lines = [re.sub(r"\s+", " ", x).strip() for x in section.splitlines() if x.strip()]
+    st_pos = body.find("スタート展示")
 
-        # .xx / F.xx を登場順に6つ拾う。
+    # ---------- 展示ST ----------
+    if st_pos >= 0:
+        st_section = body[st_pos:st_pos + 2500]
+
         sts = []
-        for line in lines:
-            for m in re.finditer(r"(F\.?\d{1,2}|(?<!\d)\.\d{2}(?!\d)|0\.\d{2})", line, re.I):
-                v = _st(m.group(1))
-                if v is not None:
-                    sts.append(v)
-                    if len(sts) == 6:
-                        break
-            if len(sts) == 6:
-                break
+        for tok in re.findall(
+            r"F\.?\d{1,2}|(?<!\d)\.\d{2}(?!\d)|0\.\d{2}",
+            st_section,
+            flags=re.I,
+        ):
+            v = _st(tok)
+            if v is not None:
+                sts.append(float(v))
+                if len(sts) == 6:
+                    break
 
         if len(sts) == 6:
-            for b, v in enumerate(sts, 1):
-                out[b]["ex_st"] = v
+            for boat, v in enumerate(sts, 1):
+                out[boat]["ex_st"] = v
+
+    # ---------- 展示タイム ----------
+    # スタート展示より前だけを見ることで、
+    # 気温・水温・前走ST等の誤拾いを減らす。
+    before = body[:st_pos] if st_pos >= 0 else body
+    time_pos = before.find("展示タイム")
+    if time_pos >= 0:
+        time_section = before[time_pos:time_pos + 5000]
+    else:
+        time_section = before
+
+    ex_times = []
+    for m in re.finditer(
+        r"(?<!\d)(6\.\d{2}|7\.\d{2})(?!\d)",
+        time_section,
+    ):
+        v = float(m.group(1))
+        if 6.20 <= v <= 7.80:
+            ex_times.append(v)
+            if len(ex_times) == 6:
+                break
+
+    if len(ex_times) == 6:
+        for boat, v in enumerate(ex_times, 1):
+            out[boat]["ex_time"] = v
 
     return out
 
-
 def fetch_official_exhibition(page, venue, race_no):
     """
-    公式直前情報をPlaywrightで確認。
-    展示開始前・6艇未完了なら通知しない。
+    BOATRACE公式スマホ版の直前情報から展示ST/展示タイムを取得。
+
+    6艇すべての展示STが揃うまで未完了扱い。
+    PC版テーブル依存をやめ、スマホ版の描画後本文を本命にする。
     """
     p = page.context.new_page()
     out = {i: {} for i in range(1, 7)}
 
     try:
+        url = official_before_url(venue, race_no)
+
         p.goto(
-            official_before_url(venue, race_no),
+            url,
             wait_until="domcontentloaded",
-            timeout=25000
+            timeout=20000,
         )
-        p.wait_for_timeout(600)
 
-        body = p.locator("body").inner_text(timeout=7000)
+        # 展示更新直後の描画待ち。
+        try:
+            p.wait_for_function(
+                """() => {
+                    const t = document.body?.innerText || '';
+                    return t.includes('スタート展示') && t.includes('展示タイム');
+                }""",
+                timeout=6000,
+            )
+        except Exception:
+            p.wait_for_timeout(1200)
 
-        # 展示情報そのものが無ければ未開始。
-        if "スタート展示" not in body or "展示タイム" not in body:
+        body = p.locator("body").inner_text(timeout=5000)
+
+        if "スタート展示" not in body:
+            print(
+                f"[EXHIBITION-NOT-READY] {venue} {race_no}R / "
+                "スタート展示欄なし",
+                flush=True,
+            )
             return out
 
-        # まずテーブル/行ベースで取得
-        try:
-            rows = _row_cells(p)
-        except Exception:
-            rows = []
+        parsed = _extract_exhibition_from_text(body)
 
-        ex_times = []
-        ex_sts = []
+        got_st = []
+        got_time = []
 
-        for cells in rows:
-            s = " ".join(cells)
+        for boat in range(1, 7):
+            if parsed.get(boat, {}).get("ex_st") is not None:
+                out[boat]["ex_st"] = parsed[boat]["ex_st"]
+                got_st.append(boat)
 
-            # 展示タイム候補
-            for m in re.finditer(r"(?<!\d)(6\.\d{2}|7\.\d{2})(?!\d)", s):
-                v = float(m.group(1))
-                if 6.20 <= v <= 7.80:
-                    ex_times.append(v)
+            if parsed.get(boat, {}).get("ex_time") is not None:
+                out[boat]["ex_time"] = parsed[boat]["ex_time"]
+                got_time.append(boat)
 
-            # スタート展示候補
-            for tok in re.findall(
-                r"F\.?\d{1,2}|(?<!\d)\.\d{2}(?!\d)|0\.\d{2}",
-                s,
-                flags=re.I
-            ):
-                v = _st(tok)
-                if v is not None:
-                    ex_sts.append(v)
+        print(
+            f"[EXHIBITION] {venue} {race_no}R / "
+            f"ST={got_st} / TIME={got_time}",
+            flush=True,
+        )
 
-        # 重複が多いサイト構造では本文の「スタート展示」部分を優先して上書き
-        text_parsed = _extract_exhibition_from_text(body)
-        text_sts = [text_parsed[b].get("ex_st") for b in range(1, 7)]
-
-        if all(v is not None for v in text_sts):
-            ex_sts = text_sts
-        else:
-            # 0.00チルト等の誤拾いを避けるため、6艇ちょうど取れていないなら破棄
-            # 公式DOMが変わった時に誤通知するより「待つ」を優先。
-            if len(ex_sts) != 6:
-                ex_sts = []
-
-        # 展示タイムも6艇ちょうど/本文順が取れた時だけ採用
-        # 6艇分以上ある場合は、6.xxの連続ブロックを候補にする。
-        if len(ex_times) >= 6:
-            # 同一値重複を消さず、最初の6艇分を使用
-            ex_times = ex_times[:6]
-        else:
-            ex_times = []
-
-        if len(ex_sts) == 6:
-            for b, v in enumerate(ex_sts, 1):
-                out[b]["ex_st"] = float(v)
-
-        if len(ex_times) == 6:
-            for b, v in enumerate(ex_times, 1):
-                out[b]["ex_time"] = float(v)
+        # 6艇STが揃っていれば展示完了。
+        if len(got_st) == 6:
+            print(
+                f"[EXHIBITION-READY] {venue} {race_no}R / "
+                + " / ".join(
+                    (
+                        f"{b}="
+                        + (
+                            f"F{abs(out[b]['ex_st']):.02f}"
+                            if out[b]["ex_st"] < 0
+                            else f"{out[b]['ex_st']:.02f}"
+                        )
+                    )
+                    for b in range(1, 7)
+                ),
+                flush=True,
+            )
 
         return out
 
     except Exception as e:
-        print(f"[OFFICIAL-EX-ERR] {venue}{race_no}R {e!r}", flush=True)
+        print(
+            f"[OFFICIAL-EX-ERR] {venue}{race_no}R {e!r}",
+            flush=True,
+        )
         return out
+
     finally:
         p.close()
 
