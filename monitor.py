@@ -19,7 +19,7 @@ from playwright.sync_api import sync_playwright
 # - 最終日判定は場ごとに1回だけ公式BOATRACEから取得してキャッシュ
 # - 最終日でない場は候補リンクの段階で除外
 # - 展示STが6艇すべて揃うまで絶対に通知しない
-# - 展示タイムは参考表示のみ。通知可否は6艇の展示STで判定
+# - 展示タイムも6艇揃った時だけ通知
 # - 2着予想 / ○号艇有利 / 最終1着率 は出さない
 # - コース補正は入れない
 # - 本番ST予測配分:
@@ -64,12 +64,6 @@ _FINAL_DAY_CACHE = {}
 _FINAL_DAY_VENUES_CACHE = {
     "date": None,
     "venues": None,
-}
-
-# 公式ページの「最終日」という別欄を誤読する場合に備えた日付別の確定表。
-# 値がある日は公式の自動判定よりこちらを優先する。
-FINAL_DAY_OVERRIDES = {
-    "20260825": ["芦屋"],
 }
 
 # そのプロセス内で通知済み
@@ -250,13 +244,8 @@ def _parse_st_token(s):
 
 def is_final_day_official(venue):
     """
-    今日、その場が最終日かをBOATRACE公式で厳密判定。
-
-    「最終日」という単語がページ内にあるだけではTrueにしない。
-    出走表には成績欄として「最終日」が常時出る場合があるため、
-    raceindex上の「今日の日付 + 開催日ラベル」を確認する。
-
-    取得失敗・判定不能は誤通知防止でFalse。
+    今日、その場が最終日かをBOATRACE公式で判定。
+    同一日・同一場は1回だけ取得してキャッシュ。
     """
     key = f"{today_hd()}|{venue}"
     if key in _FINAL_DAY_CACHE:
@@ -268,46 +257,29 @@ def is_final_day_official(venue):
         return False
 
     url = (
-        "https://www.boatrace.jp/owpc/pc/race/raceindex"
-        f"?hd={today_hd()}&jcd={jcd:02d}"
+        "https://www.boatrace.jp/owpc/pc/race/racelist"
+        f"?hd={today_hd()}&jcd={jcd:02d}&rno=1"
     )
 
     final_day = False
 
     try:
-        r = _http.get(url, timeout=7)
+        r = _http.get(url, timeout=10)
         r.raise_for_status()
 
-        compact = re.sub(r"\s+", "", _clean_html(r.text))
+        plain = _clean_html(r.text)
+        compact = re.sub(r"\s+", "", plain)
 
-        dt = now()
-        today_label = f"{dt.month}月{dt.day}日"
-
-        # 例:
-        # 8月25日初日
-        # 8月25日2日目
-        # 8月25日最終日
-        m = re.search(
-            rf"{re.escape(today_label)}"
-            r"(初日|(?:[1-9]|1[0-2])日目|最終日)",
-            compact
+        # 未開催ページを最終日扱いしない
+        has_race_page = (
+            "1R" in compact
+            or "レース" in compact
+            or "締切予定時刻" in compact
+            or "出走表" in compact
         )
 
-        if m:
-            day_label = m.group(1)
-            final_day = (day_label == "最終日")
-            print(
-                f"[FINAL-DAY-CHECK] {venue} "
-                f"{today_label}{day_label}",
-                flush=True
-            )
-        else:
-            print(
-                f"[FINAL-DAY-CHECK] {venue} "
-                f"{today_label}の開催日ラベル取得不能 -> 対象外",
-                flush=True
-            )
-            final_day = False
+        # BOATRACE公式は節最終日に「最終日」を表示する
+        final_day = bool(has_race_page and "最終日" in compact)
 
     except Exception as e:
         print(
@@ -326,28 +298,13 @@ def is_final_day_official(venue):
 
     return final_day
 
+
 def get_final_day_venues():
     """
-    今日の最終日場だけ返す。
-
-    日付別オーバーライドがある日はそれを最優先。
-    これにより公式ページ内の別用途の「最終日」表記を
-    誤って拾って他場を監視する事故を防ぐ。
+    16場を最初に一度だけ確認。
+    今日が最終日の場だけ返す。
     """
     d = today_hd()
-
-    override = FINAL_DAY_OVERRIDES.get(d)
-    if override is not None:
-        venues = [v for v in override if v in TARGET_VENUES]
-        _FINAL_DAY_VENUES_CACHE["date"] = d
-        _FINAL_DAY_VENUES_CACHE["venues"] = venues
-
-        print(
-            "[FINAL-DAY-OVERRIDE] "
-            + (", ".join(venues) if venues else "該当場なし"),
-            flush=True
-        )
-        return venues
 
     if (
         _FINAL_DAY_VENUES_CACHE["date"] == d
@@ -368,6 +325,7 @@ def get_final_day_venues():
         + (", ".join(venues) if venues else "該当場なし"),
         flush=True
     )
+
     return venues
 
 
@@ -469,6 +427,13 @@ def fetch_official_exhibition(venue, race_no):
     - 展示タイム
     - スタート展示ST
     を取得。
+
+    2026-08-25修正:
+    BOATRACE公式の「スタート展示」は通常のtable抽出だけでは
+    6艇STを拾えないことがあるため、
+    1) table解析
+    2) ページ本文の「スタート展示」区間を直接解析
+    の二段構えにする。
     """
     jcd = VENUE_CODES.get(venue)
     if not jcd:
@@ -491,6 +456,9 @@ def fetch_official_exhibition(venue, race_no):
 
     out = {i: {} for i in range(1, 7)}
 
+    # --------------------------------------------------
+    # 1) 従来のtable解析
+    # --------------------------------------------------
     for tb in _tables(r.text):
         flat = " ".join(" ".join(row) for row in tb)
 
@@ -530,28 +498,103 @@ def fetch_official_exhibition(venue, race_no):
                 if st is not None:
                     out[int(bm.group(1))]["ex_st"] = st
 
-    return out
+    # --------------------------------------------------
+    # 2) 本文から「スタート展示」区間を直接解析
+    #    公式ページは次のような並びになる:
+    #    スタート展示 コース 並び ST 1 .22 2 .10 ... 6 .20
+    # --------------------------------------------------
+    plain = _clean_html(r.text)
+    compact_plain = re.sub(r"\s+", " ", plain).strip()
 
+    start_pos = compact_plain.find("スタート展示")
+    if start_pos >= 0:
+        end_candidates = [
+            p for p in (
+                compact_plain.find("水面気象情報", start_pos + 1),
+                compact_plain.find("水面気象", start_pos + 1),
+                compact_plain.find("スタンド", start_pos + 1),
+            )
+            if p > start_pos
+        ]
+        end_pos = min(end_candidates) if end_candidates else min(
+            len(compact_plain), start_pos + 1800
+        )
+        section = compact_plain[start_pos:end_pos]
+
+        # 艇番→ST の順に6艇を抽出。
+        # .07 / 0.07 / F.02 / F02 に対応。
+        pairs = re.findall(
+            r"(?<!\d)([1-6])(?!\d)\s*(F\.?\d{1,2}|0?\.\d{2})(?!\d)",
+            section,
+            flags=re.I,
+        )
+
+        for boat_s, st_s in pairs:
+            b = int(boat_s)
+            if 1 <= b <= 6 and out[b].get("ex_st") is None:
+                st = _parse_st_token(st_s)
+                if st is not None:
+                    out[b]["ex_st"] = st
+
+    # --------------------------------------------------
+    # 3) 展示タイムもtable解析に失敗した場合の本文フォールバック
+    #    レーサー表の先頭6艇について、6.xx / 7.xx を順番に拾う。
+    # --------------------------------------------------
+    if sum(out[b].get("ex_time") is not None for b in range(1, 7)) < 6:
+        header_pos = compact_plain.find("展示 タイム")
+        if header_pos < 0:
+            header_pos = compact_plain.find("展示タイム")
+
+        body_end = start_pos if start_pos > 0 else min(len(compact_plain), 6000)
+        racer_section = compact_plain[header_pos if header_pos >= 0 else 0:body_end]
+
+        # 艇番ごとの周辺文字列から展示タイムを拾う
+        for b in range(1, 7):
+            if out[b].get("ex_time") is not None:
+                continue
+
+            m = re.search(
+                rf"(?<!\d){b}(?!\d)(.{{0,220}}?)(6\.\d{{2}}|7\.\d{{2}})",
+                racer_section,
+                flags=re.S,
+            )
+            if m:
+                try:
+                    out[b]["ex_time"] = float(m.group(2))
+                except Exception:
+                    pass
+
+    got_st = [b for b in range(1, 7) if out[b].get("ex_st") is not None]
+    got_time = [b for b in range(1, 7) if out[b].get("ex_time") is not None]
+
+    print(
+        f"[EXHIBITION-PARSE] {venue}{race_no}R "
+        f"ST={got_st} / TIME={got_time}",
+        flush=True
+    )
+
+    return out
 
 def exhibition_complete(ex):
     """
-    本番ST予測を出してよいかのガード。
-
-    6艇すべての「スタート展示ST」が取得できたらTrue。
-    展示タイムは画像表示用の参考値であり、予測配分には使わないため
-    展示タイム取得失敗だけで通知を止めない。
-
-    展示開始前は6艇のex_stが揃わないのでFalseのまま。
+    最重要ガード。
+    6艇すべての展示STと展示タイムが揃った時だけTrue。
+    宮島3Rのような展示前レースはここで完全除外。
     """
     if not ex or len(ex) < 6:
         return False
 
     for b in range(1, 7):
         d = ex.get(b, {})
+
         if d.get("ex_st") is None:
             return False
 
+        if d.get("ex_time") is None:
+            return False
+
     return True
+
 
 def fetch_official_f(venue, race_no):
     """
@@ -1263,16 +1306,12 @@ def inspect(page, final_day_venues):
         race_no
     )
 
-    # ★ 6艇の展示STが揃っていなければ
+    # ★ 6艇の展示ST + 展示タイムが揃っていなければ
     #    日和取得も画像生成もしない。通知もしない。
     if not exhibition_complete(exhibition):
-        got_st = [
-            b for b in range(1, 7)
-            if exhibition.get(b, {}).get("ex_st") is not None
-        ]
         print(
             f"[WAIT-EXHIBITION] {venue} {race} "
-            f"展示ST取得={got_st} / 6艇未完了 → 通知しない",
+            f"展示未完了 → 通知しない",
             flush=True
         )
         return None
@@ -1439,7 +1478,7 @@ def main():
         print(
             f"[{now():%Y-%m-%d %H:%M:%S}] "
             "Shinsum Monitor "
-            "最終日1〜12R 本番ST予測開始（厳密最終日判定）",
+            "最終日1〜12R 本番ST予測開始",
             flush=True
         )
 
