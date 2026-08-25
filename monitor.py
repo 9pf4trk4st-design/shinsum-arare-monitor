@@ -191,14 +191,15 @@ def get_hiyori_event_day(page, venue):
 
         event_day = None
 
-        # 例:
-        # "8月25日 / 初日"
-        # "8月30日 / 最終日"
+        # 日付selectと開催日selectが別々でも判定できるようにする。
+        # 例: selected=["8月25日", "初日"] / ["8月30日", "最終日"]
+        # 旧UIの "8月25日 / 初日" 形式にも対応する。
         for t in selected:
-            if re.search(r"(?:/|／)\s*初日", t):
+            normalized = re.sub(r"\s+", "", str(t))
+            if normalized == "初日" or re.search(r"(?:/|／)初日$", normalized):
                 event_day = "初日"
                 break
-            if re.search(r"(?:/|／)\s*最終日", t):
+            if normalized == "最終日" or re.search(r"(?:/|／)最終日$", normalized):
                 event_day = "最終日"
                 break
 
@@ -608,12 +609,12 @@ def predict_st(d, event_day):
       → 基礎80% + 展示ST20%
 
     最終日:
-      - 当地ST順位 20%
-      - 初日ST順位 15%
-      - 最終日ST順位 15%
+      - 当地ST順位 25%
+      - 最終日ST順位 25%
       - 今節平均ST 25%
       - トップST分析(1年) 15%
       - F関連 10%
+      - 初日ST順位は使わない
       → 基礎80% + 展示ST20%
 
     直近1か月/3か月、コース補正は使わない。
@@ -641,9 +642,8 @@ def predict_st(d, event_day):
             setsu = max(0.07, min(0.28, float(setsu)))
 
         base = weighted_available([
-            (local, 0.20),
-            (firstday, 0.15),
-            (finalday, 0.15),
+            (local, 0.25),
+            (finalday, 0.25),
             (setsu, 0.25),
             (top, 0.15),
             (f_st, 0.10),
@@ -757,7 +757,7 @@ def build_image(page, venue, race_no, deadline_text, data, event_day):
       <div class="foot">
         {("当地・初日ST順位 / F / トップST分析 / 展示ST"
           if event_day == "初日"
-          else "当地・初日・最終日ST順位 / F / 今節平均ST / トップST分析 / 展示ST")}
+          else "当地・最終日ST順位 / F / 今節平均ST / トップST分析 / 展示ST")}
       </div>
     </body></html>
     """
