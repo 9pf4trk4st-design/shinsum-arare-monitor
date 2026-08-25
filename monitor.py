@@ -262,14 +262,14 @@ def get_hiyori_event_day(page, venue):
 def detect_target_venues(page):
     """
     16場を場単位で1回だけ判定。
-    今日が「初日」または「最終日」の場だけ返す。
-    戻り値: {venue: "初日" or "最終日"}
+    今日が「最終日」の場だけ返す。
+    戻り値: {venue: "最終日"}
     """
     out = {}
 
     for venue in TARGET_VENUES:
         event_day = get_hiyori_event_day(page, venue)
-        if event_day in ("初日", "最終日"):
+        if event_day == "最終日":
             out[venue] = event_day
 
     print(
@@ -295,16 +295,27 @@ def _row_cells(page):
     )
 
 
-def fetch_hiyori_data(page, venue, race_no):
+def fetch_hiyori_data(page, venue, race_no, event_day):
     """
-    ボートレース日和から必要データだけ取得。
-    直近1か月・直近3か月は使用しない。
+    ボートレース日和から、その開催日に実際に使うデータだけ取得。
+
+    初日:
+      当地ST順位 / 初日ST順位 / F / トップST分析(直近1年)
+      ※最終日ST順位・今節平均STは取得も使用もしない
+
+    最終日:
+      当地ST順位 / 最終日ST順位 / 今節平均ST / F / トップST分析(直近1年)
+      ※初日ST順位は取得も使用もしない
     """
     p = page.context.new_page()
     out = {i: {} for i in range(1, 7)}
 
     try:
-        p.goto(hiyori_url(venue, race_no), wait_until="domcontentloaded", timeout=25000)
+        p.goto(
+            hiyori_url(venue, race_no),
+            wait_until="domcontentloaded",
+            timeout=25000
+        )
 
         try:
             p.wait_for_function(
@@ -319,114 +330,143 @@ def fetch_hiyori_data(page, venue, race_no):
 
         rows = _row_cells(p)
 
-        # ---------- ST順位・今節データ ----------
+        # ---------- ST順位 / 今節平均ST ----------
         for cells in rows:
-            if len(cells) < 2:
+            if len(cells) < 7:
                 continue
 
-            label = re.sub(r"\s+", "", cells[0])
+            label = re.sub(r"\s+", "", str(cells[0]))
             vals = cells[1:7]
-
-            if len(vals) < 6:
-                continue
 
             key = None
             parser = _rank
 
             if label == "当地" or label.startswith("当地ST"):
                 key = "local_rank"
-            elif label == "初日" or label.startswith("初日ST"):
+
+            elif event_day == "初日" and (
+                label == "初日" or label.startswith("初日ST")
+            ):
                 key = "firstday_rank"
-            elif label == "最終日" or label.startswith("最終日ST"):
+
+            elif event_day == "最終日" and (
+                label == "最終日" or label.startswith("最終日ST")
+            ):
                 key = "finalday_rank"
+
             elif label in ("F持", "F持ち") or label.startswith("F持"):
                 key = "f_rank"
-            elif label == "平均ST":
-                # 今節データ内の平均ST。0.08〜0.30程度。
+
+            elif event_day == "最終日" and label == "平均ST":
                 key = "setsu_avg_st"
                 parser = _float
 
             if key:
-                for b, raw in enumerate(vals[:6], 1):
+                for boat, raw in enumerate(vals[:6], 1):
                     v = parser(raw)
-                    if v is not None:
-                        if key == "setsu_avg_st" and not (0.05 <= v <= 0.35):
-                            continue
-                        out[b][key] = float(v)
+                    if v is None:
+                        continue
+                    if key == "setsu_avg_st" and not (0.05 <= v <= 0.35):
+                        continue
+                    out[boat][key] = float(v)
 
         # ---------- トップスタート分析（直近1年） ----------
-        # テーブル行は艇番順に6選手。
-        top_table = None
-        tables = p.locator("table")
-        for i in range(tables.count()):
-            tb = tables.nth(i)
-            try:
-                text = tb.inner_text(timeout=300)
-            except Exception:
-                continue
-            if "トップスタート" in text and "確率" in text and "1着率" in text:
-                top_table = tb
-                break
-
-        if top_table is None:
-            # 見出しがtable外のサイト構造向け:
-            # 「トップスタート分析」の後にある最初のtableを取る。
-            heads = p.get_by_text(re.compile("トップスタート分析"))
-            if heads.count():
-                try:
-                    top_table = heads.first.locator(
-                        "xpath=following::table[1]"
-                    )
-                except Exception:
-                    top_table = None
-
-        if top_table is not None:
-            try:
-                trows = top_table.locator("tr").evaluate_all(
-                    """els => els.map(tr =>
-                        Array.from(tr.querySelectorAll('th,td'))
-                          .map(x => (x.innerText || x.textContent || '').trim())
-                    )"""
-                )
-            except Exception:
-                trows = []
-
-            boat = 0
-            for cells in trows:
-                # データ行の例:
-                # 選手名 / 出走数 / トップST回数 / 確率 / 1着数 / 1着率
-                if len(cells) < 5:
-                    continue
-
-                joined = " ".join(cells)
-                pcts = re.findall(r"(\d+(?:\.\d+)?)\s*%", joined)
-                if len(pcts) < 2:
-                    continue
-
-                boat += 1
-                if boat > 6:
-                    break
-
-                out[boat]["top_start_prob"] = float(pcts[0])
-                out[boat]["top_start_win"] = float(pcts[1])
-
-        # Fの有無は、日和のF持順位が存在すればF持ちと扱う。
-        for b in range(1, 7):
-            out[b]["has_f"] = out[b].get("f_rank") is not None
-
-        print(
-            f"[HIYORI] {venue}{race_no}R "
-            + " / ".join(
-                f"{b}:当地={out[b].get('local_rank')},"
-                f"初日={out[b].get('firstday_rank')},"
-                f"最終={out[b].get('finalday_rank')},"
-                f"節ST={out[b].get('setsu_avg_st')},"
-                f"TOP={out[b].get('top_start_prob')},"
-                f"F={'Y' if out[b].get('has_f') else 'N'}"
-                for b in range(1, 7)
-            ),
-            flush=True
+        # popup/hidden DOMでも取れるよう innerText ではなく textContent を使用。
+        all_rows = p.locator("tr").evaluate_all(
+            """els => els.map(tr =>
+                Array.from(tr.querySelectorAll('th,td'))
+                    .map(x => (x.textContent || '').replace(/\\s+/g,' ').trim())
+            )"""
         )
+
+        # 「トップスタート分析」見出しを含むDOM全体のテキスト
+        body_text = p.locator("body").evaluate(
+            """el => el.textContent || ''"""
+        )
+        compact_body = re.sub(r"\s+", "", body_text)
+        top_anchor = compact_body.find("トップスタート分析")
+
+        candidates = []
+        for cells in all_rows:
+            if len(cells) < 5:
+                continue
+
+            joined = " ".join(cells)
+            compact = re.sub(r"\s+", "", joined)
+            pcts = re.findall(r"(\d+(?:\.\d+)?)\s*%", joined)
+
+            # TopST確率 + 1着率 の2つの%がある行
+            if len(pcts) < 2:
+                continue
+
+            # 可能ならトップスタート分析より後ろに存在する行だけ採用
+            if top_anchor >= 0:
+                token = compact[:10]
+                pos = compact_body.find(token, top_anchor) if token else -1
+                if pos < 0:
+                    continue
+
+            candidates.append(
+                (float(pcts[0]), float(pcts[1]))
+            )
+
+        if len(candidates) >= 6:
+            for boat, (prob, win_rate) in enumerate(candidates[:6], 1):
+                out[boat]["top_start_prob"] = prob
+                out[boat]["top_start_win"] = win_rate
+
+        # ---------- F有無 ----------
+        for boat in range(1, 7):
+            out[boat]["has_f"] = out[boat].get("f_rank") is not None
+
+        # 念のため不要データを物理削除
+        if event_day == "初日":
+            for boat in range(1, 7):
+                out[boat].pop("finalday_rank", None)
+                out[boat].pop("setsu_avg_st", None)
+        elif event_day == "最終日":
+            for boat in range(1, 7):
+                out[boat].pop("firstday_rank", None)
+
+        # 実際に予測へ使う項目だけログに表示
+        if event_day == "初日":
+            print(
+                f"[HIYORI] {venue}{race_no}R 初日 "
+                + " / ".join(
+                    f"{boat}:当地={out[boat].get('local_rank')},"
+                    f"初日={out[boat].get('firstday_rank')},"
+                    f"TOP={out[boat].get('top_start_prob')},"
+                    f"TOP1着={out[boat].get('top_start_win')},"
+                    f"F={'Y' if out[boat].get('has_f') else 'N'}"
+                    for boat in range(1, 7)
+                ),
+                flush=True
+            )
+        else:
+            print(
+                f"[HIYORI] {venue}{race_no}R 最終日 "
+                + " / ".join(
+                    f"{boat}:当地={out[boat].get('local_rank')},"
+                    f"最終={out[boat].get('finalday_rank')},"
+                    f"節ST={out[boat].get('setsu_avg_st')},"
+                    f"TOP={out[boat].get('top_start_prob')},"
+                    f"TOP1着={out[boat].get('top_start_win')},"
+                    f"F={'Y' if out[boat].get('has_f') else 'N'}"
+                    for boat in range(1, 7)
+                ),
+                flush=True
+            )
+
+        missing_top = [
+            boat for boat in range(1, 7)
+            if out[boat].get("top_start_prob") is None
+        ]
+        if missing_top:
+            print(
+                f"[TOPSTART-INCOMPLETE] {venue}{race_no}R / "
+                f"不足艇={missing_top}",
+                flush=True
+            )
 
         return out
 
@@ -436,53 +476,6 @@ def fetch_hiyori_data(page, venue, race_no):
     finally:
         p.close()
 
-
-
-
-class _OfficialTableParser(HTMLParser):
-    """
-    BOATRACE公式HTMLのtable/tr/th/tdを構造のまま取り出す。
-    """
-    def __init__(self):
-        super().__init__()
-        self.tables = []
-        self._depth = 0
-        self._table = None
-        self._row = None
-        self._cell = None
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag == "table":
-            self._depth += 1
-            if self._depth == 1:
-                self._table = []
-        elif self._depth and tag == "tr":
-            self._row = []
-        elif self._depth and tag in ("td", "th"):
-            self._cell = []
-
-    def handle_data(self, data):
-        if self._cell is not None:
-            self._cell.append(data)
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if self._depth and tag in ("td", "th") and self._cell is not None:
-            if self._row is not None:
-                txt = re.sub(r"\s+", " ", "".join(self._cell)).strip()
-                self._row.append(txt)
-            self._cell = None
-        elif self._depth and tag == "tr":
-            if self._table is not None and self._row:
-                self._table.append(self._row)
-            self._row = None
-        elif tag == "table" and self._depth:
-            self._depth -= 1
-            if self._depth == 0:
-                if self._table:
-                    self.tables.append(self._table)
-                self._table = None
 
 
 def _official_tables(raw_html):
@@ -1020,6 +1013,15 @@ def build_image(page, venue, race_no, deadline_text, data, event_day):
 
     best = min(pred, key=pred.get)
 
+    # 1M到達時の予測艇身差。
+    # ST差を、スタート後の概算速度 約80km/h・艇長約2.9m で艇身換算。
+    # 1秒あたり約7.66艇身。最速予測艇を0.00艇身とする。
+    BOAT_LENGTHS_PER_SEC = (80_000 / 3600) / 2.9
+    one_m_gap = {
+        b: max(0.0, (pred[b] - pred[best]) * BOAT_LENGTHS_PER_SEC)
+        for b in range(1, 7)
+    }
+
     # 右に出ているほど速い。
     vals = list(pred.values())
     lo, hi = min(vals), max(vals)
@@ -1054,6 +1056,7 @@ def build_image(page, venue, race_no, deadline_text, data, event_day):
             <b>予測 {pred[b]:.02f}</b>
             <span>展示ST {html.escape(ex_txt)}</span>
             <span>展示 {html.escape(ext_txt)}</span>
+            <span>1M差 {one_m_gap[b]:.02f}艇身</span>
           </div>
         </div>
         """)
@@ -1099,12 +1102,11 @@ def build_image(page, venue, race_no, deadline_text, data, event_day):
         {''.join(lanes)}
         <div class="arrow">進行方向 →　　STARTは赤線</div>
         <div class="note">右に出ているほど本番先行予測 / 🔥は最速予測艇</div>
+        <div class="note">1M差＝最速予測艇を0.00艇身とした1M到達時の予測艇身差（ST差から概算）</div>
       </div>
 
       <div class="foot">
-        {("当地・初日ST順位 / F / トップST分析 / 展示ST"
-          if event_day == "初日"
-          else "当地・最終日ST順位 / F / 今節平均ST / トップST分析 / 展示ST")}
+        当地・最終日ST順位 / F / 今節平均ST / トップST分析 / 展示ST / 1M予測艇身差
       </div>
     </body></html>
     """
@@ -1376,12 +1378,25 @@ def cycle(page, target_venues):
             page,
             venue,
             race_no,
+            event_day,
         )
 
         data = {i: {} for i in range(1, 7)}
         for b in range(1, 7):
             data[b].update(hdata.get(b, {}))
             data[b].update(ex.get(b, {}))
+
+        top_missing = [
+            b for b in range(1, 7)
+            if data[b].get("top_start_prob") is None
+        ]
+        if top_missing:
+            print(
+                f"[WAIT-TOPSTART] {venue} {race_no}R {event_day} / "
+                f"トップST率不足艇={top_missing} -> 通知しない",
+                flush=True,
+            )
+            continue
 
         image_path, pred = build_image(
             page,
