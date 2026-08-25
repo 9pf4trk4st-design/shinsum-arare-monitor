@@ -9,19 +9,19 @@ import requests
 from playwright.sync_api import sync_playwright
 
 # ============================================================
-# Shinsum Monitor - 最終日専用 本番ST予測
+# Shinsum Monitor - 初日/最終日専用 本番ST予測
 # ============================================================
 # 通知対象:
-#   ・指定16場のうち「ボートレース日和で当日が最終日と確認できた場」だけ
+#   ・指定16場のうち「ボートレース日和で当日が初日または最終日と確認できた場」だけ
 #   ・1R〜12Rすべて
 #   ・展示STが6艇分そろった後に各R 1回だけ通知
 #
 # 本番ST予測に使う材料:
 #   1. 当地ST順位
 #   2. 初日ST順位
-#   3. 最終日ST順位（最終日なので追加）
+#   3. 最終日ST順位（最終日のみ）
 #   4. F有無 / F持ちST順位
-#   5. 今節平均ST
+#   5. 今節平均ST（最終日のみ。初日は使わない）
 #   6. トップST分析（直近1年）
 #      - トップST確率
 #      - トップST時1着率
@@ -170,10 +170,13 @@ def _selected_texts(page):
         return []
 
 
-def is_hiyori_final_day(page, venue):
+def get_hiyori_event_day(page, venue):
     """
-    最終日判定はボートレース日和の「当日選択欄」だけを見る。
-    ST順位表の中に常時ある「最終日」という文字は判定に使わない。
+    ボートレース日和の「当日選択欄」だけを見て、
+    今日が 初日 / 最終日 / その他 のどれかを返す。
+
+    ST順位表の中にある「初日」「最終日」という文字は、
+    開催日判定には使わない。
     """
     cache_key = f"{hd()}|{venue}"
     if cache_key in _final_day_cache:
@@ -186,54 +189,69 @@ def is_hiyori_final_day(page, venue):
 
         selected = _selected_texts(p)
 
-        # 例: "8月25日 / 最終日"
-        final = any(
-            re.search(r"(?:/|／)\s*最終日", t)
-            for t in selected
-        )
+        event_day = None
 
-        # selectが独自UIで拾えない時だけ、ページ上部の短い範囲を補助確認。
-        if not selected:
+        # 例:
+        # "8月25日 / 初日"
+        # "8月30日 / 最終日"
+        for t in selected:
+            if re.search(r"(?:/|／)\s*初日", t):
+                event_day = "初日"
+                break
+            if re.search(r"(?:/|／)\s*最終日", t):
+                event_day = "最終日"
+                break
+
+        # selectが独自UIで拾えない場合だけ、ページ上部を補助確認
+        if event_day is None and not selected:
             body = p.locator("body").inner_text(timeout=7000)
             head = body[:1800]
-            final = bool(re.search(
-                r"\d{1,2}月\d{1,2}日\s*(?:/|／)\s*最終日",
-                head
-            ))
 
-        _final_day_cache[cache_key] = final
+            if re.search(r"\d{1,2}月\d{1,2}日\s*(?:/|／)\s*初日", head):
+                event_day = "初日"
+            elif re.search(r"\d{1,2}月\d{1,2}日\s*(?:/|／)\s*最終日", head):
+                event_day = "最終日"
+
+        _final_day_cache[cache_key] = event_day
+
         print(
-            f"[FINAL-DAY] {venue} -> {'対象' if final else '対象外'}"
+            f"[EVENT-DAY] {venue} -> {event_day or '対象外'}"
             f" / selected={selected[:3]}",
             flush=True
         )
-        return final
+
+        return event_day
 
     except Exception as e:
-        # 判定不能を最終日扱いには絶対しない。
-        print(f"[FINAL-DAY-ERR] {venue}: {e!r} -> 対象外", flush=True)
-        _final_day_cache[cache_key] = False
-        return False
+        print(f"[EVENT-DAY-ERR] {venue}: {e!r} -> 対象外", flush=True)
+        _final_day_cache[cache_key] = None
+        return None
     finally:
         p.close()
 
-
-def detect_final_day_venues(page):
+def detect_target_venues(page):
     """
     16場を場単位で1回だけ判定。
-    レースごとに最終日判定しないので処理を軽くする。
+    今日が「初日」または「最終日」の場だけ返す。
+    戻り値: {venue: "初日" or "最終日"}
     """
-    out = []
+    out = {}
+
     for venue in TARGET_VENUES:
-        if is_hiyori_final_day(page, venue):
-            out.append(venue)
+        event_day = get_hiyori_event_day(page, venue)
+        if event_day in ("初日", "最終日"):
+            out[venue] = event_day
 
     print(
-        "[FINAL-DAY-TARGET] " + (", ".join(out) if out else "なし"),
+        "[TARGET-DAY] "
+        + (
+            ", ".join(f"{v}({d})" for v, d in out.items())
+            if out else "なし"
+        ),
         flush=True
     )
-    return out
 
+    return out
 
 def _row_cells(page):
     """
@@ -576,19 +594,33 @@ def weighted_available(parts):
     return sum(v * w for v, w in valid) / sw
 
 
-def predict_st(d):
+def predict_st(d, event_day):
     """
-    最終日の本番ST予測。
+    初日/最終日の本番ST予測。
 
-    直近1か月/3か月、コース補正は入れない。
+    初日:
+      - 当地ST順位 30%
+      - 初日ST順位 30%
+      - トップST分析(1年) 25%
+      - F関連 15%
+      - 今節平均STは使わない
+      - 最終日ST順位も使わない
+      → 基礎80% + 展示ST20%
+
+    最終日:
+      - 当地ST順位 20%
+      - 初日ST順位 15%
+      - 最終日ST順位 15%
+      - 今節平均ST 25%
+      - トップST分析(1年) 15%
+      - F関連 10%
+      → 基礎80% + 展示ST20%
+
+    直近1か月/3か月、コース補正は使わない。
     """
     local = rank_to_st(d.get("local_rank"))
     firstday = rank_to_st(d.get("firstday_rank"))
     finalday = rank_to_st(d.get("finalday_rank"))
-
-    setsu = d.get("setsu_avg_st")
-    if setsu is not None:
-        setsu = max(0.07, min(0.28, float(setsu)))
 
     top = topstart_to_st(
         d.get("top_start_prob"),
@@ -596,22 +628,37 @@ def predict_st(d):
     )
     f_st = f_adjusted_st(d)
 
-    base = weighted_available([
-        (local, BASE_W_LOCAL),
-        (firstday, BASE_W_FIRSTDAY),
-        (finalday, BASE_W_FINALDAY),
-        (setsu, BASE_W_SETSU),
-        (top, BASE_W_TOPSTART),
-        (f_st, BASE_W_F),
-    ])
+    if event_day == "初日":
+        base = weighted_available([
+            (local, 0.30),
+            (firstday, 0.30),
+            (top, 0.25),
+            (f_st, 0.15),
+        ])
+    else:
+        setsu = d.get("setsu_avg_st")
+        if setsu is not None:
+            setsu = max(0.07, min(0.28, float(setsu)))
+
+        base = weighted_available([
+            (local, 0.20),
+            (firstday, 0.15),
+            (finalday, 0.15),
+            (setsu, 0.25),
+            (top, 0.15),
+            (f_st, 0.10),
+        ])
 
     ex = d.get("ex_st")
     if ex is None:
         pred = base
     else:
-        # 展示Fは「本番F予測」にはしない。
-        # F.05なら実質0秒近辺の踏み込みとして0.04に丸めて扱う。
-        ex_for_calc = max(0.04, float(ex)) if ex >= 0 else max(0.04, 0.06 - abs(float(ex)))
+        # 展示Fをそのまま本番Fとは予測しない
+        ex_for_calc = (
+            max(0.04, float(ex))
+            if ex >= 0
+            else max(0.04, 0.06 - abs(float(ex)))
+        )
         pred = base * FINAL_W_BASE + ex_for_calc * FINAL_W_EXHIBITION
 
     return max(0.04, min(0.25, pred))
@@ -621,8 +668,8 @@ def predict_st(d):
 # 通知画像
 # ============================================================
 
-def build_image(page, venue, race_no, deadline_text, data):
-    pred = {b: predict_st(data[b]) for b in range(1, 7)}
+def build_image(page, venue, race_no, deadline_text, data, event_day):
+    pred = {b: predict_st(data[b], event_day) for b in range(1, 7)}
 
     best = min(pred, key=pred.get)
 
@@ -697,7 +744,7 @@ def build_image(page, venue, race_no, deadline_text, data):
     <body>
       <div class="top">
         <div class="race">{html.escape(venue)} {race_no}R</div>
-        <div class="sub">締切 {html.escape(deadline_text or "-")}</div>
+        <div class="sub">{html.escape(event_day)} / 締切 {html.escape(deadline_text or "-")}</div>
       </div>
 
       <div class="card">
@@ -708,7 +755,9 @@ def build_image(page, venue, race_no, deadline_text, data):
       </div>
 
       <div class="foot">
-        当地・初日・最終日ST順位 / F / 今節平均ST / トップST分析 / 展示ST
+        {("当地・初日ST順位 / F / トップST分析 / 展示ST"
+          if event_day == "初日"
+          else "当地・初日・最終日ST順位 / F / 今節平均ST / トップST分析 / 展示ST")}
       </div>
     </body></html>
     """
@@ -725,14 +774,14 @@ def build_image(page, venue, race_no, deadline_text, data):
         p.close()
 
 
-def send_image(path, venue, race_no):
+def send_image(path, venue, race_no, event_day):
     with open(path, "rb") as f:
         r = requests.put(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             params={
                 "filename": os.path.basename(path),
                 "title": "Shinsum Monitor",
-                "message": f"{venue} {race_no}R / 本番ST予測",
+                "message": f"{venue} {race_no}R / {event_day} / 本番ST予測",
                 "priority": "5",
                 "tags": "ship",
             },
@@ -770,10 +819,10 @@ def race_complete(ex):
     return len(got) == 6, got
 
 
-def cycle(page, final_venues):
-    for venue in final_venues:
+def cycle(page, target_venues):
+    for venue, event_day in target_venues.items():
         for race_no in range(1, 13):
-            key = f"{hd()}|{venue}|{race_no}"
+            key = f"{hd()}|{venue}|{race_no}|{event_day}"
             if key in seen:
                 continue
 
@@ -783,11 +832,10 @@ def cycle(page, final_venues):
             if not complete:
                 print(
                     f"[WAIT-EXHIBITION] {venue} {race_no}R "
-                    f"展示ST取得={got} / 6艇未完了 -> 通知しない",
+                    f"{event_day} / 展示ST取得={got} / 6艇未完了 -> 通知しない",
                     flush=True
                 )
-                # 未来Rばかり全部開き続けない。
-                # その場で未完了Rが出たら次周期へ。
+                # その場の未来Rを無駄に開かない
                 break
 
             hdata = fetch_hiyori_data(page, venue, race_no)
@@ -798,25 +846,32 @@ def cycle(page, final_venues):
                 data[b].update(ex.get(b, {}))
 
             deadline_text = fetch_deadline(page, venue, race_no)
+
             image_path, pred = build_image(
-                page, venue, race_no, deadline_text, data
+                page, venue, race_no, deadline_text, data, event_day
             )
 
             try:
-                send_image(image_path, venue, race_no)
+                send_image(image_path, venue, race_no, event_day)
                 seen.add(key)
+
                 print(
-                    f"[ST-PREDICT] {venue} {race_no}R / "
-                    + " / ".join(f"{b}={pred[b]:.02f}" for b in range(1, 7)),
+                    f"[ST-PREDICT] {venue} {race_no}R / {event_day} / "
+                    + " / ".join(
+                        f"{b}={pred[b]:.02f}"
+                        for b in range(1, 7)
+                    ),
                     flush=True
                 )
-                print(f"[NOTIFY] {venue} {race_no}R 送信完了", flush=True)
+                print(
+                    f"[NOTIFY] {venue} {race_no}R {event_day} 送信完了",
+                    flush=True
+                )
             finally:
                 try:
                     os.remove(image_path)
                 except Exception:
                     pass
-
 
 def main():
     with sync_playwright() as pw:
@@ -835,11 +890,16 @@ def main():
             flush=True
         )
         print(
-            "最終日1〜12R 本番ST予測開始",
+            "初日・最終日 1〜12R 本番ST予測開始",
             flush=True
         )
         print(
-            "使用: 当地ST順位 / 初日ST順位 / 最終日ST順位 / "
+            "初日使用: 当地ST順位 / 初日ST順位 / "
+            "F有無 / トップST分析(1年) / 展示ST",
+            flush=True
+        )
+        print(
+            "最終日使用: 当地ST順位 / 初日ST順位 / 最終日ST順位 / "
             "F有無 / 今節平均ST / トップST分析(1年) / 展示ST",
             flush=True
         )
@@ -848,21 +908,21 @@ def main():
             flush=True
         )
 
-        # 最終日判定は起動時に1回だけ。
-        final_venues = detect_final_day_venues(page)
+        # 開催日判定は起動時に1回だけ。
+        target_venues = detect_target_venues(page)
 
-        if not final_venues:
-            print("本日の対象最終日場なし。終了します。", flush=True)
+        if not target_venues:
+            print("本日の初日・最終日対象場なし。終了します。", flush=True)
             return
 
         while active():
             print(
                 f"[{now():%Y-%m-%d %H:%M:%S}] 再チェック / "
-                f"最終日場: {', '.join(final_venues)}",
+                f"対象場: {', '.join(f'{v}({d})' for v, d in target_venues.items())}",
                 flush=True
             )
 
-            cycle(page, final_venues)
+            cycle(page, target_venues)
 
             time.sleep(CHECK_INTERVAL)
 
