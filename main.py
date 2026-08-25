@@ -90,16 +90,30 @@ def frame_from_rows(rows):
 
 def fetch_intraday(symbol, interval, days):
     frames = []
-    jst = now_jst()
+
+    # GMO KLine の日付は日本時間06:00で切り替わる。
+    # 00:00〜05:59 JST にカレンダー当日を投げると404になり得るため、
+    # 「JST - 6時間」をAPI上の取引日として使う。
+    api_day = now_jst() - timedelta(hours=6)
+
     for i in range(days + 1):
-        d = (jst - timedelta(days=i)).strftime("%Y%m%d")
+        d = (api_day - timedelta(days=i)).strftime("%Y%m%d")
         try:
             rows = api_get("/v1/klines", {"symbol": symbol, "interval": interval, "date": d})
             f = frame_from_rows(rows)
             if not f.empty:
                 frames.append(f)
+        except requests.HTTPError as e:
+            # 404は「そのAPI日付にデータがまだ無い / 取扱開始前」の意味になり得る。
+            # 他の日付データで分析できる場合は正常にスキップする。
+            status = getattr(e.response, "status_code", None)
+            if status == 404:
+                print(f"[INFO] {symbol} {interval} {d}: KLine未提供のためスキップ")
+                continue
+            print(f"[WARN] {symbol} {interval} {d}: {e}")
         except Exception as e:
             print(f"[WARN] {symbol} {interval} {d}: {e}")
+
     if not frames:
         raise RuntimeError(f"No data for {symbol} {interval}")
     return pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
@@ -113,6 +127,13 @@ def fetch_yearly(symbol, interval, years_back=3):
             f = frame_from_rows(rows)
             if not f.empty:
                 frames.append(f)
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 404:
+                # 取扱開始前など、その年のKLineが無いケースは異常終了させない。
+                print(f"[INFO] {symbol} {interval} {year}: KLine未提供のためスキップ")
+                continue
+            print(f"[WARN] {symbol} {interval} {year}: {e}")
         except Exception as e:
             print(f"[WARN] {symbol} {interval} {year}: {e}")
     if not frames:
