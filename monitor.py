@@ -86,6 +86,7 @@ _http.headers.update({
 
 seen = set()
 _final_day_cache = {}
+_deadline_cache = {}
 
 
 def now():
@@ -795,98 +796,68 @@ def send_image(path, venue, race_no, event_day):
 
 def fetch_deadline(page, venue, race_no):
     """
-    締切時刻は BOATRACE公式ではなくボートレース日和から取得する。
-    BOATRACE公式への締切取得アクセスはしない。
+    ボートレース日和の描画後DOMから、
+    指定したRそのものの締切だけを取得する。
 
-    1) requests で高速取得
-    2) 失敗時だけ Playwright でボートレース日和を開く
+    requestsはrace_noと異なる1R相当HTMLを返す場合があるため使用しない。
     """
+    cache_key = f"{hd()}|{venue}|{race_no}"
+    if cache_key in _deadline_cache:
+        return _deadline_cache[cache_key]
+
     url = hiyori_url(venue, race_no)
+    p = page.context.new_page()
 
     try:
-        r = _http.get(url, timeout=4)
-        r.raise_for_status()
+        p.goto(url, wait_until="domcontentloaded", timeout=12000)
+        p.wait_for_timeout(1200)
 
-        raw = re.sub(
-            r"<script\b[^>]*>.*?</script>",
-            " ",
-            r.text,
-            flags=re.I | re.S,
-        )
-        raw = re.sub(
-            r"<style\b[^>]*>.*?</style>",
-            " ",
-            raw,
-            flags=re.I | re.S,
-        )
-        body = re.sub(r"<[^>]+>", " ", raw)
-        body = html.unescape(body)
-        body = re.sub(r"\s+", " ", body)
+        body = p.locator("body").inner_text(timeout=4000).replace("\r", "")
 
-        # 例: 7R 予選 締切14:03
-        pats = (
-            rf"(?<!\d){race_no}\s*R.*?締切\s*([0-2]?\d:[0-5]\d)",
-            r"締切\s*([0-2]?\d:[0-5]\d)",
+        patterns = (
+            rf"(?m)^\s*{race_no}\s*R[^\n]*締切\s*([0-2]?\d:[0-5]\d)",
+            rf"(?s)(?<!\d){race_no}\s*R\b.{{0,140}}?締切\s*([0-2]?\d:[0-5]\d)",
         )
 
-        for pat in pats:
+        deadline_value = ""
+        for pat in patterns:
             m = re.search(pat, body, flags=re.I)
             if m:
-                return m.group(1)
+                deadline_value = m.group(1)
+                break
 
-    except Exception as e:
+        if not deadline_value:
+            head = re.sub(r"\s+", " ", body[:600]).strip()
+            print(
+                f"[DEADLINE-MISMATCH] {venue} {race_no}R / "
+                f"指定Rの締切を確認できず / head={head[:200]}",
+                flush=True,
+            )
+            return ""
+
+        _deadline_cache[cache_key] = deadline_value
         print(
-            f"[HIYORI-DEADLINE-HTTP-ERR] "
-            f"{venue} {race_no}R {e!r}",
+            f"[DEADLINE] {venue} {race_no}R -> {deadline_value}",
             flush=True,
         )
-
-    p = page.context.new_page()
-    try:
-        p.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=10000,
-        )
-        body = p.locator("body").inner_text(timeout=4000)
-
-        m = re.search(
-            rf"(?<!\d){race_no}\s*R.*?締切\s*([0-2]?\d:[0-5]\d)",
-            body,
-            flags=re.I | re.S,
-        )
-        if not m:
-            m = re.search(
-                r"締切\s*([0-2]?\d:[0-5]\d)",
-                body,
-            )
-
-        return m.group(1) if m else ""
+        return deadline_value
 
     except Exception as e:
         print(
-            f"[HIYORI-DEADLINE-PW-ERR] "
-            f"{venue} {race_no}R {e!r}",
+            f"[HIYORI-DEADLINE-ERR] {venue} {race_no}R {e!r}",
             flush=True,
         )
         return ""
     finally:
         p.close()
 
-
 def find_current_race(page, venue, event_day):
     """
-    現在の未締切レースを二分探索で特定する。
+    現在の未締切Rを二分探索で特定する。
 
-    締切時刻は1R→12Rで昇順なので、
-    12ページ全部を開かず最大5回程度の締切取得で現在Rを探す。
-
-    戻り値:
-      (race_no, deadline_text)
-      全レース終了済み -> (None, "FINISHED")
-      締切取得不能      -> (None, "")
+    締切取得に失敗した場合は推測しない。
+    12R終了済みならその場は即終了。
     """
-    # まず12Rだけ確認。終了済みなら場ごと即終了。
     d12 = fetch_deadline(page, venue, 12)
 
     if not d12:
@@ -903,7 +874,6 @@ def find_current_race(page, venue, event_day):
     lo, hi = 1, 12
     deadline_cache = {12: d12}
 
-    # 最初の「まだ締切前」のRを二分探索。
     while lo < hi:
         mid = (lo + hi) // 2
 
@@ -913,10 +883,12 @@ def find_current_race(page, venue, event_day):
             deadline_cache[mid] = d
 
         if not d:
-            # 取得失敗時は無理に過去Rへ戻らず、
-            # 右側へ寄せて誤って終了済みRを審査するのを防ぐ。
-            lo = mid + 1
-            continue
+            print(
+                f"[CURRENT-RACE-ERR] {venue} {event_day} / "
+                f"{mid}R締切取得失敗 -> この周期は判定しない",
+                flush=True,
+            )
+            return None, ""
 
         if race_is_closed(d):
             lo = mid + 1
@@ -932,7 +904,6 @@ def find_current_race(page, venue, event_day):
     if not d:
         return None, ""
 
-    # 通知済みなら次Rへ進める。
     while race_no <= 12:
         key = f"{hd()}|{venue}|{race_no}|{event_day}"
 
@@ -948,9 +919,7 @@ def find_current_race(page, venue, event_day):
             return None, ""
 
         if race_is_closed(d):
-            seen.add(
-                f"{hd()}|{venue}|{race_no}|{event_day}"
-            )
+            seen.add(f"{hd()}|{venue}|{race_no}|{event_day}")
             continue
 
     return None, "FINISHED"
