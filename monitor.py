@@ -931,7 +931,7 @@ def deadline_datetime(deadline_text):
     if not deadline_text:
         return None
 
-    m = re.fullmatch(r"([0-2]?\\d):([0-5]\\d)", str(deadline_text).strip())
+    m = re.fullmatch(r"([0-2]?\d):([0-5]\d)", str(deadline_text).strip())
     if not m:
         return None
 
