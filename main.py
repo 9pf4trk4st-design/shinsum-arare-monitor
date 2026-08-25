@@ -534,10 +534,15 @@ def main():
         notify("📊 "+m)
 
     # 2) 待機中候補の約定 / 失効
+    # ntfy通知は「実際の仮想売買が発生した時だけ」。
+    # 候補失効・候補取消はGitHub Actionsログだけに残す。
     if not state.get("position"):
         msg=manage_pending(state,analyses)
         if msg:
-            notify(msg)
+            if msg.startswith("🎯 仮想約定"):
+                notify(msg)
+            else:
+                print(msg, flush=True)
 
     # 3) ポジションも待機候補も無ければ新候補選定
     if not state.get("position") and not state.get("pending"):
@@ -549,7 +554,8 @@ def main():
                 ok,why=can_open(state)
                 if ok:
                     create_pending(state,winner)
-                    notify(fmt_candidate(winner,ranking,state))
+                    # 候補発生は通知しない。GitHub Actionsログだけに表示。
+                    print(fmt_candidate(winner,ranking,state), flush=True)
                     state["last_notified"]=key
                 else:
                     print("新規停止:",why)
