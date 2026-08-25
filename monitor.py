@@ -2,47 +2,46 @@ import os
 import re
 import time
 import html
-from datetime import datetime, timedelta
-from urllib.parse import urljoin, urlparse
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from html.parser import HTMLParser
 
 import requests
 from playwright.sync_api import sync_playwright
 
-# =========================================================
-# Shinsum Monitor
-# 最終日限定 / 1R〜12R / 本番ST予測のみ
+# ============================================================
+# Shinsum Monitor - 最終日専用 本番ST予測
+# ============================================================
+# 通知対象:
+#   ・指定16場のうち「ボートレース日和で当日が最終日と確認できた場」だけ
+#   ・1R〜12Rすべて
+#   ・展示STが6艇分そろった後に各R 1回だけ通知
 #
-# 重要仕様
-# - TARGET_VENUES のうち「今日が最終日」の場だけ監視
-# - 最終日判定は場ごとに1回だけ公式BOATRACEから取得してキャッシュ
-# - 最終日でない場は候補リンクの段階で除外
-# - 展示STが6艇すべて揃うまで絶対に通知しない
-# - 展示タイムも6艇揃った時だけ通知
-# - 2着予想 / ○号艇有利 / 最終1着率 は出さない
-# - コース補正は入れない
-# - 本番ST予測配分:
-#     ST傾向 45%
-#     F補正 35%
-#     展示ST 20%
-# - 直近1ヶ月 / 直近3ヶ月 / 初日 は予測に使わない
-# =========================================================
+# 本番ST予測に使う材料:
+#   1. 当地ST順位
+#   2. 初日ST順位
+#   3. 最終日ST順位（最終日なので追加）
+#   4. F有無 / F持ちST順位
+#   5. 今節平均ST
+#   6. トップST分析（直近1年）
+#      - トップST確率
+#      - トップST時1着率
+#   7. 展示ST
+#
+# 「直近1か月」「直近3か月」は予測に使わない。
+# 「コース補正」も使わない。
+# 2着予想・最終1着率も出さない。
+# ============================================================
 
-BASE_URL = "https://boatrace-shinsum.com/"
-
-USER = os.environ["SHINSUM_USER"]
-PASSWORD = os.environ["SHINSUM_PASSWORD"]
-NTFY_TOPIC = os.environ["NTFY_TOPIC"]
-
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 JST = ZoneInfo("Asia/Tokyo")
+
+NTFY_TOPIC = os.environ["NTFY_TOPIC"]
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 
 TARGET_VENUES = [
     "平和島", "児島", "戸田", "多摩川",
     "蒲郡", "びわこ", "三国", "鳴門",
     "宮島", "徳山", "下関", "若松",
-    "芦屋", "唐津", "大村", "住之江"
+    "芦屋", "唐津", "大村", "住之江",
 ]
 
 VENUE_CODES = {
@@ -52,177 +51,98 @@ VENUE_CODES = {
     "若松": 20, "芦屋": 21, "唐津": 23, "大村": 24,
 }
 
-NIGHT_VENUES = {"蒲郡", "住之江", "下関", "若松", "大村"}
+# ------------------------------------------------------------
+# 予測配分
+# ------------------------------------------------------------
+# 展示前の「基礎ST傾向」部分を100として作り、
+# 最後に展示STを20%だけ混ぜる。
+#
+# 基礎ST傾向の内訳:
+#   当地ST順位        20%
+#   初日ST順位        15%
+#   最終日ST順位      15%
+#   今節平均ST        25%
+#   トップST分析      15%
+#   F補正             10%
+#
+# 最終出力:
+#   基礎傾向 80% + 展示ST 20%
+#
+# ※コース補正は入れない。
+BASE_W_LOCAL = 0.20
+BASE_W_FIRSTDAY = 0.15
+BASE_W_FINALDAY = 0.15
+BASE_W_SETSU = 0.25
+BASE_W_TOPSTART = 0.15
+BASE_W_F = 0.10
+FINAL_W_BASE = 0.80
+FINAL_W_EXHIBITION = 0.20
 
 _http = requests.Session()
 _http.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; shinsum-finalday-st-monitor/2.0)"
+    "User-Agent": "Mozilla/5.0 (compatible; shinsum-finalday-st/2.0)"
 })
 
-# 場単位キャッシュ
-_FINAL_DAY_CACHE = {}
-_FINAL_DAY_VENUES_CACHE = {
-    "date": None,
-    "venues": None,
-}
-
-# そのプロセス内で通知済み
 seen = set()
+_final_day_cache = {}
 
-
-# ---------------------------------------------------------
-# 基本
-# ---------------------------------------------------------
 
 def now():
     return datetime.now(JST)
+
+
+def hd():
+    return now().strftime("%Y%m%d")
 
 
 def active():
     return 8 <= now().hour < 23
 
 
-def today_hd():
-    return now().strftime("%Y%m%d")
-
-
-def deadline(text):
-    m = re.search(
-        r"締切\s*[：:]?\s*([01]?\d|2[0-3]):([0-5]\d)",
-        text
+def hiyori_url(venue, race_no):
+    return (
+        "https://kyoteibiyori.com/race_shusso.php"
+        f"?place_no={VENUE_CODES[venue]}&race_no={race_no}&hiduke={hd()}"
     )
-    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
 
 
-def deadline_dt(deadline_value):
-    if not deadline_value:
-        return None
-    try:
-        h, m = map(int, deadline_value.split(":"))
-        return now().replace(
-            hour=h,
-            minute=m,
-            second=0,
-            microsecond=0
-        )
-    except Exception:
-        return None
-
-
-def race_is_still_relevant(deadline_value):
-    """
-    終了済みレースを拾わない。
-    締切5分後まで許容。
-    """
-    t = deadline_dt(deadline_value)
-    if t is None:
-        return True
-    return t >= now() - timedelta(minutes=5)
-
-
-# ---------------------------------------------------------
-# HTML
-# ---------------------------------------------------------
-
-class _TableParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.tables = []
-        self.table = None
-        self.row = None
-        self.cell = None
-        self.depth = 0
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag == "table":
-            self.depth += 1
-            if self.depth == 1:
-                self.table = []
-        elif self.depth and tag == "tr":
-            self.row = []
-        elif self.depth and tag in ("td", "th"):
-            self.cell = []
-
-    def handle_data(self, data):
-        if self.cell is not None:
-            self.cell.append(data)
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if self.depth and tag in ("td", "th") and self.cell is not None:
-            if self.row is not None:
-                self.row.append(
-                    re.sub(r"\s+", " ", "".join(self.cell)).strip()
-                )
-            self.cell = None
-        elif self.depth and tag == "tr":
-            if self.table is not None and self.row:
-                self.table.append(self.row)
-            self.row = None
-        elif tag == "table" and self.depth:
-            self.depth -= 1
-            if self.depth == 0:
-                if self.table:
-                    self.tables.append(self.table)
-                self.table = None
-
-
-def _tables(raw):
-    p = _TableParser()
-    p.feed(raw)
-    return p.tables
-
-
-def _clean_html(raw):
-    raw = re.sub(
-        r"<script\b[^>]*>.*?</script>",
-        " ",
-        raw,
-        flags=re.I | re.S
+def official_before_url(venue, race_no):
+    return (
+        "https://www.boatrace.jp/owpc/pc/race/beforeinfo"
+        f"?hd={hd()}&jcd={VENUE_CODES[venue]:02d}&rno={race_no}"
     )
-    raw = re.sub(
-        r"<style\b[^>]*>.*?</style>",
-        " ",
-        raw,
-        flags=re.I | re.S
-    )
-    raw = re.sub(r"<[^>]+>", " ", raw)
-    return re.sub(
-        r"\s+",
-        " ",
-        html.unescape(raw)
-    ).strip()
 
 
-def _num_or_none(s, lo=None, hi=None):
-    s = re.sub(r"\s+", "", str(s))
-    if s in ("", "-", "－", "—"):
+def _float(s):
+    if s is None:
         return None
+    s = str(s).strip().replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    return float(m.group(0)) if m else None
 
-    m = re.search(r"(-?\d+(?:\.\d+)?)", s)
-    if not m:
-        return None
 
-    try:
-        v = float(m.group(1))
-    except Exception:
-        return None
-
-    if lo is not None and v < lo:
-        return None
-    if hi is not None and v > hi:
-        return None
+def _pct(s):
+    v = _float(s)
     return v
 
 
-def _parse_st_token(s):
-    """
-    0.07 / .07 / F.02 / F02 をST値に変換。
-    展示Fは負数で返す。
-    """
-    s = str(s).strip().upper().replace(" ", "")
+def _rank(s):
+    v = _float(s)
+    if v is None:
+        return None
+    if 1.0 <= v <= 6.0:
+        return float(v)
+    return None
 
+
+def _st(s):
+    """
+    .12 / 0.12 / F.03 / F03 を秒へ。
+    Fは負値で返す。
+    """
+    if s is None:
+        return None
+    s = str(s).upper().replace(" ", "")
     m = re.search(r"F\.?(\d{1,2})", s)
     if m:
         return -int(m.group(1)) / 100.0
@@ -238,1282 +158,713 @@ def _parse_st_token(s):
     return None
 
 
-# ---------------------------------------------------------
-# 最終日判定
-# ---------------------------------------------------------
-
-def is_final_day_official(venue):
-    """
-    今日、その場が最終日かをBOATRACE公式で判定。
-    同一日・同一場は1回だけ取得してキャッシュ。
-    """
-    key = f"{today_hd()}|{venue}"
-    if key in _FINAL_DAY_CACHE:
-        return _FINAL_DAY_CACHE[key]
-
-    jcd = VENUE_CODES.get(venue)
-    if not jcd:
-        _FINAL_DAY_CACHE[key] = False
-        return False
-
-    url = (
-        "https://www.boatrace.jp/owpc/pc/race/racelist"
-        f"?hd={today_hd()}&jcd={jcd:02d}&rno=1"
-    )
-
-    final_day = False
-
+def _selected_texts(page):
     try:
-        r = _http.get(url, timeout=10)
-        r.raise_for_status()
-
-        plain = _clean_html(r.text)
-        compact = re.sub(r"\s+", "", plain)
-
-        # 未開催ページを最終日扱いしない
-        has_race_page = (
-            "1R" in compact
-            or "レース" in compact
-            or "締切予定時刻" in compact
-            or "出走表" in compact
+        return page.locator("select").evaluate_all(
+            """sels => sels.map(s => {
+                const o = s.selectedOptions && s.selectedOptions[0];
+                return o ? (o.textContent || '').trim() : '';
+            })"""
         )
-
-        # BOATRACE公式は節最終日に「最終日」を表示する
-        final_day = bool(has_race_page and "最終日" in compact)
-
-    except Exception as e:
-        print(
-            f"[FINAL-DAY-ERR] {venue}: {e!r}",
-            flush=True
-        )
-        final_day = False
-
-    _FINAL_DAY_CACHE[key] = final_day
-
-    print(
-        f"[FINAL-DAY] {venue} -> "
-        f"{'最終日' if final_day else '対象外'}",
-        flush=True
-    )
-
-    return final_day
-
-
-def get_final_day_venues():
-    """
-    16場を最初に一度だけ確認。
-    今日が最終日の場だけ返す。
-    """
-    d = today_hd()
-
-    if (
-        _FINAL_DAY_VENUES_CACHE["date"] == d
-        and _FINAL_DAY_VENUES_CACHE["venues"] is not None
-    ):
-        return _FINAL_DAY_VENUES_CACHE["venues"]
-
-    venues = [
-        v for v in TARGET_VENUES
-        if is_final_day_official(v)
-    ]
-
-    _FINAL_DAY_VENUES_CACHE["date"] = d
-    _FINAL_DAY_VENUES_CACHE["venues"] = venues
-
-    print(
-        "[FINAL-DAY-TARGET] "
-        + (", ".join(venues) if venues else "該当場なし"),
-        flush=True
-    )
-
-    return venues
-
-
-# ---------------------------------------------------------
-# Shinsumリンク収集
-# ---------------------------------------------------------
-
-def candidate_links(page, final_day_venues):
-    """
-    最終日の場に関係するリンクだけ候補化。
-    ここで他場を落とすので処理が軽くなる。
-    """
-    if not final_day_venues:
+    except Exception:
         return []
 
-    page.goto(
-        BASE_URL,
-        wait_until="domcontentloaded",
-        timeout=30000
-    )
-    page.wait_for_timeout(800)
 
-    host = urlparse(BASE_URL).netloc
-    out = []
-
-    aa = page.locator("a")
-
-    for i in range(aa.count()):
-        a = aa.nth(i)
-
-        try:
-            href = a.get_attribute("href")
-
-            if (
-                not href
-                or href.startswith("#")
-                or href.startswith("javascript:")
-            ):
-                continue
-
-            full = urljoin(BASE_URL, href)
-
-            if urlparse(full).netloc != host:
-                continue
-
-            txt = ""
-
-            try:
-                txt = a.inner_text(timeout=200) or ""
-            except Exception:
-                pass
-
-            try:
-                txt += "\n" + a.locator(
-                    "xpath=ancestor::*[self::div or self::td or self::li or self::section][1]"
-                ).inner_text(timeout=200)
-            except Exception:
-                pass
-
-            if not any(v in txt for v in final_day_venues):
-                continue
-
-            if (
-                re.search(r"([1-9]|1[0-2])\s*R", txt)
-                or "race" in full.lower()
-                or "detail" in full.lower()
-                or "sum" in full.lower()
-            ):
-                out.append(full)
-
-        except Exception:
-            pass
-
-    return list(dict.fromkeys(out))
-
-
-def actual_venue(text, final_day_venues):
-    head = text[:2200]
-    matches = [v for v in final_day_venues if v in head]
-    return matches[0] if len(matches) == 1 else ""
-
-
-def actual_race(text):
-    m = re.search(
-        r"(?<!\d)([1-9]|1[0-2])\s*R\b",
-        text[:2200],
-        re.I
-    )
-    return m.group(1) + "R" if m else ""
-
-
-# ---------------------------------------------------------
-# 公式BOATRACE
-# ---------------------------------------------------------
-
-def fetch_official_exhibition(venue, race_no):
+def is_hiyori_final_day(page, venue):
     """
-    公式直前情報から
-    - 展示タイム
-    - スタート展示ST
-    を取得。
-
-    2026-08-25修正:
-    BOATRACE公式の「スタート展示」は通常のtable抽出だけでは
-    6艇STを拾えないことがあるため、
-    1) table解析
-    2) ページ本文の「スタート展示」区間を直接解析
-    の二段構えにする。
+    最終日判定はボートレース日和の「当日選択欄」だけを見る。
+    ST順位表の中に常時ある「最終日」という文字は判定に使わない。
     """
-    jcd = VENUE_CODES.get(venue)
-    if not jcd:
-        return {}
+    cache_key = f"{hd()}|{venue}"
+    if cache_key in _final_day_cache:
+        return _final_day_cache[cache_key]
 
-    url = (
-        "https://www.boatrace.jp/owpc/pc/race/beforeinfo"
-        f"?hd={today_hd()}&jcd={jcd:02d}&rno={race_no}"
-    )
-
+    p = page.context.new_page()
     try:
-        r = _http.get(url, timeout=12)
-        r.raise_for_status()
-    except Exception as e:
+        p.goto(hiyori_url(venue, 1), wait_until="domcontentloaded", timeout=25000)
+        p.wait_for_timeout(700)
+
+        selected = _selected_texts(p)
+
+        # 例: "8月25日 / 最終日"
+        final = any(
+            re.search(r"(?:/|／)\s*最終日", t)
+            for t in selected
+        )
+
+        # selectが独自UIで拾えない時だけ、ページ上部の短い範囲を補助確認。
+        if not selected:
+            body = p.locator("body").inner_text(timeout=7000)
+            head = body[:1800]
+            final = bool(re.search(
+                r"\d{1,2}月\d{1,2}日\s*(?:/|／)\s*最終日",
+                head
+            ))
+
+        _final_day_cache[cache_key] = final
         print(
-            f"[EXHIBITION-ERR] {venue}{race_no}R {e!r}",
+            f"[FINAL-DAY] {venue} -> {'対象' if final else '対象外'}"
+            f" / selected={selected[:3]}",
             flush=True
         )
-        return {}
+        return final
 
-    out = {i: {} for i in range(1, 7)}
+    except Exception as e:
+        # 判定不能を最終日扱いには絶対しない。
+        print(f"[FINAL-DAY-ERR] {venue}: {e!r} -> 対象外", flush=True)
+        _final_day_cache[cache_key] = False
+        return False
+    finally:
+        p.close()
 
-    # --------------------------------------------------
-    # 1) 従来のtable解析
-    # --------------------------------------------------
-    for tb in _tables(r.text):
-        flat = " ".join(" ".join(row) for row in tb)
 
-        # 展示タイム
-        if "展示タイム" in flat:
-            for row in tb:
-                s = " ".join(row)
-
-                bm = re.search(
-                    r"(?<!\d)([1-6])(?!\d)",
-                    s
-                )
-                tm = re.search(
-                    r"(?<!\d)(6\.\d{2}|7\.\d{2})(?!\d)",
-                    s
-                )
-
-                if bm and tm:
-                    out[int(bm.group(1))]["ex_time"] = float(
-                        tm.group(1)
-                    )
-
-        # スタート展示
-        if "スタート展示" in flat or ("ST" in flat and "進入" in flat):
-            for row in tb:
-                s = " ".join(row)
-
-                bm = re.search(
-                    r"(?<!\d)([1-6])(?!\d)",
-                    s
-                )
-                if not bm:
-                    continue
-
-                st = _parse_st_token(s)
-
-                if st is not None:
-                    out[int(bm.group(1))]["ex_st"] = st
-
-    # --------------------------------------------------
-    # 2) 本文から「スタート展示」区間を直接解析
-    #    公式ページは次のような並びになる:
-    #    スタート展示 コース 並び ST 1 .22 2 .10 ... 6 .20
-    # --------------------------------------------------
-    plain = _clean_html(r.text)
-    compact_plain = re.sub(r"\s+", " ", plain).strip()
-
-    start_pos = compact_plain.find("スタート展示")
-    if start_pos >= 0:
-        end_candidates = [
-            p for p in (
-                compact_plain.find("水面気象情報", start_pos + 1),
-                compact_plain.find("水面気象", start_pos + 1),
-                compact_plain.find("スタンド", start_pos + 1),
-            )
-            if p > start_pos
-        ]
-        end_pos = min(end_candidates) if end_candidates else min(
-            len(compact_plain), start_pos + 1800
-        )
-        section = compact_plain[start_pos:end_pos]
-
-        # 艇番→ST の順に6艇を抽出。
-        # .07 / 0.07 / F.02 / F02 に対応。
-        pairs = re.findall(
-            r"(?<!\d)([1-6])(?!\d)\s*(F\.?\d{1,2}|0?\.\d{2})(?!\d)",
-            section,
-            flags=re.I,
-        )
-
-        for boat_s, st_s in pairs:
-            b = int(boat_s)
-            if 1 <= b <= 6 and out[b].get("ex_st") is None:
-                st = _parse_st_token(st_s)
-                if st is not None:
-                    out[b]["ex_st"] = st
-
-    # --------------------------------------------------
-    # 3) 展示タイムもtable解析に失敗した場合の本文フォールバック
-    #    レーサー表の先頭6艇について、6.xx / 7.xx を順番に拾う。
-    # --------------------------------------------------
-    if sum(out[b].get("ex_time") is not None for b in range(1, 7)) < 6:
-        header_pos = compact_plain.find("展示 タイム")
-        if header_pos < 0:
-            header_pos = compact_plain.find("展示タイム")
-
-        body_end = start_pos if start_pos > 0 else min(len(compact_plain), 6000)
-        racer_section = compact_plain[header_pos if header_pos >= 0 else 0:body_end]
-
-        # 艇番ごとの周辺文字列から展示タイムを拾う
-        for b in range(1, 7):
-            if out[b].get("ex_time") is not None:
-                continue
-
-            m = re.search(
-                rf"(?<!\d){b}(?!\d)(.{{0,220}}?)(6\.\d{{2}}|7\.\d{{2}})",
-                racer_section,
-                flags=re.S,
-            )
-            if m:
-                try:
-                    out[b]["ex_time"] = float(m.group(2))
-                except Exception:
-                    pass
-
-    got_st = [b for b in range(1, 7) if out[b].get("ex_st") is not None]
-    got_time = [b for b in range(1, 7) if out[b].get("ex_time") is not None]
+def detect_final_day_venues(page):
+    """
+    16場を場単位で1回だけ判定。
+    レースごとに最終日判定しないので処理を軽くする。
+    """
+    out = []
+    for venue in TARGET_VENUES:
+        if is_hiyori_final_day(page, venue):
+            out.append(venue)
 
     print(
-        f"[EXHIBITION-PARSE] {venue}{race_no}R "
-        f"ST={got_st} / TIME={got_time}",
+        "[FINAL-DAY-TARGET] " + (", ".join(out) if out else "なし"),
         flush=True
     )
-
-    return out
-
-def exhibition_complete(ex):
-    """
-    最重要ガード。
-    6艇すべての展示STと展示タイムが揃った時だけTrue。
-    宮島3Rのような展示前レースはここで完全除外。
-    """
-    if not ex or len(ex) < 6:
-        return False
-
-    for b in range(1, 7):
-        d = ex.get(b, {})
-
-        if d.get("ex_st") is None:
-            return False
-
-        if d.get("ex_time") is None:
-            return False
-
-    return True
-
-
-def fetch_official_f(venue, race_no):
-    """
-    F数はBOATRACE公式を正とする。
-    """
-    jcd = VENUE_CODES.get(venue)
-    if not jcd:
-        return {}
-
-    url = (
-        "https://www.boatrace.jp/owpc/pc/race/racelist"
-        f"?hd={today_hd()}&jcd={jcd:02d}&rno={race_no}"
-    )
-
-    try:
-        r = _http.get(url, timeout=12)
-        r.raise_for_status()
-    except Exception as e:
-        print(
-            f"[F-ERR] {venue}{race_no}R {e!r}",
-            flush=True
-        )
-        return {}
-
-    out = {
-        i: {"f_count": 0}
-        for i in range(1, 7)
-    }
-
-    for tb in _tables(r.text):
-        flat = " ".join(" ".join(row) for row in tb)
-
-        if "平均ST" not in flat:
-            continue
-
-        for row in tb:
-            s = " ".join(row)
-
-            bm = re.search(
-                r"^\s*([1-6])(?:\s|$)",
-                s
-            )
-            if not bm:
-                continue
-
-            b = int(bm.group(1))
-
-            fm = re.search(
-                r"F\s*([0-9])",
-                s
-            )
-
-            out[b]["f_count"] = (
-                int(fm.group(1))
-                if fm
-                else 0
-            )
-
     return out
 
 
-# ---------------------------------------------------------
-# ボートレース日和
-# ---------------------------------------------------------
-
-def _extract_six_numeric(cells, lo=None, hi=None):
-    vals = [
-        _num_or_none(x, lo, hi)
-        for x in cells[1:7]
-    ]
-    if len(vals) != 6:
-        return None
-    return vals
-
-
-def fetch_hiyori_st(page, venue, race_no):
+def _row_cells(page):
     """
-    ボートレース日和のST予測用データ。
-
-    使用:
-    - 当地ST順位
-    - 最終日ST順位
-    - ナイターST順位（ナイター場のみ）
-    - F持ST順位
-    - 節間平均ST
-    - トップスタート確率
-    - トップスタート時1着率
-
-    不使用:
-    - 直近1ヶ月
-    - 直近3ヶ月
-    - 初日
-    - コース補正
+    全trを二次元配列にして返す。
     """
-    jcd = VENUE_CODES.get(venue)
-    if not jcd:
-        return {}
-
-    url = (
-        "https://kyoteibiyori.com/race_shusso.php"
-        f"?place_no={jcd}&race_no={race_no}&hiduke={today_hd()}"
+    return page.locator("tr").evaluate_all(
+        """els => els.map(tr =>
+            Array.from(tr.querySelectorAll('th,td'))
+              .map(x => (x.innerText || x.textContent || '').trim())
+        )"""
     )
 
+
+def fetch_hiyori_data(page, venue, race_no):
+    """
+    ボートレース日和から必要データだけ取得。
+    直近1か月・直近3か月は使用しない。
+    """
+    p = page.context.new_page()
     out = {i: {} for i in range(1, 7)}
-    hp = page.context.new_page()
 
     try:
-        hp.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=30000
-        )
+        p.goto(hiyori_url(venue, race_no), wait_until="domcontentloaded", timeout=25000)
 
         try:
-            hp.wait_for_function(
+            p.wait_for_function(
                 """() => {
                     const t = document.body?.innerText || '';
                     return t.includes('ST順位');
                 }""",
-                timeout=10000
+                timeout=9000
             )
         except Exception:
-            hp.wait_for_timeout(2200)
+            p.wait_for_timeout(1000)
 
-        rows = hp.locator("tr").evaluate_all(
-            """els => els.map(tr =>
-                Array.from(tr.querySelectorAll('th,td'))
-                    .map(x => (x.innerText || x.textContent || '').trim())
-            )"""
-        )
+        rows = _row_cells(p)
 
-        # -------------------------
-        # ST順位系・節間平均ST
-        # -------------------------
+        # ---------- ST順位・今節データ ----------
         for cells in rows:
-            if not cells:
+            if len(cells) < 2:
                 continue
 
             label = re.sub(r"\s+", "", cells[0])
+            vals = cells[1:7]
+
+            if len(vals) < 6:
+                continue
 
             key = None
+            parser = _rank
 
             if label == "当地" or label.startswith("当地ST"):
                 key = "local_rank"
-
+            elif label == "初日" or label.startswith("初日ST"):
+                key = "firstday_rank"
             elif label == "最終日" or label.startswith("最終日ST"):
                 key = "finalday_rank"
-
-            elif venue in NIGHT_VENUES and (
-                label == "ナイター"
-                or label.startswith("ナイターST")
-            ):
-                key = "night_rank"
-
-            elif (
-                label == "F持"
-                or label == "F持ち"
-                or label.startswith("F持")
-            ):
+            elif label in ("F持", "F持ち") or label.startswith("F持"):
                 key = "f_rank"
+            elif label == "平均ST":
+                # 今節データ内の平均ST。0.08〜0.30程度。
+                key = "setsu_avg_st"
+                parser = _float
 
             if key:
-                vals = _extract_six_numeric(
-                    cells,
-                    1.0,
-                    6.0
+                for b, raw in enumerate(vals[:6], 1):
+                    v = parser(raw)
+                    if v is not None:
+                        if key == "setsu_avg_st" and not (0.05 <= v <= 0.35):
+                            continue
+                        out[b][key] = float(v)
+
+        # ---------- トップスタート分析（直近1年） ----------
+        # テーブル行は艇番順に6選手。
+        top_table = None
+        tables = p.locator("table")
+        for i in range(tables.count()):
+            tb = tables.nth(i)
+            try:
+                text = tb.inner_text(timeout=300)
+            except Exception:
+                continue
+            if "トップスタート" in text and "確率" in text and "1着率" in text:
+                top_table = tb
+                break
+
+        if top_table is None:
+            # 見出しがtable外のサイト構造向け:
+            # 「トップスタート分析」の後にある最初のtableを取る。
+            heads = p.get_by_text(re.compile("トップスタート分析"))
+            if heads.count():
+                try:
+                    top_table = heads.first.locator(
+                        "xpath=following::table[1]"
+                    )
+                except Exception:
+                    top_table = None
+
+        if top_table is not None:
+            try:
+                trows = top_table.locator("tr").evaluate_all(
+                    """els => els.map(tr =>
+                        Array.from(tr.querySelectorAll('th,td'))
+                          .map(x => (x.innerText || x.textContent || '').trim())
+                    )"""
                 )
+            except Exception:
+                trows = []
 
-                if vals:
-                    for b, v in enumerate(vals, 1):
-                        if v is not None:
-                            out[b][key] = float(v)
-
-            # 節間平均ST
-            if (
-                "節間平均ST" in label
-                or label == "節間ST"
-                or label.startswith("節間平均")
-            ):
-                vals = _extract_six_numeric(
-                    cells,
-                    0.00,
-                    0.40
-                )
-
-                if vals:
-                    for b, v in enumerate(vals, 1):
-                        if v is not None:
-                            out[b]["series_avg_st"] = float(v)
-
-        # -------------------------
-        # トップスタート分析
-        # 画面の表:
-        # 選手名 / 出走数 / 回数 / 確率 / 1着数 / 1着率
-        # -------------------------
-        body_text = hp.locator("body").inner_text(timeout=10000)
-
-        if "トップスタート分析" in body_text:
-            for cells in rows:
+            boat = 0
+            for cells in trows:
+                # データ行の例:
+                # 選手名 / 出走数 / トップST回数 / 確率 / 1着数 / 1着率
                 if len(cells) < 5:
                     continue
 
                 joined = " ".join(cells)
-
-                # 登録番号を艇番に照合するのはページ上の順番が一番安定。
-                # ここでは選手名/登録番号を含む行を上から6行だけ拾う。
-                pct_tokens = re.findall(
-                    r"(\d+(?:\.\d+)?)\s*%",
-                    joined
-                )
-
-                if len(pct_tokens) < 1:
+                pcts = re.findall(r"(\d+(?:\.\d+)?)\s*%", joined)
+                if len(pcts) < 2:
                     continue
 
-                # 行内に登録番号4桁があること
-                if not re.search(r"\b\d{4}\b", joined):
-                    continue
+                boat += 1
+                if boat > 6:
+                    break
 
-                # 後で順番割当用
-                out.setdefault("_top_rows", []).append({
-                    "top_rate": float(pct_tokens[0]),
-                    "top_win_rate": (
-                        float(pct_tokens[1])
-                        if len(pct_tokens) >= 2
-                        else None
-                    )
-                })
+                out[boat]["top_start_prob"] = float(pcts[0])
+                out[boat]["top_start_win"] = float(pcts[1])
 
-            top_rows = out.pop("_top_rows", [])
+        # Fの有無は、日和のF持順位が存在すればF持ちと扱う。
+        for b in range(1, 7):
+            out[b]["has_f"] = out[b].get("f_rank") is not None
 
-            if len(top_rows) >= 6:
-                for b in range(1, 7):
-                    out[b]["top_rate"] = top_rows[b - 1]["top_rate"]
-                    if top_rows[b - 1]["top_win_rate"] is not None:
-                        out[b]["top_win_rate"] = top_rows[b - 1]["top_win_rate"]
+        print(
+            f"[HIYORI] {venue}{race_no}R "
+            + " / ".join(
+                f"{b}:当地={out[b].get('local_rank')},"
+                f"初日={out[b].get('firstday_rank')},"
+                f"最終={out[b].get('finalday_rank')},"
+                f"節ST={out[b].get('setsu_avg_st')},"
+                f"TOP={out[b].get('top_start_prob')},"
+                f"F={'Y' if out[b].get('has_f') else 'N'}"
+                for b in range(1, 7)
+            ),
+            flush=True
+        )
 
         return out
 
     except Exception as e:
-        print(
-            f"[HIYORI-ERR] {venue}{race_no}R {e!r}",
-            flush=True
-        )
-        return {}
-
+        print(f"[HIYORI-ERR] {venue}{race_no}R {e!r}", flush=True)
+        return out
     finally:
-        hp.close()
+        p.close()
 
 
-# ---------------------------------------------------------
-# ST予測
-# ---------------------------------------------------------
-
-def _rank_to_st(rank_value):
+def _extract_exhibition_from_text(body):
     """
-    ST順位(1〜6)を予測STスケールへ。
-    コース差は一切入れない。
+    BOATRACE公式の表示済み本文から展示ST・展示タイムを拾う。
+    HTMLテーブル構造変更に依存しない補助パーサ。
     """
-    if rank_value is None:
-        return None
-
-    # 1位≈0.11 / 6位≈0.19
-    return 0.11 + (float(rank_value) - 1.0) * 0.016
-
-
-def trend_estimate(d):
-    """
-    ST傾向45%の中身。
-    直近1/3ヶ月・初日は使わない。
-    """
-    estimates = []
-
-    # 当地
-    x = _rank_to_st(d.get("local_rank"))
-    if x is not None:
-        estimates.append((x, 1.0))
-
-    # 最終日
-    x = _rank_to_st(d.get("finalday_rank"))
-    if x is not None:
-        estimates.append((x, 1.2))
-
-    # ナイター
-    x = _rank_to_st(d.get("night_rank"))
-    if x is not None:
-        estimates.append((x, 0.8))
-
-    # 節間平均STは実STなので強め
-    if d.get("series_avg_st") is not None:
-        estimates.append((
-            float(d["series_avg_st"]),
-            1.5
-        ))
-
-    if not estimates:
-        base = 0.15
-    else:
-        sw = sum(w for _, w in estimates)
-        base = sum(v * w for v, w in estimates) / sw
-
-    # トップST率は傾向の微調整
-    top_rate = d.get("top_rate")
-    if top_rate is not None:
-        # 25%を中立、10ptごとに約0.008補正
-        base -= (float(top_rate) - 25.0) * 0.0008
-
-    # トップSTを決めた時の1着率は、
-    # 「前を取った時の信頼度」として小さく補強。
-    top_win_rate = d.get("top_win_rate")
-    if top_win_rate is not None:
-        base -= (float(top_win_rate) - 30.0) * 0.00015
-
-    return max(0.06, min(0.24, base))
-
-
-def f_adjusted_estimate(d, trend):
-    """
-    F補正35%。
-    Fなし艇はトレンド値をそのまま使うため、
-    Fなしなのに勝手にコース補正されることはない。
-    """
-    f_count = int(d.get("f_count", 0))
-
-    if f_count <= 0:
-        return trend
-
-    f_rank = d.get("f_rank")
-
-    if f_rank is not None:
-        f_est = _rank_to_st(f_rank)
-    else:
-        f_est = trend + 0.012 * f_count
-
-    # F2はF1よりさらに慎重
-    if f_count >= 2:
-        f_est += 0.010
-
-    return max(0.06, min(0.26, f_est))
-
-
-def exhibition_estimate(d, trend):
-    """
-    展示ST20%。
-    展示Fをそのまま本番F予測にはしない。
-    """
-    ex_st = d.get("ex_st")
-
-    if ex_st is None:
-        return trend
-
-    ex_st = float(ex_st)
-
-    if ex_st >= 0:
-        return max(0.02, min(0.30, ex_st))
-
-    # 展示F:
-    # 本番でも負値と決めつけず、
-    # その艇の傾向より少しだけ踏み込む推定。
-    depth = abs(ex_st)
-
-    if depth <= 0.03:
-        return max(0.04, trend - 0.015)
-
-    if depth <= 0.06:
-        return max(0.04, trend - 0.010)
-
-    return max(0.05, trend - 0.005)
-
-
-def predicted_st(d):
-    """
-    本番ST予測
-      ST傾向 45%
-      F補正 35%
-      展示ST 20%
-    """
-    trend = trend_estimate(d)
-    f_est = f_adjusted_estimate(d, trend)
-    ex_est = exhibition_estimate(d, trend)
-
-    p = (
-        trend * 0.45
-        + f_est * 0.35
-        + ex_est * 0.20
-    )
-
-    return max(0.03, min(0.28, p))
-
-
-def merge_data(exhibition, official_f, hiyori):
     out = {i: {} for i in range(1, 7)}
 
-    for b in range(1, 7):
-        out[b].update(hiyori.get(b, {}))
-        out[b].update(exhibition.get(b, {}))
+    # 展示タイムは 6.5x〜7.xx
+    # body全体から「艇番の近く」にあるものを探すのは誤爆しやすいため、
+    # Playwrightの行抽出を本命とし、ここはST抽出の補助だけにする。
+    start_pos = body.find("スタート展示")
+    if start_pos >= 0:
+        section = body[start_pos:start_pos + 3000]
+        lines = [re.sub(r"\s+", " ", x).strip() for x in section.splitlines() if x.strip()]
 
-        # F有無は必ず公式で最後に上書き
-        out[b]["f_count"] = int(
-            official_f.get(b, {}).get("f_count", 0)
-        )
+        # .xx / F.xx を登場順に6つ拾う。
+        sts = []
+        for line in lines:
+            for m in re.finditer(r"(F\.?\d{1,2}|(?<!\d)\.\d{2}(?!\d)|0\.\d{2})", line, re.I):
+                v = _st(m.group(1))
+                if v is not None:
+                    sts.append(v)
+                    if len(sts) == 6:
+                        break
+            if len(sts) == 6:
+                break
+
+        if len(sts) == 6:
+            for b, v in enumerate(sts, 1):
+                out[b]["ex_st"] = v
 
     return out
 
 
-# ---------------------------------------------------------
-# 画像生成
-# ---------------------------------------------------------
+def fetch_official_exhibition(page, venue, race_no):
+    """
+    公式直前情報をPlaywrightで確認。
+    展示開始前・6艇未完了なら通知しない。
+    """
+    p = page.context.new_page()
+    out = {i: {} for i in range(1, 7)}
 
-def build_st_image(page, venue, race, deadline_value, data):
-    pred = {
-        b: predicted_st(data[b])
-        for b in range(1, 7)
-    }
+    try:
+        p.goto(
+            official_before_url(venue, race_no),
+            wait_until="domcontentloaded",
+            timeout=25000
+        )
+        p.wait_for_timeout(600)
 
+        body = p.locator("body").inner_text(timeout=7000)
+
+        # 展示情報そのものが無ければ未開始。
+        if "スタート展示" not in body or "展示タイム" not in body:
+            return out
+
+        # まずテーブル/行ベースで取得
+        try:
+            rows = _row_cells(p)
+        except Exception:
+            rows = []
+
+        ex_times = []
+        ex_sts = []
+
+        for cells in rows:
+            s = " ".join(cells)
+
+            # 展示タイム候補
+            for m in re.finditer(r"(?<!\d)(6\.\d{2}|7\.\d{2})(?!\d)", s):
+                v = float(m.group(1))
+                if 6.20 <= v <= 7.80:
+                    ex_times.append(v)
+
+            # スタート展示候補
+            for tok in re.findall(
+                r"F\.?\d{1,2}|(?<!\d)\.\d{2}(?!\d)|0\.\d{2}",
+                s,
+                flags=re.I
+            ):
+                v = _st(tok)
+                if v is not None:
+                    ex_sts.append(v)
+
+        # 重複が多いサイト構造では本文の「スタート展示」部分を優先して上書き
+        text_parsed = _extract_exhibition_from_text(body)
+        text_sts = [text_parsed[b].get("ex_st") for b in range(1, 7)]
+
+        if all(v is not None for v in text_sts):
+            ex_sts = text_sts
+        else:
+            # 0.00チルト等の誤拾いを避けるため、6艇ちょうど取れていないなら破棄
+            # 公式DOMが変わった時に誤通知するより「待つ」を優先。
+            if len(ex_sts) != 6:
+                ex_sts = []
+
+        # 展示タイムも6艇ちょうど/本文順が取れた時だけ採用
+        # 6艇分以上ある場合は、6.xxの連続ブロックを候補にする。
+        if len(ex_times) >= 6:
+            # 同一値重複を消さず、最初の6艇分を使用
+            ex_times = ex_times[:6]
+        else:
+            ex_times = []
+
+        if len(ex_sts) == 6:
+            for b, v in enumerate(ex_sts, 1):
+                out[b]["ex_st"] = float(v)
+
+        if len(ex_times) == 6:
+            for b, v in enumerate(ex_times, 1):
+                out[b]["ex_time"] = float(v)
+
+        return out
+
+    except Exception as e:
+        print(f"[OFFICIAL-EX-ERR] {venue}{race_no}R {e!r}", flush=True)
+        return out
+    finally:
+        p.close()
+
+
+# ============================================================
+# 予測ロジック
+# ============================================================
+
+def rank_to_st(rank):
+    """
+    ST順位 1〜6 を相対STへ変換。
+    1位≈0.105 / 6位≈0.195 のスケール。
+    """
+    if rank is None:
+        return None
+    return 0.105 + (float(rank) - 1.0) * 0.018
+
+
+def topstart_to_st(prob, win_rate):
+    """
+    トップST分析を相対STへ。
+    主役はトップST確率。トップST時1着率は補助（20%）。
+    """
+    if prob is None:
+        return None
+
+    prob = max(0.0, min(50.0, float(prob)))
+    # 0% -> .195 / 50% -> .105
+    st_prob = 0.195 - (prob / 50.0) * 0.090
+
+    if win_rate is None:
+        return st_prob
+
+    win_rate = max(0.0, min(100.0, float(win_rate)))
+    # 0% -> .185 / 100% -> .115
+    st_win = 0.185 - (win_rate / 100.0) * 0.070
+
+    return st_prob * 0.80 + st_win * 0.20
+
+
+def f_adjusted_st(d):
+    """
+    F補正。
+    Fなしはニュートラル(.150)。
+    F持ちはF持ちST順位に応じて慎重/攻めを表す。
+    """
+    if not d.get("has_f"):
+        return 0.150
+
+    fr = d.get("f_rank")
+    if fr is None:
+        return 0.165
+
+    # F持ちでも順位が良い選手は過度に遅くしない。
+    base = rank_to_st(fr)
+    return min(0.185, max(0.125, base + 0.008))
+
+
+def weighted_available(parts):
+    """
+    欠損データがあっても、ある項目だけで重みを再正規化。
+    """
+    valid = [(v, w) for v, w in parts if v is not None and w > 0]
+    if not valid:
+        return 0.150
+
+    sw = sum(w for _, w in valid)
+    return sum(v * w for v, w in valid) / sw
+
+
+def predict_st(d):
+    """
+    最終日の本番ST予測。
+
+    直近1か月/3か月、コース補正は入れない。
+    """
+    local = rank_to_st(d.get("local_rank"))
+    firstday = rank_to_st(d.get("firstday_rank"))
+    finalday = rank_to_st(d.get("finalday_rank"))
+
+    setsu = d.get("setsu_avg_st")
+    if setsu is not None:
+        setsu = max(0.07, min(0.28, float(setsu)))
+
+    top = topstart_to_st(
+        d.get("top_start_prob"),
+        d.get("top_start_win")
+    )
+    f_st = f_adjusted_st(d)
+
+    base = weighted_available([
+        (local, BASE_W_LOCAL),
+        (firstday, BASE_W_FIRSTDAY),
+        (finalday, BASE_W_FINALDAY),
+        (setsu, BASE_W_SETSU),
+        (top, BASE_W_TOPSTART),
+        (f_st, BASE_W_F),
+    ])
+
+    ex = d.get("ex_st")
+    if ex is None:
+        pred = base
+    else:
+        # 展示Fは「本番F予測」にはしない。
+        # F.05なら実質0秒近辺の踏み込みとして0.04に丸めて扱う。
+        ex_for_calc = max(0.04, float(ex)) if ex >= 0 else max(0.04, 0.06 - abs(float(ex)))
+        pred = base * FINAL_W_BASE + ex_for_calc * FINAL_W_EXHIBITION
+
+    return max(0.04, min(0.25, pred))
+
+
+# ============================================================
+# 通知画像
+# ============================================================
+
+def build_image(page, venue, race_no, deadline_text, data):
+    pred = {b: predict_st(data[b]) for b in range(1, 7)}
+
+    best = min(pred, key=pred.get)
+
+    # 右に出ているほど速い。
     vals = list(pred.values())
-    lo = min(vals)
-    hi = max(vals)
+    lo, hi = min(vals), max(vals)
     spread = max(hi - lo, 0.04)
 
-    # 最速予測艇だけ🔥
-    best_boat = min(
-        pred,
-        key=pred.get
-    )
-
     lanes = []
-
     for b in range(1, 7):
-        # 右に出るほどSTが速い
         rel = (hi - pred[b]) / spread
-        x = 22 + max(0.0, min(1.0, rel)) * 58
+        x = 28 + max(0.0, min(1.0, rel)) * 52
 
-        d = data[b]
+        ex = data[b].get("ex_st")
+        ext = data[b].get("ex_time")
 
-        exst = d.get("ex_st")
-        if exst is None:
-            exst_txt = "-"
-        elif exst < 0:
-            exst_txt = f"F{abs(exst):.02f}"
+        if ex is None:
+            ex_txt = "-"
+        elif ex < 0:
+            ex_txt = f"F{abs(ex):.02f}".replace("0.", ".")
         else:
-            exst_txt = f"{exst:.02f}"
+            ex_txt = f"{ex:.02f}"
 
-        ext = d.get("ex_time")
-        ext_txt = (
-            f"{ext:.2f}"
-            if ext is not None
-            else "-"
-        )
-
-        fire = "🔥" if b == best_boat else ""
+        ext_txt = f"{ext:.2f}" if ext is not None else "-"
+        fire = "🔥" if b == best else ""
 
         lanes.append(f"""
         <div class="lane">
-          <div class="num n{b}">{b}</div>
+          <div class="num">{b}</div>
           <div class="track">
             <div class="start"></div>
             <div class="boat" style="left:{x:.1f}%">⛵▶ {fire}</div>
           </div>
           <div class="stat">
             <b>予測 {pred[b]:.02f}</b>
-            <span>展示ST {exst_txt}</span>
-            <span>展示 {ext_txt}</span>
+            <span>展示ST {html.escape(ex_txt)}</span>
+            <span>展示 {html.escape(ext_txt)}</span>
           </div>
         </div>
         """)
 
     doc = f"""
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <style>
-        *{{box-sizing:border-box}}
-        body{{
-          margin:0;
-          padding:28px;
-          width:900px;
-          background:#08111f;
-          color:#eef4ff;
-          font-family:"Noto Sans CJK JP","Noto Sans JP","Yu Gothic",sans-serif;
-        }}
-        .top{{
-          display:flex;
-          justify-content:space-between;
-          align-items:flex-end;
-          padding-bottom:18px;
-          border-bottom:1px solid #283850;
-        }}
-        .race{{
-          font-size:31px;
-          font-weight:900;
-        }}
-        .sub{{
-          font-size:15px;
-          color:#90a4c2;
-          margin-top:5px;
-        }}
-        .card{{
-          margin-top:24px;
-          background:#0d192a;
-          border:1px solid #263957;
-          border-radius:18px;
-          padding:20px;
-        }}
-        .title{{
-          font-size:24px;
-          font-weight:900;
-          margin-bottom:12px;
-        }}
-        .lane{{
-          display:grid;
-          grid-template-columns:44px 1fr 170px;
-          gap:10px;
-          align-items:center;
-          min-height:70px;
-          border-top:1px solid #1d2c42;
-        }}
-        .lane:first-of-type{{
-          border-top:none;
-        }}
-        .num{{
-          width:35px;
-          height:35px;
-          border-radius:50%;
-          border:1px solid #607798;
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          font-weight:900;
-        }}
-        .track{{
-          position:relative;
-          height:48px;
-        }}
-        .track:before{{
-          content:"";
-          position:absolute;
-          left:0;
-          right:0;
-          top:24px;
-          height:2px;
-          background:#263956;
-        }}
-        .start{{
-          position:absolute;
-          left:84%;
-          top:2px;
-          bottom:2px;
-          width:3px;
-          background:#ff5252;
-        }}
-        .boat{{
-          position:absolute;
-          top:8px;
-          transform:translateX(-50%);
-          font-size:25px;
-          white-space:nowrap;
-          font-weight:900;
-        }}
-        .stat{{
-          display:flex;
-          flex-direction:column;
-          font-size:13px;
-          color:#99acc7;
-        }}
-        .stat b{{
-          font-size:17px;
-          color:#f2f6ff;
-        }}
-        .arrow{{
-          text-align:center;
-          margin-top:10px;
-          color:#a6b8d1;
-          font-weight:800;
-        }}
-        .note{{
-          margin-top:12px;
-          color:#8fa5c4;
-          font-size:13px;
-        }}
-        .foot{{
-          margin-top:16px;
-          color:#6f83a2;
-          font-size:12px;
-          text-align:right;
-        }}
-      </style>
-    </head>
+    <html><head><meta charset="utf-8">
+    <style>
+      *{{box-sizing:border-box}}
+      body{{
+        margin:0;padding:26px;width:920px;background:#08111f;color:#eef4ff;
+        font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",sans-serif;
+      }}
+      .top{{padding-bottom:18px;border-bottom:1px solid #283850}}
+      .race{{font-size:31px;font-weight:900}}
+      .sub{{font-size:15px;color:#90a4c2;margin-top:6px}}
+      .card{{margin-top:22px;background:#0d192a;border:1px solid #263957;
+        border-radius:18px;padding:20px}}
+      .title{{font-size:22px;font-weight:900;margin-bottom:14px}}
+      .lane{{display:grid;grid-template-columns:42px 1fr 175px;gap:10px;
+        align-items:center;min-height:70px;border-top:1px solid #1d2c42}}
+      .lane:first-of-type{{border-top:none}}
+      .num{{width:34px;height:34px;border-radius:50%;border:1px solid #607798;
+        display:flex;align-items:center;justify-content:center;font-weight:900}}
+      .track{{position:relative;height:48px}}
+      .track:before{{content:"";position:absolute;left:0;right:0;top:24px;height:2px;background:#263956}}
+      .start{{position:absolute;left:84%;top:2px;bottom:2px;width:3px;background:#ff5252}}
+      .boat{{position:absolute;top:8px;transform:translateX(-50%);font-size:25px;
+        white-space:nowrap;font-weight:900}}
+      .stat{{display:flex;flex-direction:column;font-size:13px;color:#99acc7}}
+      .stat b{{font-size:17px;color:#f2f6ff}}
+      .arrow{{text-align:center;margin-top:12px;color:#a6b8d1;font-weight:800}}
+      .note{{margin-top:12px;color:#8fa5c4;font-size:13px}}
+      .foot{{margin-top:18px;color:#7185a5;font-size:12px;text-align:right}}
+    </style></head>
     <body>
       <div class="top">
-        <div>
-          <div class="race">{html.escape(venue)} {html.escape(str(race))}</div>
-          <div class="sub">締切 {html.escape(str(deadline_value))}</div>
-        </div>
+        <div class="race">{html.escape(venue)} {race_no}R</div>
+        <div class="sub">締切 {html.escape(deadline_text or "-")}</div>
       </div>
 
       <div class="card">
         <div class="title">本番ST予測</div>
         {''.join(lanes)}
         <div class="arrow">進行方向 →　　STARTは赤線</div>
-        <div class="note">
-          右に出ているほど本番先行予測 / 🔥は最速予測艇
-        </div>
+        <div class="note">右に出ているほど本番先行予測 / 🔥は最速予測艇</div>
       </div>
 
       <div class="foot">
-        予測配分：ST傾向45% / F補正35% / 展示ST20%
+        当地・初日・最終日ST順位 / F / 今節平均ST / トップST分析 / 展示ST
       </div>
-    </body>
-    </html>
+    </body></html>
     """
 
-    ip = page.context.new_page()
-
+    p = page.context.new_page()
     try:
-        ip.set_viewport_size({
-            "width": 900,
-            "height": 950
-        })
-
-        ip.set_content(
-            doc,
-            wait_until="load"
-        )
-
-        ip.wait_for_timeout(250)
-
-        safe_venue = re.sub(r"[^\w\-]+", "_", venue)
-        path = (
-            f"/tmp/st_{safe_venue}_"
-            f"{re.sub(r'\\D', '', str(race))}_"
-            f"{int(time.time())}.png"
-        )
-
-        ip.screenshot(
-            path=path,
-            full_page=True
-        )
-
+        p.set_viewport_size({"width": 920, "height": 1000})
+        p.set_content(doc, wait_until="load")
+        p.wait_for_timeout(200)
+        path = f"/tmp/finalday_st_{venue}_{race_no}_{int(time.time())}.png"
+        p.screenshot(path=path, full_page=True)
         return path, pred
-
     finally:
-        ip.close()
+        p.close()
 
 
-# ---------------------------------------------------------
-# ntfy
-# ---------------------------------------------------------
-
-def send_image_ntfy(image_path, venue, race):
-    filename = os.path.basename(image_path)
-
-    with open(image_path, "rb") as f:
+def send_image(path, venue, race_no):
+    with open(path, "rb") as f:
         r = requests.put(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             params={
-                "filename": filename,
+                "filename": os.path.basename(path),
                 "title": "Shinsum Monitor",
-                "message": f"{venue} {race} 本番ST予測",
+                "message": f"{venue} {race_no}R / 本番ST予測",
                 "priority": "5",
                 "tags": "ship",
             },
             data=f,
-            headers={
-                "Content-Type": "image/png"
-            },
+            headers={"Content-Type": "image/png"},
             timeout=30,
         )
-
     r.raise_for_status()
 
 
-# ---------------------------------------------------------
-# 1レース判定
-# ---------------------------------------------------------
-
-def inspect(page, final_day_venues):
-    text = page.locator(
-        "body"
-    ).inner_text(timeout=10000)
-
-    venue = actual_venue(
-        text,
-        final_day_venues
-    )
-    race = actual_race(text)
-
-    if not venue or not race:
-        return None
-
-    # 念のため二重ガード
-    if venue not in final_day_venues:
-        return None
-
-    race_no = int(
-        re.sub(r"\D", "", race) or 0
-    )
-
-    if not 1 <= race_no <= 12:
-        return None
-
-    d = deadline(text)
-
-    if not race_is_still_relevant(d):
-        return None
-
-    # まず公式展示だけを見る
-    exhibition = fetch_official_exhibition(
-        venue,
-        race_no
-    )
-
-    # ★ 6艇の展示ST + 展示タイムが揃っていなければ
-    #    日和取得も画像生成もしない。通知もしない。
-    if not exhibition_complete(exhibition):
-        print(
-            f"[WAIT-EXHIBITION] {venue} {race} "
-            f"展示未完了 → 通知しない",
-            flush=True
-        )
-        return None
-
-    official_f = fetch_official_f(
-        venue,
-        race_no
-    )
-
-    hiyori = fetch_hiyori_st(
-        page,
-        venue,
-        race_no
-    )
-
-    data = merge_data(
-        exhibition,
-        official_f,
-        hiyori
-    )
-
-    key = (
-        f"{today_hd()}|"
-        f"{venue}|{race}|ST"
-    )
-
-    return {
-        "key": key,
-        "venue": venue,
-        "race": race,
-        "deadline": d,
-        "data": data,
-    }
+def fetch_deadline(page, venue, race_no):
+    """
+    公式直前情報本文から締切予定時刻を補助取得。
+    """
+    p = page.context.new_page()
+    try:
+        p.goto(official_before_url(venue, race_no), wait_until="domcontentloaded", timeout=20000)
+        body = p.locator("body").inner_text(timeout=5000)
+        m = re.search(r"締切予定時刻\s*([0-2]?\d:[0-5]\d)", body)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+    finally:
+        p.close()
 
 
-# ---------------------------------------------------------
-# cycle
-# ---------------------------------------------------------
+def race_complete(ex):
+    """
+    6艇すべての展示STが取れて初めて「展示完了」。
+    """
+    got = [
+        b for b in range(1, 7)
+        if ex.get(b, {}).get("ex_st") is not None
+    ]
+    return len(got) == 6, got
 
-def cycle(page):
-    final_day_venues = get_final_day_venues()
 
-    if not final_day_venues:
-        print(
-            "[CYCLE] 今日の対象最終日場なし",
-            flush=True
-        )
-        return
-
-    links = candidate_links(
-        page,
-        final_day_venues
-    )
-
-    print(
-        f"詳細候補リンク数: {len(links)} "
-        f"/ 最終日場: {', '.join(final_day_venues)}",
-        flush=True
-    )
-
-    for u in links[:80]:
-        try:
-            page.goto(
-                u,
-                wait_until="domcontentloaded",
-                timeout=20000
-            )
-
-            page.wait_for_timeout(250)
-
-            item = inspect(
-                page,
-                final_day_venues
-            )
-
-            if not item:
+def cycle(page, final_venues):
+    for venue in final_venues:
+        for race_no in range(1, 13):
+            key = f"{hd()}|{venue}|{race_no}"
+            if key in seen:
                 continue
 
-            if item["key"] in seen:
-                continue
+            ex = fetch_official_exhibition(page, venue, race_no)
+            complete, got = race_complete(ex)
 
-            image_path = None
+            if not complete:
+                print(
+                    f"[WAIT-EXHIBITION] {venue} {race_no}R "
+                    f"展示ST取得={got} / 6艇未完了 -> 通知しない",
+                    flush=True
+                )
+                # 未来Rばかり全部開き続けない。
+                # その場で未完了Rが出たら次周期へ。
+                break
+
+            hdata = fetch_hiyori_data(page, venue, race_no)
+
+            data = {i: {} for i in range(1, 7)}
+            for b in range(1, 7):
+                data[b].update(hdata.get(b, {}))
+                data[b].update(ex.get(b, {}))
+
+            deadline_text = fetch_deadline(page, venue, race_no)
+            image_path, pred = build_image(
+                page, venue, race_no, deadline_text, data
+            )
 
             try:
-                image_path, pred = build_st_image(
-                    page,
-                    item["venue"],
-                    item["race"],
-                    item["deadline"],
-                    item["data"],
-                )
-
-                send_image_ntfy(
-                    image_path,
-                    item["venue"],
-                    item["race"],
-                )
-
+                send_image(image_path, venue, race_no)
+                seen.add(key)
                 print(
-                    "[ST-PREDICT] "
-                    f"{item['venue']} {item['race']} / "
-                    + " / ".join(
-                        f"{b}={pred[b]:.02f}"
-                        for b in range(1, 7)
-                    ),
+                    f"[ST-PREDICT] {venue} {race_no}R / "
+                    + " / ".join(f"{b}={pred[b]:.02f}" for b in range(1, 7)),
                     flush=True
                 )
-
-                # 成功後だけ既読
-                seen.add(item["key"])
-
-            except Exception as e:
-                print(
-                    f"[NOTIFY-ERR] "
-                    f"{item['venue']} {item['race']} "
-                    f"{e!r}",
-                    flush=True
-                )
-
+                print(f"[NOTIFY] {venue} {race_no}R 送信完了", flush=True)
             finally:
-                if image_path:
-                    try:
-                        os.remove(image_path)
-                    except Exception:
-                        pass
+                try:
+                    os.remove(image_path)
+                except Exception:
+                    pass
 
-        except Exception as e:
-            print(
-                "詳細ページ確認失敗:",
-                u,
-                repr(e),
-                flush=True
-            )
-
-
-# ---------------------------------------------------------
-# main
-# ---------------------------------------------------------
 
 def main():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True
-        )
-
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
         context = browser.new_context(
-            http_credentials={
-                "username": USER,
-                "password": PASSWORD
-            }
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15"
         )
-
         page = context.new_page()
 
         if not active():
-            print(
-                "監視時間外（23:00〜08:00 JST）。終了します。",
-                flush=True
-            )
+            print("監視時間外（23:00〜08:00 JST）。終了します。", flush=True)
             return
 
-        targets = get_final_day_venues()
-
         print(
-            f"[{now():%Y-%m-%d %H:%M:%S}] "
-            "Shinsum Monitor "
+            f"[{now():%Y-%m-%d %H:%M:%S}] Shinsum Monitor",
+            flush=True
+        )
+        print(
             "最終日1〜12R 本番ST予測開始",
             flush=True
         )
-
         print(
-            "予測配分: "
-            "ST傾向45% / F補正35% / 展示ST20%",
+            "使用: 当地ST順位 / 初日ST順位 / 最終日ST順位 / "
+            "F有無 / 今節平均ST / トップST分析(1年) / 展示ST",
+            flush=True
+        )
+        print(
+            "不使用: 直近1か月 / 直近3か月 / コース補正 / 2着予想 / 最終1着率",
             flush=True
         )
 
-        print(
-            "監視対象: "
-            + (", ".join(targets) if targets else "なし"),
-            flush=True
-        )
+        # 最終日判定は起動時に1回だけ。
+        final_venues = detect_final_day_venues(page)
 
-        # 起動直後から、
-        # 展示完了済みの「まだ締切前」の対象レースは通知可能。
-        cycle(page)
+        if not final_venues:
+            print("本日の対象最終日場なし。終了します。", flush=True)
+            return
 
         while active():
             print(
-                f"{CHECK_INTERVAL}秒後に再チェック",
+                f"[{now():%Y-%m-%d %H:%M:%S}] 再チェック / "
+                f"最終日場: {', '.join(final_venues)}",
                 flush=True
             )
 
-            time.sleep(
-                CHECK_INTERVAL
-            )
+            cycle(page, final_venues)
 
-            print(
-                f"[{now():%Y-%m-%d %H:%M:%S}] 再チェック",
-                flush=True
-            )
-
-            cycle(page)
+            time.sleep(CHECK_INTERVAL)
 
         browser.close()
 
