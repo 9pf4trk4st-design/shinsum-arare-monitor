@@ -653,6 +653,55 @@ def _extract_exhibition_from_text(body):
 
     return out
 
+
+class _OfficialTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self.table = None
+        self.row = None
+        self.cell = None
+        self.depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "table":
+            self.depth += 1
+            if self.depth == 1:
+                self.table = []
+        elif self.depth and tag == "tr":
+            self.row = []
+        elif self.depth and tag in ("td", "th"):
+            self.cell = []
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self.depth and tag in ("td", "th") and self.cell is not None:
+            if self.row is not None:
+                self.row.append(re.sub(r"\s+", " ", "".join(self.cell)).strip())
+            self.cell = None
+        elif self.depth and tag == "tr":
+            if self.table is not None and self.row:
+                self.table.append(self.row)
+            self.row = None
+        elif tag == "table" and self.depth:
+            self.depth -= 1
+            if self.depth == 0:
+                if self.table:
+                    self.tables.append(self.table)
+                self.table = None
+
+
+def _official_tables(raw_html):
+    parser = _OfficialTableParser()
+    parser.feed(raw_html)
+    return parser.tables
+
+
 def fetch_official_exhibition(page, venue, race_no):
     """
     6艇取得を最優先にした展示情報取得。
