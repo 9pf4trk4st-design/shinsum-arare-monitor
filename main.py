@@ -52,7 +52,7 @@ def api_get(path, params, retries=3):
                 last_error=requests.HTTPError(f"{r.status_code} temporary error",response=r)
                 if attempt<retries:
                     wait=2*attempt
-                    print(f"[RETRY] GMO API {r.status_code}: {wait}ç§å¾ã«åè©¦è¡")
+                    print(f"[RETRY] GMO API HTTP {r.status_code}; retry in {wait}s")
                     time.sleep(wait); continue
                 raise last_error
             r.raise_for_status(); j=r.json()
@@ -62,7 +62,7 @@ def api_get(path, params, retries=3):
             last_error=e
             if attempt<retries:
                 wait=2*attempt
-                print(f"[RETRY] GMO APIéä¿¡å¤±æ: {wait}ç§å¾ã«åè©¦è¡ ({e})")
+                print(f"[RETRY] GMO API connection error; retry in {wait}s ({e})")
                 time.sleep(wait); continue
             raise
     if last_error: raise last_error
@@ -89,14 +89,14 @@ def fetch_intraday(symbol, interval, days, extra_days=10, min_rows=60):
                 if len(merged)>=min_rows and i>=days: break
         except requests.HTTPError as e:
             if getattr(e.response,"status_code",None)==404:
-                print(f"[INFO] {symbol} {interval} {d}: KLineæªæä¾ â åæ¥ã¸"); continue
+                print(f"[INFO] {symbol} {interval} {d}: no KLine; fallback older date"); continue
             print(f"[WARN] {symbol} {interval} {d}: {e}")
         except Exception as e:
             print(f"[WARN] {symbol} {interval} {d}: {e}")
     if not frames:
         raise RuntimeError(f"No data for {symbol} {interval} (JST6æåºæºã§{max_lookback+1}æ¥æ¢ç´¢)")
     out=pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    if len(out)<min_rows: print(f"[WARN] {symbol} {interval}: {len(out)}æ¬ã®ã¿åå¾")
+    if len(out)<min_rows: print(f"[WARN] {symbol} {interval}: only {len(out)} candles fetched")
     return out
 
 def fetch_yearly(symbol, interval, years_back=3, extra_years=1):
@@ -107,7 +107,7 @@ def fetch_yearly(symbol, interval, years_back=3, extra_years=1):
             if not f.empty: frames.append(f)
         except requests.HTTPError as e:
             if getattr(e.response,"status_code",None)==404:
-                print(f"[INFO] {symbol} {interval} {year}: KLineæªæä¾ã®ããã¹ã­ãã"); continue
+                print(f"[INFO] {symbol} {interval} {year}: no KLine; skip year"); continue
             print(f"[WARN] {symbol} {interval} {year}: {e}")
         except Exception as e:
             print(f"[WARN] {symbol} {interval} {year}: {e}")
@@ -346,8 +346,38 @@ def log_signals(analyses):
         for a in analyses: w.writerow([now_utc().isoformat(),a.symbol,a.side,a.score_long,a.score_short,a.confidence,a.price])
 
 def rank_text(analyses):
-    ranking=sorted(analyses,key=lambda a:a.confidence,reverse=True); icons=["ð¥","ð¥","ð¥","4ï¸â£"]
-    return "\n".join(f"{icons[i]} {a.symbol}: {a.side if a.side!='WAIT' else 'è¦éã'} {a.confidence}ç¹" for i,a in enumerate(ranking))
+    ranking=sorted(analyses,key=lambda a:a.confidence,reverse=True)
+    return "\n".join(
+        f"#{i+1} {a.symbol}: {a.side if a.side!='WAIT' else 'WAIT'} {a.confidence}"
+        for i,a in enumerate(ranking)
+    )
+
+def print_analysis_summary(analyses, failed_symbols=None):
+    """GitHub Actionsã§æå­åããã«ããASCIIä¸­å¿ã®åæä¸è¦§ã"""
+    failed_symbols = failed_symbols or []
+    by_symbol = {a.symbol: a for a in analyses}
+
+    print("", flush=True)
+    print("========== MUSIGNY ANALYSIS ==========", flush=True)
+
+    for symbol in SYMBOLS:
+        a = by_symbol.get(symbol)
+
+        if a is None:
+            status = "DATA_SKIP" if symbol in failed_symbols else "NO_DATA"
+            print(f"{symbol:>3} | {status}", flush=True)
+            continue
+
+        strength = "STRONG" if a.confidence >= STRONG_THRESHOLD and a.side != "WAIT" else ""
+        print(
+            f"{symbol:>3} | {a.side:<5} | "
+            f"LONG={a.score_long:>3} SHORT={a.score_short:>3} "
+            f"CONF={a.confidence:>3} {strength}",
+            flush=True
+        )
+
+    print("======================================", flush=True)
+    print("", flush=True)
 
 def choose_winner(analyses):
     valid=[a for a in analyses if a.side!="WAIT" and a.confidence>=ENTRY_THRESHOLD]
@@ -383,12 +413,13 @@ def main():
             analyses.append(analyze(symbol,frames))
         except Exception as e:
             failed_symbols.append(symbol)
-            print(f"[DATA-SKIP] {symbol}: ä»åã®å¤å®ãã¹ã­ãã ({e})",flush=True)
+            print(f"[DATA-SKIP] {symbol}: skip this cycle ({e})", flush=True)
     state=load_state()
     if not analyses:
-        print("[DATA-WAIT] å¨éæã®åæãã¼ã¿åå¾å¤±æãå£²è²·ããæ¬¡åãã§ãã¯ã¸ã",flush=True)
+        print("[DATA-WAIT] No symbols available. No trade; wait for next cycle.", flush=True)
         save_state(state); return
-    if failed_symbols: print("[DATA-INFO] ä»åã¹ã­ãã: "+", ".join(failed_symbols),flush=True)
+    if failed_symbols: print("[DATA-INFO] skipped symbols: "+", ".join(failed_symbols), flush=True)
+    print_analysis_summary(analyses, failed_symbols)
     log_signals(analyses)
     for m in manage_position(state,analyses): notify("ð "+m)
     if not state.get("position"):
@@ -405,10 +436,10 @@ def main():
                 if ok: create_pending(state,winner); print(fmt_candidate(winner,ranking,state),flush=True); state["last_notified"]=key
                 else: print("æ°è¦åæ­¢:",why)
             else: print(ranking)
-        else: print("å¨éæè¦éã"); print(ranking)
+        else: print("[TRADE] No entry candidate this cycle", flush=True); print(ranking, flush=True)
     else:
-        if state.get("position"): print("ä»®æ³ãã¸ã·ã§ã³ä¿æä¸­:",state["position"]["symbol"])
-        elif state.get("pending"): print("å¾æ©åè£ãã:",state["pending"]["symbol"])
+        if state.get("position"): print("[STATE] OPEN_POSITION:", state["position"]["symbol"], flush=True)
+        elif state.get("pending"): print("[STATE] PENDING:", state["pending"]["symbol"], flush=True)
     save_state(state)
 
 if __name__=="__main__": main()
