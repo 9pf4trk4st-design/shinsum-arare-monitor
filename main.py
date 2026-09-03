@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-# Musigny 4-Crypto DayTrade BOT v4
-# BTC / ETH / XRP / SOL
-# GMO Public API / シグナル通知 + 待機注文型の仮想売買（実売買なし）
-
 from __future__ import annotations
-import os, json, math, csv, hashlib
+import os, json, math, csv, hashlib, time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -16,582 +12,403 @@ import requests
 PUBLIC = "https://api.coin.z.com/public"
 SYMBOLS = ["BTC", "ETH", "XRP", "SOL"]
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")
-
-STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR = Path(os.getenv("STATE_DIR", "state")); STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "bot_state.json"
 TRADES_FILE = STATE_DIR / "paper_trades.csv"
 SIGNALS_FILE = STATE_DIR / "signal_log.csv"
 
 EMA_PERIOD = 12
 RCI_PERIODS = (8, 25, 47)
-
-ENTRY_THRESHOLD = int(os.getenv("ENTRY_THRESHOLD", "72"))
-OPPOSITE_GAP = int(os.getenv("OPPOSITE_GAP", "15"))
-WINNER_GAP = int(os.getenv("WINNER_GAP", "5"))
-
+ENTRY_THRESHOLD = int(os.getenv("ENTRY_THRESHOLD", "60"))
+STRONG_THRESHOLD = int(os.getenv("STRONG_THRESHOLD", "70"))
+OPPOSITE_GAP = int(os.getenv("OPPOSITE_GAP", "10"))
 PAPER_BALANCE_DEFAULT = float(os.getenv("PAPER_BALANCE", "100000"))
 RISK_PCT = float(os.getenv("RISK_PCT", "0.0075"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
-
-TP1_PCT = 0.30
-TP2_PCT = 0.40
-TP3_PCT = 0.30
-
+TP1_PCT, TP2_PCT, TP3_PCT = 0.30, 0.40, 0.30
 PENDING_EXPIRE_HOURS = int(os.getenv("PENDING_EXPIRE_HOURS", "8"))
+RCI_EXTREME = 75.0
+RCI_STRONG_EXTREME = 85.0
 
 @dataclass
 class Analysis:
-    symbol: str
-    side: str
-    score_long: int
-    score_short: int
-    confidence: int
-    price: float
-    entry_low: float | None
-    entry_high: float | None
-    stop: float | None
-    tp1: float | None
-    tp2: float | None
-    tp3: float | None
-    reasons: list[str]
-    invalidation: str
-    candle_id: str
-    candle_high: float
-    candle_low: float
+    symbol: str; side: str; score_long: int; score_short: int; confidence: int
+    price: float; entry_low: float|None; entry_high: float|None; stop: float|None
+    tp1: float|None; tp2: float|None; tp3: float|None; reasons: list[str]
+    invalidation: str; candle_id: str; candle_high: float; candle_low: float
 
-def now_utc():
-    return datetime.now(timezone.utc)
+def now_utc(): return datetime.now(timezone.utc)
+def now_jst(): return now_utc() + timedelta(hours=9)
 
-def now_jst():
-    return now_utc() + timedelta(hours=9)
-
-def api_get(path, params):
-    r = requests.get(PUBLIC + path, params=params, timeout=25)
-    r.raise_for_status()
-    j = r.json()
-    if int(j.get("status", 1)) != 0:
-        raise RuntimeError(f"GMO API error: {j}")
-    return j["data"]
+def api_get(path, params, retries=3):
+    last_error=None
+    for attempt in range(1,retries+1):
+        try:
+            r=requests.get(PUBLIC+path,params=params,timeout=25)
+            if r.status_code==404:
+                r.raise_for_status()
+            if r.status_code==429 or 500<=r.status_code<600:
+                last_error=requests.HTTPError(f"{r.status_code} temporary error",response=r)
+                if attempt<retries:
+                    wait=2*attempt
+                    print(f"[RETRY] GMO API {r.status_code}: {wait}ç§å¾ã«åè©¦è¡")
+                    time.sleep(wait); continue
+                raise last_error
+            r.raise_for_status(); j=r.json()
+            if int(j.get("status",1))!=0: raise RuntimeError(f"GMO API error: {j}")
+            return j.get("data",[]) or []
+        except (requests.Timeout,requests.ConnectionError) as e:
+            last_error=e
+            if attempt<retries:
+                wait=2*attempt
+                print(f"[RETRY] GMO APIéä¿¡å¤±æ: {wait}ç§å¾ã«åè©¦è¡ ({e})")
+                time.sleep(wait); continue
+            raise
+    if last_error: raise last_error
+    return []
 
 def frame_from_rows(rows):
     out = pd.DataFrame([{
         "time": pd.to_datetime(int(x["openTime"]), unit="ms", utc=True),
-        "open": float(x["open"]),
-        "high": float(x["high"]),
-        "low": float(x["low"]),
-        "close": float(x["close"]),
-        "volume": float(x["volume"]),
+        "open": float(x["open"]), "high": float(x["high"]), "low": float(x["low"]),
+        "close": float(x["close"]), "volume": float(x["volume"])
     } for x in rows])
-    if out.empty:
-        return out
-    return out.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    return out if out.empty else out.sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
-def fetch_intraday(symbol, interval, days):
-    frames = []
-
-    # GMO KLine の日付は日本時間06:00で切り替わる。
-    # 00:00〜05:59 JST にカレンダー当日を投げると404になり得るため、
-    # 「JST - 6時間」をAPI上の取引日として使う。
-    api_day = now_jst() - timedelta(hours=6)
-
-    for i in range(days + 1):
-        d = (api_day - timedelta(days=i)).strftime("%Y%m%d")
+def fetch_intraday(symbol, interval, days, extra_days=10, min_rows=60):
+    frames=[]; api_day=now_jst()-timedelta(hours=6)
+    max_lookback=max(days+extra_days,days+2)
+    for i in range(max_lookback+1):
+        d=(api_day-timedelta(days=i)).strftime("%Y%m%d")
         try:
-            rows = api_get("/v1/klines", {"symbol": symbol, "interval": interval, "date": d})
-            f = frame_from_rows(rows)
+            f=frame_from_rows(api_get("/v1/klines",{"symbol":symbol,"interval":interval,"date":d},retries=3))
             if not f.empty:
                 frames.append(f)
+                merged=pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
+                if len(merged)>=min_rows and i>=days: break
         except requests.HTTPError as e:
-            # 404は「そのAPI日付にデータがまだ無い / 取扱開始前」の意味になり得る。
-            # 他の日付データで分析できる場合は正常にスキップする。
-            status = getattr(e.response, "status_code", None)
-            if status == 404:
-                print(f"[INFO] {symbol} {interval} {d}: KLine未提供のためスキップ")
-                continue
+            if getattr(e.response,"status_code",None)==404:
+                print(f"[INFO] {symbol} {interval} {d}: KLineæªæä¾ â åæ¥ã¸"); continue
             print(f"[WARN] {symbol} {interval} {d}: {e}")
         except Exception as e:
             print(f"[WARN] {symbol} {interval} {d}: {e}")
-
     if not frames:
-        raise RuntimeError(f"No data for {symbol} {interval}")
-    return pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        raise RuntimeError(f"No data for {symbol} {interval} (JST6æåºæºã§{max_lookback+1}æ¥æ¢ç´¢)")
+    out=pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    if len(out)<min_rows: print(f"[WARN] {symbol} {interval}: {len(out)}æ¬ã®ã¿åå¾")
+    return out
 
-def fetch_yearly(symbol, interval, years_back=3):
-    y = now_utc().year
-    frames = []
-    for year in range(y-years_back, y+1):
+def fetch_yearly(symbol, interval, years_back=3, extra_years=1):
+    frames=[]; y=now_utc().year
+    for year in range(y-years_back-extra_years,y+1):
         try:
-            rows = api_get("/v1/klines", {"symbol": symbol, "interval": interval, "date": str(year)})
-            f = frame_from_rows(rows)
-            if not f.empty:
-                frames.append(f)
+            f=frame_from_rows(api_get("/v1/klines",{"symbol":symbol,"interval":interval,"date":str(year)},retries=3))
+            if not f.empty: frames.append(f)
         except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 404:
-                # 取扱開始前など、その年のKLineが無いケースは異常終了させない。
-                print(f"[INFO] {symbol} {interval} {year}: KLine未提供のためスキップ")
-                continue
+            if getattr(e.response,"status_code",None)==404:
+                print(f"[INFO] {symbol} {interval} {year}: KLineæªæä¾ã®ããã¹ã­ãã"); continue
             print(f"[WARN] {symbol} {interval} {year}: {e}")
         except Exception as e:
             print(f"[WARN] {symbol} {interval} {year}: {e}")
-    if not frames:
-        raise RuntimeError(f"No data for {symbol} {interval}")
+    if not frames: raise RuntimeError(f"No data for {symbol} {interval}")
     return pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
-def drop_open_candle(df):
-    return df.iloc[:-1].copy().reset_index(drop=True) if len(df) >= 3 else df
+def drop_open_candle(df): return df.iloc[:-1].copy().reset_index(drop=True) if len(df)>=3 else df
 
 def rci(series, period):
-    out = np.full(len(series), np.nan)
-    vals = series.to_numpy(float)
-    for i in range(period-1, len(vals)):
-        w = vals[i-period+1:i+1]
-        tr = np.arange(1, period+1, dtype=float)
-        pr = pd.Series(w).rank(method="average").to_numpy(float)
-        d2 = np.sum((tr-pr)**2)
-        out[i] = (1 - 6*d2/(period*(period**2-1))) * 100
-    return pd.Series(out, index=series.index)
+    out=np.full(len(series),np.nan); vals=series.to_numpy(float)
+    for i in range(period-1,len(vals)):
+        w=vals[i-period+1:i+1]; tr=np.arange(1,period+1,dtype=float)
+        pr=pd.Series(w).rank(method="average").to_numpy(float); d2=np.sum((tr-pr)**2)
+        out[i]=(1-6*d2/(period*(period**2-1)))*100
+    return pd.Series(out,index=series.index)
 
 def ichimoku(df):
-    x=df.copy()
-    h9=x["high"].rolling(9).max(); l9=x["low"].rolling(9).min()
-    h26=x["high"].rolling(26).max(); l26=x["low"].rolling(26).min()
-    h52=x["high"].rolling(52).max(); l52=x["low"].rolling(52).min()
-    x["tenkan"]=(h9+l9)/2
-    x["kijun"]=(h26+l26)/2
-    x["span_a"]=(x["tenkan"]+x["kijun"])/2
-    x["span_b"]=(h52+l52)/2
+    x=df.copy(); h9=x.high.rolling(9).max(); l9=x.low.rolling(9).min(); h26=x.high.rolling(26).max(); l26=x.low.rolling(26).min(); h52=x.high.rolling(52).max(); l52=x.low.rolling(52).min()
+    x["tenkan"]=(h9+l9)/2; x["kijun"]=(h26+l26)/2; x["span_a"]=(x.tenkan+x.kijun)/2; x["span_b"]=(h52+l52)/2
     return x
 
 def indicators(df):
-    x=df.copy()
-    x["ema12"]=x["close"].ewm(span=12, adjust=False).mean()
-    x["ema_slope5"]=x["ema12"].pct_change(5)
-    for p in RCI_PERIODS:
-        x[f"rci{p}"]=rci(x["close"], p)
-    x["atr"]=(x["high"]-x["low"]).rolling(14).mean()
-    x["vol_ma20"]=x["volume"].rolling(20).mean()
-    return ichimoku(x)
+    x=df.copy(); x["ema12"]=x.close.ewm(span=EMA_PERIOD,adjust=False).mean(); x["ema_slope5"]=x.ema12.pct_change(5)
+    for p in RCI_PERIODS: x[f"rci{p}"]=rci(x.close,p)
+    x["atr"]=(x.high-x.low).rolling(14).mean(); x["vol_ma20"]=x.volume.rolling(20).mean(); return ichimoku(x)
 
-def trend_state(df):
-    x=indicators(df); r=x.iloc[-1]
-    bull=bear=0
-    if r["close"]>r["ema12"] and r["ema_slope5"]>0: bull+=2
-    if r["close"]<r["ema12"] and r["ema_slope5"]<0: bear+=2
-    if pd.notna(r["span_a"]) and pd.notna(r["span_b"]):
-        hi=max(r["span_a"],r["span_b"]); lo=min(r["span_a"],r["span_b"])
-        if r["close"]>hi: bull+=2
-        elif r["close"]<lo: bear+=2
-    if pd.notna(r["rci25"]) and pd.notna(r["rci47"]):
-        if r["rci25"]>0 and r["rci47"]>-50: bull+=1
-        if r["rci25"]<0 and r["rci47"]<50: bear+=1
+def trend_state_ind(x):
+    r=x.iloc[-1]; bull=bear=0
+    if r.close>r.ema12 and r.ema_slope5>0: bull+=2
+    if r.close<r.ema12 and r.ema_slope5<0: bear+=2
+    if pd.notna(r.span_a) and pd.notna(r.span_b):
+        hi=max(r.span_a,r.span_b); lo=min(r.span_a,r.span_b)
+        if r.close>hi: bull+=2
+        elif r.close<lo: bear+=2
+    if pd.notna(r.rci25) and pd.notna(r.rci47):
+        if r.rci25>0 and r.rci47>-50: bull+=1
+        if r.rci25<0 and r.rci47<50: bear+=1
     if bull>=bear+2: return "BULL"
     if bear>=bull+2: return "BEAR"
     return "NEUTRAL"
 
+def rci_dir(ind, period):
+    if len(ind)<2: return 0
+    a,b=ind.iloc[-2][f"rci{period}"],ind.iloc[-1][f"rci{period}"]
+    if pd.isna(a) or pd.isna(b): return 0
+    return 1 if b-a>1 else -1 if b-a<-1 else 0
+
+def higher_rci_bias(W,D):
+    dirs=[rci_dir(W,25),rci_dir(W,47),rci_dir(D,25),rci_dir(D,47)]
+    up=sum(x>0 for x in dirs); down=sum(x<0 for x in dirs)
+    if up==4: return "STRONG_UP",14
+    if up>=3: return "UP",10
+    if down==4: return "STRONG_DOWN",14
+    if down>=3: return "DOWN",10
+    return "MIXED",0
+
+def red_rci_reversal(ind):
+    vals=ind["rci8"].iloc[-4:].dropna()
+    if len(vals)<3: return None,0
+    prev,cur=float(vals.iloc[-2]),float(vals.iloc[-1]); lo,hi=float(vals.min()),float(vals.max())
+    rising=cur>prev+2; falling=cur<prev-2
+    if lo<=-RCI_STRONG_EXTREME and rising: return "LONG",16
+    if lo<=-RCI_EXTREME and rising: return "LONG",12
+    if hi>=RCI_STRONG_EXTREME and falling: return "SHORT",16
+    if hi>=RCI_EXTREME and falling: return "SHORT",12
+    return None,0
+
 def pivot_levels(df,left=3,right=3):
-    highs=[]; lows=[]
-    h=df["high"].to_numpy(); l=df["low"].to_numpy()
+    highs=[]; lows=[]; h=df.high.to_numpy(); l=df.low.to_numpy()
     for i in range(left,len(df)-right):
         if h[i]>=np.max(h[i-left:i+right+1]): highs.append((i,h[i]))
         if l[i]<=np.min(l[i-left:i+right+1]): lows.append((i,l[i]))
     return highs,lows
 
 def structure(df):
-    x=df.iloc[-180:].reset_index(drop=True)
-    highs,lows=pivot_levels(x,3,3)
-    rh=highs[-1][1] if highs else x["high"].iloc[-30:].max()
-    rl=lows[-1][1] if lows else x["low"].iloc[-30:].min()
-    return rh,rl
+    x=df.iloc[-180:].reset_index(drop=True); highs,lows=pivot_levels(x)
+    return (highs[-1][1] if highs else x.high.iloc[-30:].max(), lows[-1][1] if lows else x.low.iloc[-30:].min())
 
-def fib_levels(low, high):
-    d=high-low
-    return {"0.236":high-d*.236,"0.382":high-d*.382,"0.5":high-d*.5,"0.618":high-d*.618,"0.786":high-d*.786}
+def fib_levels(low,high):
+    d=high-low; return {"0.236":high-d*.236,"0.382":high-d*.382,"0.5":high-d*.5,"0.618":high-d*.618,"0.786":high-d*.786}
 
-def major_fib(symbol, weekly):
-    lo=os.getenv(f"FIB_{symbol}_LOW")
-    hi=os.getenv(f"FIB_{symbol}_HIGH")
-    if lo and hi:
-        lo=float(lo); hi=float(hi)
-        if hi>lo:
-            return lo,hi,"固定"
-    w=weekly.iloc[-160:]
-    return float(w["low"].min()),float(w["high"].max()),"自動"
+def major_fib(symbol,weekly):
+    lo=os.getenv(f"FIB_{symbol}_LOW"); hi=os.getenv(f"FIB_{symbol}_HIGH")
+    if lo and hi and float(hi)>float(lo): return float(lo),float(hi),"åºå®"
+    w=weekly.iloc[-160:]; return float(w.low.min()),float(w.high.max()),"èªå"
 
 def score_fib(price,candle,levels):
     L=S=0; rl=[]; rs=[]
     for name,lv in levels.items():
         if abs(price-lv)/price<=.008:
             w=12 if name in ("0.382","0.618") else 8 if name=="0.5" else 4
-            if candle["low"]<=lv<=candle["close"] and candle["close"]>candle["open"]:
-                L+=w; rl.append(f"週足Fib{name}反発")
-            if candle["close"]<=lv<=candle["high"] and candle["close"]<candle["open"]:
-                S+=w; rs.append(f"週足Fib{name}拒否")
+            if candle.low<=lv<=candle.close and candle.close>candle.open: L+=w; rl.append(f"é±è¶³Fib{name}åçº")
+            if candle.close<=lv<=candle.high and candle.close<candle.open: S+=w; rs.append(f"é±è¶³Fib{name}æå¦")
     return L,S,rl,rs
 
 def analyze(symbol,frames):
-    W=indicators(frames["1week"])
-    H1=indicators(frames["1hour"])
-    M15=indicators(frames["15min"])
-    c=M15.iloc[-1]; prev=M15.iloc[-2]
-    p=float(c["close"]); L=S=0; rl=[]; rs=[]
+    W,D,H4,H1,M15,M5=[indicators(frames[k]) for k in ("1week","1day","4hour","1hour","15min","5min")]
+    c15,p15,c5=M15.iloc[-1],M15.iloc[-2],M5.iloc[-1]; p=float(c15.close); L=S=0; rl=[]; rs=[]
 
-    states={
-        "週足":trend_state(frames["1week"]),
-        "日足":trend_state(frames["1day"]),
-        "4H":trend_state(frames["4hour"]),
-        "1H":trend_state(frames["1hour"]),
-    }
-    weights={"週足":8,"日足":14,"4H":18,"1H":10}
-    for label,state in states.items():
-        if state=="BULL":
-            L+=weights[label]; rl.append(f"{label}上向き")
-        elif state=="BEAR":
-            S+=weights[label]; rs.append(f"{label}下向き")
+    # 4Hã»1Hã®æ¹å
+    for label,st,w in [("4H",trend_state_ind(H4),20),("1H",trend_state_ind(H1),15)]:
+        if st=="BULL": L+=w; rl.append(f"{label}ä¸åã")
+        elif st=="BEAR": S+=w; rs.append(f"{label}ä¸åã")
 
-    if c["close"]>c["ema12"] and c["ema_slope5"]>0:
-        L+=10; rl.append("15分12EMA上")
-    if c["close"]<c["ema12"] and c["ema_slope5"]<0:
-        S+=10; rs.append("15分12EMA下")
+    # é±è¶³ã»æ¥è¶³ã®é/ç·RCI
+    bias,bpts=higher_rci_bias(W,D)
+    if bias in ("UP","STRONG_UP"): L+=bpts; rl.append("é±è¶³ã»æ¥è¶³ é/ç·RCIä¸åã")
+    elif bias in ("DOWN","STRONG_DOWN"): S+=bpts; rs.append("é±è¶³ã»æ¥è¶³ é/ç·RCIä¸åã")
 
-    if pd.notna(c["rci8"]) and pd.notna(c["rci25"]) and pd.notna(c["rci47"]):
-        if c["rci8"]>prev["rci8"] and c["rci25"]>=prev["rci25"] and c["rci47"]>-80:
-            L+=14; rl.append("15分RCI上向き")
-        if c["rci8"]<prev["rci8"] and c["rci25"]<=prev["rci25"] and c["rci47"]<80:
-            S+=14; rs.append("15分RCI下向き")
-        if c["rci8"]>90:
-            L-=8; rl.append("RCI過熱で追撃減点")
-        if c["rci8"]<-90:
-            S-=8; rs.append("RCI売られすぎで追撃減点")
+    # 15åãã¡ã¤ã³
+    if c15.close>c15.ema12 and c15.ema_slope5>0: L+=12; rl.append("15å12EMAä¸")
+    elif c15.close<c15.ema12 and c15.ema_slope5<0: S+=12; rs.append("15å12EMAä¸")
+    if pd.notna(c15.rci8) and pd.notna(c15.rci25):
+        if c15.rci8>p15.rci8 and c15.rci25>=p15.rci25: L+=8; rl.append("15åRCIç­ä¸­æä¸åã")
+        if c15.rci8<p15.rci8 and c15.rci25<=p15.rci25: S+=8; rs.append("15åRCIç­ä¸­æä¸åã")
 
+    # Musignyå¼: ä¸ä½éç·æ¹å + ä¸ä½èµ¤RCIç«¯ããåè»¢
+    for label,ind,scale in [("4H",H4,1.0),("1H",H1,.9),("15å",M15,.85)]:
+        rev,pts=red_rci_reversal(ind); pts=int(round(pts*scale))
+        if bias in ("UP","STRONG_UP") and rev=="LONG": L+=pts; rl.append(f"{label}èµ¤RCIä¸ç«¯âä¸åãåè»¢")
+        elif bias in ("DOWN","STRONG_DOWN") and rev=="SHORT": S+=pts; rs.append(f"{label}èµ¤RCIä¸ç«¯âä¸åãåè»¢")
+        elif rev=="LONG": L+=3; rl.append(f"{label}èµ¤RCIä¸åãåè»¢(ä¸ä½è¶³ä¸è´ãªã)")
+        elif rev=="SHORT": S+=3; rs.append(f"{label}èµ¤RCIä¸åãåè»¢(ä¸ä½è¶³ä¸è´ãªã)")
+
+    # 5åã¯æçµã¿ã¤ãã³ã°ã®ã¿
+    rev5,_=red_rci_reversal(M5)
+    if bias in ("UP","STRONG_UP") and rev5=="LONG": L+=8; rl.append("5åèµ¤RCIä¸ç«¯âä¸åã(æçµã¿ã¤ãã³ã°)")
+    if bias in ("DOWN","STRONG_DOWN") and rev5=="SHORT": S+=8; rs.append("5åèµ¤RCIä¸ç«¯âä¸åã(æçµã¿ã¤ãã³ã°)")
+    if c5.close>c5.ema12 and c5.ema_slope5>0: L+=3
+    elif c5.close<c5.ema12 and c5.ema_slope5<0: S+=3
+
+    # 1Hæ§é 
     rh,rlow=structure(H1)
-    if p>rh:
-        L+=12; rl.append("1H戻り高値突破")
-    elif p>rlow and abs(p-rlow)/p<.012 and c["close"]>c["open"]:
-        L+=12; rl.append("1H押し安値反発")
+    if p>rh: L+=10; rl.append("1Hæ»ãé«å¤çªç ´")
+    elif p>rlow and abs(p-rlow)/p<.012 and c15.close>c15.open: L+=10; rl.append("1Hæ¼ãå®å¤åçº")
+    if p<rlow: S+=10; rs.append("1Hæ¼ãå®å¤å²ã")
+    elif p<rh and abs(p-rh)/p<.012 and c15.close<c15.open: S+=10; rs.append("1Hæ»ãé«å¤æå¦")
 
-    if p<rlow:
-        S+=12; rs.append("1H押し安値割れ")
-    elif p<rh and abs(p-rh)/p<.012 and c["close"]<c["open"]:
-        S+=12; rs.append("1H戻り高値拒否")
-
-    flo,fhi,fsource=major_fib(symbol,W)
-    fL,fS,frL,frS=score_fib(p,c,fib_levels(flo,fhi))
-    L+=fL; S+=fS; rl+=frL; rs+=frS
-
-    if pd.notna(c["span_a"]) and pd.notna(c["span_b"]):
-        hi=max(c["span_a"],c["span_b"]); lo=min(c["span_a"],c["span_b"])
-        if p>hi:
-            L+=6; rl.append("15分雲上")
-        elif p<lo:
-            S+=6; rs.append("15分雲下")
-
-    if pd.notna(c["vol_ma20"]) and c["volume"]>c["vol_ma20"]*1.25:
-        if c["close"]>c["open"]:
-            L+=5; rl.append("出来高増陽線")
-        elif c["close"]<c["open"]:
-            S+=5; rs.append("出来高増陰線")
+    flo,fhi,fsource=major_fib(symbol,W); fL,fS,frL,frS=score_fib(p,c15,fib_levels(flo,fhi)); L+=fL; S+=fS; rl+=frL; rs+=frS
+    if pd.notna(c15.span_a) and pd.notna(c15.span_b):
+        hi=max(c15.span_a,c15.span_b); lo=min(c15.span_a,c15.span_b)
+        if p>hi: L+=5; rl.append("15åé²ä¸")
+        elif p<lo: S+=5; rs.append("15åé²ä¸")
+    if pd.notna(c15.vol_ma20) and c15.volume>c15.vol_ma20*1.25:
+        if c15.close>c15.open: L+=4; rl.append("åºæ¥é«å¢é½ç·")
+        elif c15.close<c15.open: S+=4; rs.append("åºæ¥é«å¢é°ç·")
 
     side="WAIT"; confidence=max(L,S); reasons=[f"LONG {L}/SHORT {S}",f"Fib={fsource}"]
-    if L>=ENTRY_THRESHOLD and L>=S+OPPOSITE_GAP:
-        side="LONG"; confidence=min(100,L); reasons=rl
-    elif S>=ENTRY_THRESHOLD and S>=L+OPPOSITE_GAP:
-        side="SHORT"; confidence=min(100,S); reasons=rs
+    if L>=ENTRY_THRESHOLD and L>=S+OPPOSITE_GAP: side="LONG"; confidence=min(100,L); reasons=rl
+    elif S>=ENTRY_THRESHOLD and S>=L+OPPOSITE_GAP: side="SHORT"; confidence=min(100,S); reasons=rs
+    candle_id=str(c15.time)
+    if side=="WAIT": return Analysis(symbol,side,L,S,confidence,p,None,None,None,None,None,None,reasons,"æ¡ä»¶ä¸è¶³",candle_id,float(c15.high),float(c15.low))
 
-    candle_id=str(c["time"])
-    if side=="WAIT":
-        return Analysis(symbol,side,L,S,confidence,p,None,None,None,None,None,None,reasons,"条件不足",candle_id,float(c["high"]),float(c["low"]))
-
-    atr=float(H1["atr"].iloc[-1])
-    if not math.isfinite(atr) or atr<=0:
-        atr=p*.012
-
+    atr=float(H1.atr.iloc[-1]); atr=atr if math.isfinite(atr) and atr>0 else p*.012
     if side=="LONG":
-        entry_high=p-.08*atr
-        entry_low=p-.32*atr
-        stop=min(entry_low-.75*atr,rlow-.15*atr)
-        mid=(entry_low+entry_high)/2
-        risk=max(mid-stop,p*.003)
-        tp1=mid+1.4*risk; tp2=mid+2.0*risk; tp3=mid+2.8*risk
-        invalid=f"1H押し安値 {rlow:,.4f} 割れ"
+        entry_high=p-.08*atr; entry_low=p-.32*atr; stop=min(entry_low-.75*atr,rlow-.15*atr); mid=(entry_low+entry_high)/2; risk=max(mid-stop,p*.003)
+        tp1,tp2,tp3=mid+1.4*risk,mid+2.0*risk,mid+2.8*risk; invalid=f"1Hæ¼ãå®å¤ {rlow:,.4f} å²ã"
     else:
-        entry_low=p+.08*atr
-        entry_high=p+.32*atr
-        stop=max(entry_high+.75*atr,rh+.15*atr)
-        mid=(entry_low+entry_high)/2
-        risk=max(stop-mid,p*.003)
-        tp1=mid-1.4*risk; tp2=mid-2.0*risk; tp3=mid-2.8*risk
-        invalid=f"1H戻り高値 {rh:,.4f} 上抜け"
-
-    return Analysis(symbol,side,L,S,confidence,p,entry_low,entry_high,stop,tp1,tp2,tp3,reasons,invalid,candle_id,float(c["high"]),float(c["low"]))
+        entry_low=p+.08*atr; entry_high=p+.32*atr; stop=max(entry_high+.75*atr,rh+.15*atr); mid=(entry_low+entry_high)/2; risk=max(stop-mid,p*.003)
+        tp1,tp2,tp3=mid-1.4*risk,mid-2.0*risk,mid-2.8*risk; invalid=f"1Hæ»ãé«å¤ {rh:,.4f} ä¸æã"
+    return Analysis(symbol,side,L,S,confidence,p,entry_low,entry_high,stop,tp1,tp2,tp3,reasons,invalid,candle_id,float(c15.high),float(c15.low))
 
 def load_state():
     if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except:
-            pass
-    return {
-        "paper_balance":PAPER_BALANCE_DEFAULT,
-        "position":None,
-        "pending":None,
-        "last_notified":None,
-        "daily_date":None,
-        "daily_start_balance":PAPER_BALANCE_DEFAULT,
-        "consecutive_losses":0
-    }
+        try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except: pass
+    return {"paper_balance":PAPER_BALANCE_DEFAULT,"position":None,"pending":None,"last_notified":None,"daily_date":None,"daily_start_balance":PAPER_BALANCE_DEFAULT,"consecutive_losses":0}
 
-def save_state(s):
-    STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding="utf-8")
+def save_state(s): STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding="utf-8")
 
 def can_open(state):
     jst=now_jst().date().isoformat()
-    if state.get("daily_date")!=jst:
-        state["daily_date"]=jst
-        state["daily_start_balance"]=state["paper_balance"]
-        state["consecutive_losses"]=0
+    if state.get("daily_date")!=jst: state["daily_date"]=jst; state["daily_start_balance"]=state["paper_balance"]; state["consecutive_losses"]=0
     dd=(state["paper_balance"]-state["daily_start_balance"])/max(state["daily_start_balance"],1)
-    if dd<=-MAX_DAILY_LOSS_PCT:
-        return False,"1日最大損失到達"
-    if state.get("consecutive_losses",0)>=MAX_CONSECUTIVE_LOSSES:
-        return False,"3連敗停止"
-    if state.get("position"):
-        return False,"ポジション保有中"
+    if dd<=-MAX_DAILY_LOSS_PCT: return False,"1æ¥æå¤§æå¤±å°é"
+    if state.get("consecutive_losses",0)>=MAX_CONSECUTIVE_LOSSES: return False,"3é£æåæ­¢"
+    if state.get("position"): return False,"ãã¸ã·ã§ã³ä¿æä¸­"
     return True,"OK"
 
 def record_trade(row):
     exists=TRADES_FILE.exists()
     with TRADES_FILE.open("a",newline="",encoding="utf-8") as f:
         w=csv.writer(f)
-        if not exists:
-            w.writerow(["time","symbol","side","entry","exit","qty_closed","pnl","balance","event"])
+        if not exists: w.writerow(["time","symbol","side","entry","exit","qty_closed","pnl","balance","event"])
         w.writerow(row)
 
-def touch_zone(pending, high, low):
-    lo=min(pending["entry_low"],pending["entry_high"])
-    hi=max(pending["entry_low"],pending["entry_high"])
-    return high>=lo and low<=hi
+def touch_zone(pending,high,low):
+    lo=min(pending["entry_low"],pending["entry_high"]); hi=max(pending["entry_low"],pending["entry_high"]); return high>=lo and low<=hi
 
 def make_position(state,p):
-    mid=(p["entry_low"]+p["entry_high"])/2
-    risk_per_unit=abs(mid-p["stop"])
-    risk_yen=state["paper_balance"]*RISK_PCT
-    qty=risk_yen/max(risk_per_unit,1e-12)
-    qty=min(qty,(state["paper_balance"]*2)/mid)
-    state["position"]={
-        "symbol":p["symbol"],"side":p["side"],"entry":mid,
-        "qty_initial":qty,"qty_remaining":qty,
-        "stop":p["stop"],"original_stop":p["stop"],
-        "tp1":p["tp1"],"tp2":p["tp2"],"tp3":p["tp3"],
-        "tp1_done":False,"tp2_done":False,"tp3_done":False,
-        "realized_pnl":0.0,
-        "opened_at":now_utc().isoformat()
-    }
-    return f"🎯 仮想約定 {p['symbol']} {p['side']}\n約定: {mid:,.4f}\n数量: {qty:.8f}"
+    mid=(p["entry_low"]+p["entry_high"])/2; risk_per_unit=abs(mid-p["stop"]); risk_yen=state["paper_balance"]*RISK_PCT
+    qty=min(risk_yen/max(risk_per_unit,1e-12),(state["paper_balance"]*2)/mid)
+    state["position"]={"symbol":p["symbol"],"side":p["side"],"entry":mid,"qty_initial":qty,"qty_remaining":qty,"stop":p["stop"],"original_stop":p["stop"],"tp1":p["tp1"],"tp2":p["tp2"],"tp3":p["tp3"],"tp1_done":False,"tp2_done":False,"tp3_done":False,"realized_pnl":0.0,"opened_at":now_utc().isoformat()}
+    return f"ð¯ ä»®æ³ç´å® {p['symbol']} {p['side']}\nä¿¡é ¼åº¦: {p['confidence']}/100\nç´å®: {mid:,.4f}\næ°é: {qty:.8f}"
 
-def manage_pending(state, analyses):
+def manage_pending(state,analyses):
     p=state.get("pending")
-    if not p:
-        return None
-    created=datetime.fromisoformat(p["created_at"])
-    if now_utc()-created>timedelta(hours=PENDING_EXPIRE_HOURS):
-        msg=f"⌛ {p['symbol']} {p['side']}候補失効（{PENDING_EXPIRE_HOURS}時間未約定）"
-        state["pending"]=None
-        return msg
+    if not p: return None
+    if now_utc()-datetime.fromisoformat(p["created_at"])>timedelta(hours=PENDING_EXPIRE_HOURS): state["pending"]=None; return f"â {p['symbol']} {p['side']}åè£å¤±å¹"
     a=next((x for x in analyses if x.symbol==p["symbol"]),None)
-    if not a:
-        return None
-    # シナリオ崩れ
-    if p["side"]=="LONG" and a.candle_low<=p["stop"]:
-        state["pending"]=None
-        return f"❌ {p['symbol']} LONG候補取消：エントリー前に無効ライン到達"
-    if p["side"]=="SHORT" and a.candle_high>=p["stop"]:
-        state["pending"]=None
-        return f"❌ {p['symbol']} SHORT候補取消：エントリー前に無効ライン到達"
-    if touch_zone(p,a.candle_high,a.candle_low):
-        msg=make_position(state,p)
-        state["pending"]=None
-        return msg
+    if not a: return None
+    if p["side"]=="LONG" and a.candle_low<=p["stop"]: state["pending"]=None; return f"â {p['symbol']} LONGåè£åæ¶"
+    if p["side"]=="SHORT" and a.candle_high>=p["stop"]: state["pending"]=None; return f"â {p['symbol']} SHORTåè£åæ¶"
+    if touch_zone(p,a.candle_high,a.candle_low): msg=make_position(state,p); state["pending"]=None; return msg
     return None
 
-def manage_position(state, analyses):
+def manage_position(state,analyses):
     pos=state.get("position")
-    if not pos:
-        return []
+    if not pos: return []
     a=next((x for x in analyses if x.symbol==pos["symbol"]),None)
-    if not a:
-        return []
-    high,low=a.candle_high,a.candle_low
-    side=pos["side"]; msgs=[]
-
-    def tp_hit(level):
-        return high>=level if side=="LONG" else low<=level
-
-    def stop_hit(level):
-        return low<=level if side=="LONG" else high>=level
-
-    # 同一足でSTOPとTPが両方触れた場合は保守的にSTOP優先
+    if not a: return []
+    high,low,side=a.candle_high,a.candle_low,pos["side"]; msgs=[]
+    tp_hit=lambda level: high>=level if side=="LONG" else low<=level
+    stop_hit=lambda level: low<=level if side=="LONG" else high>=level
     if stop_hit(pos["stop"]):
-        q=max(pos["qty_remaining"],0)
-        pnl=(pos["stop"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["stop"])*q
-        pos["realized_pnl"]+=pnl
-        state["paper_balance"]+=pos["realized_pnl"]
-        state["consecutive_losses"]=state.get("consecutive_losses",0)+1 if pos["realized_pnl"]<0 else 0
+        q=max(pos["qty_remaining"],0); pnl=(pos["stop"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["stop"])*q
+        pos["realized_pnl"]+=pnl; state["paper_balance"]+=pos["realized_pnl"]; state["consecutive_losses"]=state.get("consecutive_losses",0)+1 if pos["realized_pnl"]<0 else 0
         record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["stop"],q,pnl,state["paper_balance"],"STOP_END"])
-        msgs.append(
-            f"🛑 {pos['symbol']} STOP\n"
-            f"TP1: {'済' if pos['tp1_done'] else '未'} / TP2: {'済' if pos['tp2_done'] else '未'}\n"
-            f"最終損益: {pos['realized_pnl']:+,.0f}円\n残高: {state['paper_balance']:,.0f}円"
-        )
-        state["position"]=None
-        return msgs
-
+        msgs.append(f"ð {pos['symbol']} STOP\næçµæç: {pos['realized_pnl']:+,.0f}å\næ®é«: {state['paper_balance']:,.0f}å"); state["position"]=None; return msgs
     if not pos["tp1_done"] and tp_hit(pos["tp1"]):
-        q=pos["qty_initial"]*TP1_PCT
-        pnl=(pos["tp1"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp1"])*q
-        pos["qty_remaining"]-=q; pos["realized_pnl"]+=pnl; pos["tp1_done"]=True
-        pos["stop"]=pos["entry"]  # 建値へ
-        record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp1"],q,pnl,state["paper_balance"],"TP1"])
-        msgs.append(f"✅ {pos['symbol']} TP1 30%利確: {pnl:+,.0f}円\nSTOPを建値へ移動")
-
+        q=pos["qty_initial"]*TP1_PCT; pnl=(pos["tp1"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp1"])*q
+        pos["qty_remaining"]-=q; pos["realized_pnl"]+=pnl; pos["tp1_done"]=True; pos["stop"]=pos["entry"]; record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp1"],q,pnl,state["paper_balance"],"TP1"]); msgs.append(f"â {pos['symbol']} TP1 30%å©ç¢º: {pnl:+,.0f}å\nSTOPãå»ºå¤ã¸ç§»å")
     if not pos["tp2_done"] and tp_hit(pos["tp2"]):
-        q=pos["qty_initial"]*TP2_PCT
-        pnl=(pos["tp2"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp2"])*q
-        pos["qty_remaining"]-=q; pos["realized_pnl"]+=pnl; pos["tp2_done"]=True
-        pos["stop"]=pos["tp1"]  # TP1まで利益保護
-        record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp2"],q,pnl,state["paper_balance"],"TP2"])
-        msgs.append(f"✅ {pos['symbol']} TP2 40%利確: {pnl:+,.0f}円\nSTOPをTP1へ移動")
-
+        q=pos["qty_initial"]*TP2_PCT; pnl=(pos["tp2"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp2"])*q
+        pos["qty_remaining"]-=q; pos["realized_pnl"]+=pnl; pos["tp2_done"]=True; pos["stop"]=pos["tp1"]; record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp2"],q,pnl,state["paper_balance"],"TP2"]); msgs.append(f"â {pos['symbol']} TP2 40%å©ç¢º: {pnl:+,.0f}å\nSTOPãTP1ã¸ç§»å")
     if not pos["tp3_done"] and tp_hit(pos["tp3"]):
-        q=max(pos["qty_remaining"],0)
-        pnl=(pos["tp3"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp3"])*q
-        pos["realized_pnl"]+=pnl
-        state["paper_balance"]+=pos["realized_pnl"]
-        state["consecutive_losses"]=0
-        record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp3"],q,pnl,state["paper_balance"],"TP3_END"])
-        msgs.append(f"🏁 {pos['symbol']} TP3到達\n最終損益: {pos['realized_pnl']:+,.0f}円\n残高: {state['paper_balance']:,.0f}円")
-        state["position"]=None
+        q=max(pos["qty_remaining"],0); pnl=(pos["tp3"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp3"])*q
+        pos["realized_pnl"]+=pnl; state["paper_balance"]+=pos["realized_pnl"]; state["consecutive_losses"]=0; record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp3"],q,pnl,state["paper_balance"],"TP3_END"]); msgs.append(f"ð {pos['symbol']} TP3å°é\næçµæç: {pos['realized_pnl']:+,.0f}å\næ®é«: {state['paper_balance']:,.0f}å"); state["position"]=None
     return msgs
 
 def log_signals(analyses):
     exists=SIGNALS_FILE.exists()
     with SIGNALS_FILE.open("a",newline="",encoding="utf-8") as f:
         w=csv.writer(f)
-        if not exists:
-            w.writerow(["time","symbol","side","long","short","confidence","price"])
-        for a in analyses:
-            w.writerow([now_utc().isoformat(),a.symbol,a.side,a.score_long,a.score_short,a.confidence,a.price])
+        if not exists: w.writerow(["time","symbol","side","long","short","confidence","price"])
+        for a in analyses: w.writerow([now_utc().isoformat(),a.symbol,a.side,a.score_long,a.score_short,a.confidence,a.price])
 
 def rank_text(analyses):
-    ranking=sorted(analyses,key=lambda a:a.confidence,reverse=True)
-    icons=["🥇","🥈","🥉","4️⃣"]
-    return "\n".join(
-        f"{icons[i]} {a.symbol}: {a.side if a.side!='WAIT' else '見送り'} {a.confidence}点"
-        for i,a in enumerate(ranking)
-    )
+    ranking=sorted(analyses,key=lambda a:a.confidence,reverse=True); icons=["ð¥","ð¥","ð¥","4ï¸â£"]
+    return "\n".join(f"{icons[i]} {a.symbol}: {a.side if a.side!='WAIT' else 'è¦éã'} {a.confidence}ç¹" for i,a in enumerate(ranking))
 
 def choose_winner(analyses):
     valid=[a for a in analyses if a.side!="WAIT" and a.confidence>=ENTRY_THRESHOLD]
-    if not valid:
-        return None
-    valid=sorted(valid,key=lambda a:a.confidence,reverse=True)
-    if len(valid)>=2 and valid[0].confidence-valid[1].confidence<WINNER_GAP:
-        return None
-    return valid[0]
+    return sorted(valid,key=lambda a:a.confidence,reverse=True)[0] if valid else None
 
 def create_pending(state,a):
-    state["pending"]={
-        "symbol":a.symbol,"side":a.side,"confidence":a.confidence,
-        "entry_low":a.entry_low,"entry_high":a.entry_high,
-        "stop":a.stop,"tp1":a.tp1,"tp2":a.tp2,"tp3":a.tp3,
-        "created_at":now_utc().isoformat(),"candle_id":a.candle_id
-    }
+    state["pending"]={"symbol":a.symbol,"side":a.side,"confidence":a.confidence,"entry_low":a.entry_low,"entry_high":a.entry_high,"stop":a.stop,"tp1":a.tp1,"tp2":a.tp2,"tp3":a.tp3,"created_at":now_utc().isoformat(),"candle_id":a.candle_id}
 
 def notify(text):
     print(text,flush=True)
     if NTFY_TOPIC:
-        r=requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=text.encode("utf-8"),
-            headers={"Title":"Musigny 4-Crypto BOT v4"},
-            timeout=15
-        )
-        r.raise_for_status()
+        r=requests.post(f"https://ntfy.sh/{NTFY_TOPIC}",data=text.encode("utf-8"),headers={"Title":"Musigny 4-Crypto BOT v5"},timeout=15); r.raise_for_status()
 
 def fmt_candidate(a,ranking,state):
-    icon="🟢" if a.side=="LONG" else "🔴"
-    return (
-        f"{icon} 本命候補 {a.symbol} {a.side} {a.confidence}/100\n"
-        f"{ranking}\n\n"
-        f"現在値: {a.price:,.4f}\n"
-        f"待機エントリー帯: {min(a.entry_low,a.entry_high):,.4f}〜{max(a.entry_low,a.entry_high):,.4f}\n"
-        f"STOP: {a.stop:,.4f}\n"
-        f"TP1(30%): {a.tp1:,.4f}\nTP2(40%): {a.tp2:,.4f}\nTP3(30%): {a.tp3:,.4f}\n"
-        f"無効条件: {a.invalidation}\n"
-        f"根拠: {' / '.join(a.reasons[:7])}\n"
-        f"※まだ未約定。エントリー帯到達で仮想約定\n"
-        f"仮想残高: {state['paper_balance']:,.0f}円"
-    )
+    strength="ð¥å¼·ã·ã°ãã«" if a.confidence>=STRONG_THRESHOLD else "åè£"
+    return f"{strength} {a.symbol} {a.side} {a.confidence}/100\n{ranking}\nç¾å¨å¤: {a.price:,.4f}\nå¾æ©ã¨ã³ããªã¼å¸¯: {min(a.entry_low,a.entry_high):,.4f}ã{max(a.entry_low,a.entry_high):,.4f}\nSTOP: {a.stop:,.4f}\nTP1: {a.tp1:,.4f} / TP2: {a.tp2:,.4f} / TP3: {a.tp3:,.4f}\næ ¹æ : {' / '.join(a.reasons[:10])}\nâ»åè£éç¥ã¯ntfyã«éããã­ã°ã®ã¿"
 
 def main():
-    analyses=[]
+    analyses=[]; failed_symbols=[]
     for symbol in SYMBOLS:
-        frames={
-            "15min":drop_open_candle(fetch_intraday(symbol,"15min",5)),
-            "1hour":drop_open_candle(fetch_intraday(symbol,"1hour",20)),
-            "4hour":drop_open_candle(fetch_yearly(symbol,"4hour",2)),
-            "1day":drop_open_candle(fetch_yearly(symbol,"1day",3)),
-            "1week":drop_open_candle(fetch_yearly(symbol,"1week",4)),
-        }
-        analyses.append(analyze(symbol,frames))
-
-    log_signals(analyses)
+        try:
+            frames={
+                "5min":drop_open_candle(fetch_intraday(symbol,"5min",3,extra_days=7,min_rows=80)),
+                "15min":drop_open_candle(fetch_intraday(symbol,"15min",5,extra_days=10,min_rows=80)),
+                "1hour":drop_open_candle(fetch_intraday(symbol,"1hour",20,extra_days=12,min_rows=120)),
+                "4hour":drop_open_candle(fetch_yearly(symbol,"4hour",2,extra_years=1)),
+                "1day":drop_open_candle(fetch_yearly(symbol,"1day",3,extra_years=1)),
+                "1week":drop_open_candle(fetch_yearly(symbol,"1week",4,extra_years=1))
+            }
+            required={"5min":55,"15min":55,"1hour":55,"4hour":55,"1day":55,"1week":50}
+            short=[f"{tf}:{len(frames[tf])}æ¬" for tf,n in required.items() if len(frames[tf])<n]
+            if short: raise RuntimeError(f"{symbol} ãã¼ã¿ä¸è¶³ "+", ".join(short))
+            analyses.append(analyze(symbol,frames))
+        except Exception as e:
+            failed_symbols.append(symbol)
+            print(f"[DATA-SKIP] {symbol}: ä»åã®å¤å®ãã¹ã­ãã ({e})",flush=True)
     state=load_state()
-
-    # 1) 保有中ポジション管理
-    for m in manage_position(state,analyses):
-        notify("📊 "+m)
-
-    # 2) 待機中候補の約定 / 失効
-    # ntfy通知は「実際の仮想売買が発生した時だけ」。
-    # 候補失効・候補取消はGitHub Actionsログだけに残す。
+    if not analyses:
+        print("[DATA-WAIT] å¨éæã®åæãã¼ã¿åå¾å¤±æãå£²è²·ããæ¬¡åãã§ãã¯ã¸ã",flush=True)
+        save_state(state); return
+    if failed_symbols: print("[DATA-INFO] ä»åã¹ã­ãã: "+", ".join(failed_symbols),flush=True)
+    log_signals(analyses)
+    for m in manage_position(state,analyses): notify("ð "+m)
     if not state.get("position"):
         msg=manage_pending(state,analyses)
         if msg:
-            if msg.startswith("🎯 仮想約定"):
-                notify(msg)
-            else:
-                print(msg, flush=True)
-
-    # 3) ポジションも待機候補も無ければ新候補選定
+            if msg.startswith("ð¯ ä»®æ³ç´å®"): notify(msg)
+            else: print(msg,flush=True)
     if not state.get("position") and not state.get("pending"):
-        winner=choose_winner(analyses)
-        ranking=rank_text(analyses)
+        winner=choose_winner(analyses); ranking=rank_text(analyses)
         if winner:
             key=hashlib.sha1(f"{winner.symbol}:{winner.candle_id}:{winner.side}".encode()).hexdigest()[:16]
             if state.get("last_notified")!=key:
                 ok,why=can_open(state)
-                if ok:
-                    create_pending(state,winner)
-                    # 候補発生は通知しない。GitHub Actionsログだけに表示。
-                    print(fmt_candidate(winner,ranking,state), flush=True)
-                    state["last_notified"]=key
-                else:
-                    print("新規停止:",why)
-            else:
-                print(ranking)
-        else:
-            print("全銘柄見送り、または1位と2位の差が小さいため見送り")
-            print(ranking)
+                if ok: create_pending(state,winner); print(fmt_candidate(winner,ranking,state),flush=True); state["last_notified"]=key
+                else: print("æ°è¦åæ­¢:",why)
+            else: print(ranking)
+        else: print("å¨éæè¦éã"); print(ranking)
     else:
-        if state.get("position"):
-            print("仮想ポジション保有中:",state["position"]["symbol"])
-        elif state.get("pending"):
-            print("待機候補あり:",state["pending"]["symbol"])
-
+        if state.get("position"): print("ä»®æ³ãã¸ã·ã§ã³ä¿æä¸­:",state["position"]["symbol"])
+        elif state.get("pending"): print("å¾æ©åè£ãã:",state["pending"]["symbol"])
     save_state(state)
 
-if __name__=="__main__":
-    main()
+if __name__=="__main__": main()
