@@ -1,19 +1,26 @@
 {
   "paper_balance": 100958.17502504899,
-  "position": null,
-  "pending": {
+  "position": {
     "symbol": "ETH",
     "side": "LONG",
-    "confidence": 60,
-    "entry_low": 386998.8742857143,
-    "entry_high": 387225.46857142856,
+    "entry": 387112.17142857146,
+    "qty_initial": 0.18500479724166918,
+    "qty_remaining": 0.18500479724166918,
     "stop": 383019.3785714286,
+    "original_stop": 383019.3785714286,
+    "initial_risk": 4092.792857142864,
     "tp1": 391204.9642857143,
     "tp2": 393251.36071428575,
     "tp3": 396116.31571428577,
-    "created_at": "2026-09-05T18:47:18.357710+00:00",
-    "candle_id": "2026-09-05 18:30:00+00:00"
+    "tp1_done": false,
+    "tp2_done": false,
+    "tp3_done": false,
+    "realized_pnl": 0.0,
+    "opened_at": "2026-09-05T18:53:26.282676+00:00",
+    "max_r": 0.0,
+    "exit_logic": "FX_STYLE_V2"
   },
+  "pending": null,
   "last_notified": "8f15096f83a389fd",
   "daily_date": "2026-09-06",
   "daily_start_balance": 100231.03947470934,
