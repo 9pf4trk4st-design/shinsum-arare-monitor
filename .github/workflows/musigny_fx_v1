@@ -1,0 +1,74 @@
+name: Musigny FX Paper Bot v1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: musigny-fx-paper-bot-v1
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy
+
+      - name: Run FX bot every 5 minutes
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PYTHONUNBUFFERED: "1"
+
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for i in $(seq 1 12); do
+            echo "========================================"
+            echo "Musigny FX check $i / 12"
+            date -u
+            echo "========================================"
+
+            python musigny_fx_bot.py || true
+
+            git add fx_state/ 2>/dev/null || true
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Update Musigny FX paper state"
+              git pull --rebase origin main || true
+              git push origin HEAD:main || true
+            else
+              echo "No FX state changes"
+            fi
+
+            if [ "$i" -lt 12 ]; then
+              echo "Next FX check in 5 minutes..."
+              sleep 300
+            fi
+          done
+
+      - name: Start next monitoring cycle
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+          gh workflow run musigny_fx_v1.yml --ref main
