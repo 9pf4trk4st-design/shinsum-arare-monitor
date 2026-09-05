@@ -1,19 +1,26 @@
 {
   "paper_balance": 100231.03947470934,
-  "position": null,
-  "pending": {
+  "position": {
     "symbol": "BTC",
     "side": "LONG",
-    "confidence": 76,
-    "entry_low": 12466426.234285714,
-    "entry_high": 12470007.308571428,
+    "entry": 12468216.77142857,
+    "qty_initial": 0.016077846786301128,
+    "qty_remaining": 0.016077846786301128,
     "stop": 12433261.82857143,
+    "original_stop": 12433261.82857143,
+    "initial_risk": 34954.942857140675,
     "tp1": 12505630.37442857,
     "tp2": 12524337.17592857,
     "tp3": 12550526.69802857,
-    "created_at": "2026-09-05T15:21:12.761820+00:00",
-    "candle_id": "2026-09-05 15:00:00+00:00"
+    "tp1_done": false,
+    "tp2_done": false,
+    "tp3_done": false,
+    "realized_pnl": 0.0,
+    "opened_at": "2026-09-05T15:27:16.649331+00:00",
+    "max_r": 0.0,
+    "exit_logic": "FX_STYLE_V2"
   },
+  "pending": null,
   "last_notified": "02fd7e55e8433235",
   "daily_date": "2026-09-06",
   "daily_start_balance": 100231.03947470934,
