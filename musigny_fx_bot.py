@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Musigny FX Paper Bot v1 - PAPER ONLY
+# Musigny FX Paper Bot v2 - PAPER ONLY
+# Exit strengthened / max leverage 5x
 
 from __future__ import annotations
 import csv, hashlib, json, math, os, time
@@ -18,11 +19,23 @@ STATE_DIR=Path(os.getenv('FX_STATE_DIR','fx_state')); STATE_DIR.mkdir(parents=Tr
 STATE_FILE=STATE_DIR/'bot_state.json'; TRADES_FILE=STATE_DIR/'paper_trades.csv'; SIGNALS_FILE=STATE_DIR/'signal_log.csv'; WEEKLY_REVIEW=STATE_DIR/'weekly_review.json'
 EVENT_FILE=Path(os.getenv('FX_EVENT_FILE','fx_events.json')); NEWS_FILE=Path(os.getenv('FX_NEWS_FILE','fx_news_flags.json'))
 NTFY_TOPIC=os.getenv('NTFY_TOPIC','')
+
 ENTRY_THRESHOLD=int(os.getenv('FX_ENTRY_THRESHOLD','62')); STRONG_THRESHOLD=int(os.getenv('FX_STRONG_THRESHOLD','72')); OPPOSITE_GAP=int(os.getenv('FX_OPPOSITE_GAP','10'))
 PAPER_BALANCE_DEFAULT=float(os.getenv('FX_PAPER_BALANCE','100000')); RISK_PCT=float(os.getenv('FX_RISK_PCT','0.0075'))
 MAX_DAILY_LOSS_PCT=float(os.getenv('FX_MAX_DAILY_LOSS_PCT','0.03')); MAX_CONSECUTIVE_LOSSES=int(os.getenv('FX_MAX_CONSECUTIVE_LOSSES','3'))
-MIN_RR=float(os.getenv('FX_MIN_RR','1.5')); PENDING_EXPIRE_HOURS=int(os.getenv('FX_PENDING_EXPIRE_HOURS','8')); EVENT_BLACKOUT_MINUTES=int(os.getenv('FX_EVENT_BLACKOUT_MINUTES','30'))
+MAX_LEVERAGE=float(os.getenv('FX_MAX_LEVERAGE','5'))
+
+MIN_RR=float(os.getenv('FX_MIN_RR','1.0')); PENDING_EXPIRE_HOURS=int(os.getenv('FX_PENDING_EXPIRE_HOURS','8')); EVENT_BLACKOUT_MINUTES=int(os.getenv('FX_EVENT_BLACKOUT_MINUTES','30'))
 RCI_PERIODS=(8,25,47); TP1_PCT=.30; TP2_PCT=.40
+
+TP1_R=float(os.getenv('FX_TP1_R','1.0'))
+TP2_R=float(os.getenv('FX_TP2_R','1.5'))
+TP3_R=float(os.getenv('FX_TP3_R','2.2'))
+REVIEW_HOURS=float(os.getenv('FX_REVIEW_HOURS','8'))
+MAX_HOLD_HOURS=float(os.getenv('FX_MAX_HOLD_HOURS','12'))
+TRAIL_START_R=float(os.getenv('FX_TRAIL_START_R','1.5'))
+TRAIL_GIVEBACK_R=float(os.getenv('FX_TRAIL_GIVEBACK_R','0.6'))
+REVIEW_CLOSE_R=float(os.getenv('FX_REVIEW_CLOSE_R','0.3'))
 
 @dataclass
 class Analysis:
@@ -224,9 +237,14 @@ def analyze(sym,fs,cn):
     if side=='WAIT':return Analysis(sym,side,L,S,conf,p,None,None,None,None,None,None,None,None,reasons,[],cid,float(c['high']),float(c['low']),zone,sr,cn)
     atr=float(H1['atr'].iloc[-1]); atr=atr if math.isfinite(atr) and atr>0 else p*.002
     if side=='LONG':
-        eh=p-.10*atr; el=p-.35*atr; stop=min(el-.80*atr,(ds-.25*atr if ds else el-.80*atr)); mid=(el+eh)/2; risk=max(mid-stop,p*.0008); t1=mid+1.5*risk;t2=mid+2.1*risk;t3=mid+3*risk
+        eh=p-.10*atr; el=p-.35*atr; stop=min(el-.80*atr,(ds-.25*atr if ds else el-.80*atr)); mid=(el+eh)/2
     else:
-        el=p+.10*atr; eh=p+.35*atr; stop=max(eh+.80*atr,(dr+.25*atr if dr else eh+.80*atr)); mid=(el+eh)/2; risk=max(stop-mid,p*.0008); t1=mid-1.5*risk;t2=mid-2.1*risk;t3=mid-3*risk
+        el=p+.10*atr; eh=p+.35*atr; stop=max(eh+.80*atr,(dr+.25*atr if dr else eh+.80*atr)); mid=(el+eh)/2
+    risk=max(abs(mid-stop),p*.0008)
+    if side=='LONG':
+        t1=mid+TP1_R*risk;t2=mid+TP2_R*risk;t3=mid+TP3_R*risk
+    else:
+        t1=mid-TP1_R*risk;t2=mid-TP2_R*risk;t3=mid-TP3_R*risk
     rr1=abs(t1-mid)/abs(mid-stop);rr2=abs(t2-mid)/abs(mid-stop)
     if rr1<MIN_RR:return Analysis(sym,'WAIT',L,S,conf,p,None,None,None,None,None,None,rr1,rr2,reasons,counter+[f'RR_LOW={rr1:.2f}'],cid,float(c['high']),float(c['low']),zone,sr,cn)
     return Analysis(sym,side,L,S,conf,p,el,eh,stop,t1,t2,t3,rr1,rr2,reasons,counter,cid,float(c['high']),float(c['low']),zone,sr,cn)
@@ -240,7 +258,7 @@ def load_state():
 def save_state(s):STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding='utf-8')
 def notify(t):
     print(t,flush=True)
-    if NTFY_TOPIC:requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',data=t.encode('utf-8'),headers={'Title':'Musigny FX Paper Bot'},timeout=15).raise_for_status()
+    if NTFY_TOPIC:requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',data=t.encode('utf-8'),headers={'Title':'Musigny FX Paper Bot v2'},timeout=15).raise_for_status()
 
 def can_open(s):
     d=now_jst().date().isoformat()
@@ -253,15 +271,35 @@ def can_open(s):
 
 def create_pending(s,a):s['pending']={'symbol':a.symbol,'side':a.side,'confidence':a.confidence,'entry_low':a.entry_low,'entry_high':a.entry_high,'stop':a.stop,'tp1':a.tp1,'tp2':a.tp2,'tp3':a.tp3,'rr1':a.rr1,'rr2':a.rr2,'created_at':now_utc().isoformat(),'reasons':a.reasons[:10],'counter':a.counter[:10]}
 def touch(p,h,l):return h>=min(p['entry_low'],p['entry_high']) and l<=max(p['entry_low'],p['entry_high'])
-def make_pos(s,p):
-    e=(p['entry_low']+p['entry_high'])/2; qty=s['paper_balance']*RISK_PCT/max(abs(e-p['stop']),1e-12); s['position']={'symbol':p['symbol'],'side':p['side'],'entry':e,'qty_initial':qty,'qty_remaining':qty,'stop':p['stop'],'tp1':p['tp1'],'tp2':p['tp2'],'tp3':p['tp3'],'tp1_done':False,'tp2_done':False,'realized_pnl':0.0}; s['pending']=None; return f'FX PAPER OPEN {p["symbol"]} {p["side"]}\nEntry {e:.5f}\nSTOP {p["stop"]:.5f}\nTP1 {p["tp1"]:.5f} TP2 {p["tp2"]:.5f} TP3 {p["tp3"]:.5f}'
 
-def manage_pending(s,analyses):
+def quote_to_jpy(sym,tickers):
+    quote=sym.split('_')[1]
+    if quote=='JPY': return 1.0
+    if quote=='USD':
+        t=tickers.get('USD_JPY')
+        if t:return float(t['bid'])
+    return 1.0
+
+def max_qty_by_leverage(sym,entry,balance,tickers):
+    q2j=quote_to_jpy(sym,tickers)
+    max_notional_jpy=balance*MAX_LEVERAGE
+    return max_notional_jpy/max(entry*q2j,1e-12)
+
+def make_pos(s,p,tickers):
+    e=(p['entry_low']+p['entry_high'])/2
+    risk_qty=s['paper_balance']*RISK_PCT/max(abs(e-p['stop']),1e-12)
+    lev_qty=max_qty_by_leverage(p['symbol'],e,s['paper_balance'],tickers)
+    qty=min(risk_qty,lev_qty)
+    s['position']={'symbol':p['symbol'],'side':p['side'],'entry':e,'qty_initial':qty,'qty_remaining':qty,'stop':p['stop'],'original_stop':p['stop'],'initial_risk':abs(e-p['stop']),'tp1':p['tp1'],'tp2':p['tp2'],'tp3':p['tp3'],'tp1_done':False,'tp2_done':False,'realized_pnl':0.0,'opened_at':now_utc().isoformat(),'max_r':0.0}
+    s['pending']=None
+    return f'FX PAPER OPEN {p["symbol"]} {p["side"]}\nEntry {e:.5f}\nSTOP {p["stop"]:.5f}\nTP1 {p["tp1"]:.5f} TP2 {p["tp2"]:.5f} TP3 {p["tp3"]:.5f}\nMax leverage {MAX_LEVERAGE:.1f}x'
+
+def manage_pending(s,analyses,tickers):
     p=s.get('pending')
     if not p:return None
     if now_utc()-datetime.fromisoformat(p['created_at'])>timedelta(hours=PENDING_EXPIRE_HOURS):s['pending']=None;return None
     a=next((x for x in analyses if x.symbol==p['symbol']),None)
-    if a and touch(p,a.high,a.low):return make_pos(s,p)
+    if a and touch(p,a.high,a.low):return make_pos(s,p,tickers)
     return None
 
 def live_exit_price(sym,side,tickers):
@@ -274,21 +312,62 @@ def record(row):
         if not ex:w.writerow(['time','symbol','side','entry','exit','qty','pnl','balance','event','rule_followed'])
         w.writerow(row)
 
-def manage_position(s,tickers):
-    p=s.get('position'); msgs=[]
+def close_remaining(s,p,px,event,label):
+    q=max(p['qty_remaining'],0); side=p['side']
+    pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q
+    p['realized_pnl']+=pnl;s['paper_balance']+=p['realized_pnl']
+    s['consecutive_losses']=s.get('consecutive_losses',0)+1 if p['realized_pnl']<0 else 0
+    record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],event,True])
+    msg=f'{label} {p["symbol"]}\nFinal PnL {p["realized_pnl"]:+,.0f}\nBalance {s["paper_balance"]:,.0f}'
+    s['position']=None
+    return msg
+
+def position_r(p,px):
+    risk=max(float(p.get('initial_risk',abs(p['entry']-p.get('original_stop',p['stop'])))),1e-12)
+    return (px-p['entry'])/risk if p['side']=='LONG' else (p['entry']-px)/risk
+
+def strong_reversal(p,analyses):
+    a=next((x for x in analyses if x.symbol==p['symbol']),None)
+    if not a:return False
+    if p['side']=='LONG':return a.short>=ENTRY_THRESHOLD and a.short>=a.long+OPPOSITE_GAP
+    return a.long>=ENTRY_THRESHOLD and a.long>=a.short+OPPOSITE_GAP
+
+def manage_position(s,tickers,analyses):
+    p=s.get('position');msgs=[]
     if not p:return msgs
     px=live_exit_price(p['symbol'],p['side'],tickers)
     if px is None:return msgs
-    side=p['side']; tp=lambda lv:px>=lv if side=='LONG' else px<=lv; st=lambda lv:px<=lv if side=='LONG' else px>=lv
-    print(f'[POSITION] {p["symbol"]} {side} ENTRY={p["entry"]:.5f} NOW={px:.5f} STOP={p["stop"]:.5f} TP1={p["tp1"]:.5f} TP2={p["tp2"]:.5f} TP3={p["tp3"]:.5f}',flush=True)
+    side=p['side'];tp=lambda lv:px>=lv if side=='LONG' else px<=lv;st=lambda lv:px<=lv if side=='LONG' else px>=lv
+    cur_r=position_r(p,px);p['max_r']=max(float(p.get('max_r',0)),cur_r)
+    age_h=(now_utc()-datetime.fromisoformat(p['opened_at'])).total_seconds()/3600
+    print(f'[POSITION] {p["symbol"]} {side} ENTRY={p["entry"]:.5f} NOW={px:.5f} R={cur_r:+.2f} MAX_R={p["max_r"]:+.2f} AGE={age_h:.1f}h STOP={p["stop"]:.5f} TP1={p["tp1"]:.5f} TP2={p["tp2"]:.5f} TP3={p["tp3"]:.5f}',flush=True)
+
     if st(p['stop']):
-        q=p['qty_remaining']; pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q; p['realized_pnl']+=pnl; s['paper_balance']+=p['realized_pnl']; s['consecutive_losses']=s.get('consecutive_losses',0)+1 if p['realized_pnl']<0 else 0; record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'STOP_END',True]); msgs.append(f'FX PAPER STOP {p["symbol"]}\nPnL {p["realized_pnl"]:+,.0f}\nBalance {s["paper_balance"]:,.0f}');s['position']=None;return msgs
+        msgs.append(close_remaining(s,p,px,'STOP_END','FX PAPER STOP'));return msgs
+    if strong_reversal(p,analyses):
+        msgs.append(close_remaining(s,p,px,'REVERSAL_END','FX PAPER REVERSAL EXIT'));return msgs
+    if age_h>=MAX_HOLD_HOURS:
+        msgs.append(close_remaining(s,p,px,'TIME_END','FX PAPER TIME EXIT'));return msgs
+    if age_h>=REVIEW_HOURS and not p['tp1_done'] and cur_r<=REVIEW_CLOSE_R:
+        msgs.append(close_remaining(s,p,px,'REVIEW_END','FX PAPER REVIEW EXIT'));return msgs
+    if p['max_r']>=TRAIL_START_R and cur_r<=p['max_r']-TRAIL_GIVEBACK_R:
+        msgs.append(close_remaining(s,p,px,'TRAIL_END','FX PAPER TRAIL EXIT'));return msgs
+
     if not p['tp1_done'] and tp(p['tp1']):
-        q=p['qty_initial']*TP1_PCT;pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q;p['qty_remaining']-=q;p['realized_pnl']+=pnl;p['tp1_done']=True;p['stop']=p['entry'];record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP1',True]);msgs.append(f'FX PAPER TP1 {p["symbol"]} 30% PnL {pnl:+,.0f}')
+        q=p['qty_initial']*TP1_PCT;pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q
+        p['qty_remaining']-=q;p['realized_pnl']+=pnl;p['tp1_done']=True;p['stop']=p['entry']
+        record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP1',True])
+        msgs.append(f'FX PAPER TP1 {p["symbol"]} 30% PnL {pnl:+,.0f}')
+
     if not p['tp2_done'] and tp(p['tp2']):
-        q=p['qty_initial']*TP2_PCT;pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q;p['qty_remaining']-=q;p['realized_pnl']+=pnl;p['tp2_done']=True;p['stop']=p['tp1'];record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP2',True]);msgs.append(f'FX PAPER TP2 {p["symbol"]} 40% PnL {pnl:+,.0f}')
+        q=p['qty_initial']*TP2_PCT;pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q
+        p['qty_remaining']-=q;p['realized_pnl']+=pnl;p['tp2_done']=True
+        risk=float(p['initial_risk']);p['stop']=p['entry']+risk if side=='LONG' else p['entry']-risk
+        record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP2',True])
+        msgs.append(f'FX PAPER TP2 {p["symbol"]} 40% PnL {pnl:+,.0f}')
+
     if tp(p['tp3']):
-        q=p['qty_remaining'];pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q;p['realized_pnl']+=pnl;s['paper_balance']+=p['realized_pnl'];s['consecutive_losses']=0;record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP3_END',True]);msgs.append(f'FX PAPER TP3 {p["symbol"]}\nFinal PnL {p["realized_pnl"]:+,.0f}\nBalance {s["paper_balance"]:,.0f}');s['position']=None
+        msgs.append(close_remaining(s,p,px,'TP3_END','FX PAPER TP3'));return msgs
     return msgs
 
 def log_signals(a):
@@ -312,30 +391,34 @@ def weekly_review():
     try:
         d=pd.read_csv(TRADES_FILE);d['time']=pd.to_datetime(d['time'],utc=True,errors='coerce');w=d[d['time']>=pd.Timestamp(now_utc()-timedelta(days=7))]
         if w.empty:return
-        losses=w[w['pnl']<0]; out={'generated_at':now_utc().isoformat(),'events':len(w),'loss_events':len(losses),'pnl_events':float(w['pnl'].sum()),'loss_symbols':losses['symbol'].value_counts().to_dict(),'loss_sides':losses['side'].value_counts().to_dict()};WEEKLY_REVIEW.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+        losses=w[w['pnl']<0];out={'generated_at':now_utc().isoformat(),'events':len(w),'loss_events':len(losses),'pnl_events':float(w['pnl'].sum()),'loss_symbols':losses['symbol'].value_counts().to_dict(),'loss_sides':losses['side'].value_counts().to_dict()};WEEKLY_REVIEW.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
     except Exception as e:print('[WEEKLY_REVIEW_WARN]',e,flush=True)
 
 def main():
-    tick={x['symbol']:x for x in api_get('/v1/ticker')}; market=any(tick.get(s,{}).get('status')=='OPEN' for s in SYMBOLS)
+    tick={x['symbol']:x for x in api_get('/v1/ticker')};market=any(tick.get(s,{}).get('status')=='OPEN' for s in SYMBOLS)
     allf={};failed=[]
     for s in SYMBOLS:
         try:allf[s]={'5min':drop_open(fetch_intraday(s,'5min',3,8,80)),'15min':drop_open(fetch_intraday(s,'15min',5,10,80)),'1hour':drop_open(fetch_intraday(s,'1hour',20,12,120)),'4hour':drop_open(fetch_yearly(s,'4hour',3)),'1day':drop_open(fetch_yearly(s,'1day',3)),'1week':drop_open(fetch_yearly(s,'1week',3))}
         except Exception as e:failed.append(s);print('[DATA_SKIP]',s,e,flush=True)
-    corr=correlations(allf); a=[]
+    corr=correlations(allf);a=[]
     for s,fs in allf.items():
         try:a.append(analyze(s,fs,corr_note(s,corr)))
         except Exception as e:failed.append(s);print('[ANALYSIS_SKIP]',s,e,flush=True)
+
     st=load_state()
-    for m in manage_position(st,tick):notify(m)
+    for m in manage_position(st,tick,a):notify(m)
     if not a:save_state(st);return
+
     print_summary(a,failed);log_signals(a)
+
     if not st.get('position'):
-        m=manage_pending(st,a)
+        m=manage_pending(st,a,tick)
         if m:notify(m)
+
     if market and not st.get('position') and not st.get('pending'):
         valid=sorted([x for x in a if x.side!='WAIT' and x.confidence>=ENTRY_THRESHOLD],key=lambda x:x.confidence,reverse=True)
         if valid:
-            c=valid[0]; eb,er=event_block(c.symbol); nb,nr=news_block(c.symbol); ok,why=can_open(st)
+            c=valid[0];eb,er=event_block(c.symbol);nb,nr=news_block(c.symbol);ok,why=can_open(st)
             print(f'[CANDIDATE] {c.symbol} {c.side} CONF={c.confidence} RR1={c.rr1:.2f} COUNTER={" | ".join(c.counter[:5]) or "NONE"}',flush=True)
             if eb:print('[BLOCK]',er,flush=True)
             elif nb:print('[BLOCK]',nr,flush=True)
@@ -343,8 +426,10 @@ def main():
             else:
                 key=hashlib.sha1(f'{c.symbol}:{c.side}:{c.candle_id}'.encode()).hexdigest()[:16]
                 if st.get('last_key')!=key:create_pending(st,c);st['last_key']=key;print(f'[PENDING_CREATED] {c.symbol} {c.side}',flush=True)
+
     if st.get('position'):print('[STATE] OPEN_POSITION:',st['position']['symbol'],flush=True)
     elif st.get('pending'):print('[STATE] PENDING:',st['pending']['symbol'],flush=True)
+
     weekly_review();save_state(st)
 
 if __name__=='__main__':main()
