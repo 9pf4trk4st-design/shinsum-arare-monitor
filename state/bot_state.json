@@ -1,25 +1,21 @@
 {
-  "paper_balance": 100000.0,
-  "position": {
-    "symbol": "XRP",
-    "side": "SHORT",
-    "entry": 224.78031428571427,
-    "qty_initial": 63.41464298461903,
-    "qty_remaining": 63.41464298461903,
-    "stop": 236.60723571428574,
-    "original_stop": 236.60723571428574,
-    "tp1": 208.2226242857142,
-    "tp2": 201.12647142857134,
-    "tp3": 191.66493428571417,
-    "tp1_done": false,
-    "tp2_done": false,
-    "tp3_done": false,
-    "realized_pnl": 0.0,
-    "opened_at": "2026-08-26T09:54:03.717144+00:00"
+  "paper_balance": 100231.03947470934,
+  "position": null,
+  "pending": {
+    "symbol": "BTC",
+    "side": "LONG",
+    "confidence": 76,
+    "entry_low": 12466426.234285714,
+    "entry_high": 12470007.308571428,
+    "stop": 12433261.82857143,
+    "tp1": 12505630.37442857,
+    "tp2": 12524337.17592857,
+    "tp3": 12550526.69802857,
+    "created_at": "2026-09-05T15:21:12.761820+00:00",
+    "candle_id": "2026-09-05 15:00:00+00:00"
   },
-  "pending": null,
-  "last_notified": "ef035b0511ed7912",
-  "daily_date": "2026-08-26",
-  "daily_start_balance": 100000.0,
+  "last_notified": "02fd7e55e8433235",
+  "daily_date": "2026-09-06",
+  "daily_start_balance": 100231.03947470934,
   "consecutive_losses": 0
 }
