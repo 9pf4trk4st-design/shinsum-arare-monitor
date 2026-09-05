@@ -17,7 +17,7 @@
     "tp3_done": false,
     "realized_pnl": 0.0,
     "opened_at": "2026-09-05T18:53:26.282676+00:00",
-    "max_r": 0.10697550223301269,
+    "max_r": 0.18809370478767748,
     "exit_logic": "FX_STYLE_V2"
   },
   "pending": null,
