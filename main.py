@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Musigny 4-Crypto BOT v8 - FX-style short-term exits
 from __future__ import annotations
 import os, json, math, csv, hashlib, time
 from dataclasses import dataclass
@@ -28,6 +29,16 @@ MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 TP1_PCT, TP2_PCT, TP3_PCT = 0.30, 0.40, 0.30
 PENDING_EXPIRE_HOURS = int(os.getenv("PENDING_EXPIRE_HOURS", "8"))
+
+# FXçã¨åãç­æåºå£
+TP1_R = float(os.getenv("TP1_R", "1.0"))
+TP2_R = float(os.getenv("TP2_R", "1.5"))
+TP3_R = float(os.getenv("TP3_R", "2.2"))
+REVIEW_HOURS = float(os.getenv("REVIEW_HOURS", "8"))
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "12"))
+TRAIL_START_R = float(os.getenv("TRAIL_START_R", "1.5"))
+TRAIL_GIVEBACK_R = float(os.getenv("TRAIL_GIVEBACK_R", "0.6"))
+REVIEW_CLOSE_R = float(os.getenv("REVIEW_CLOSE_R", "0.3"))
 RCI_EXTREME = 75.0
 RCI_STRONG_EXTREME = 85.0
 
@@ -264,10 +275,10 @@ def analyze(symbol,frames):
     atr=float(H1.atr.iloc[-1]); atr=atr if math.isfinite(atr) and atr>0 else p*.012
     if side=="LONG":
         entry_high=p-.08*atr; entry_low=p-.32*atr; stop=min(entry_low-.75*atr,rlow-.15*atr); mid=(entry_low+entry_high)/2; risk=max(mid-stop,p*.003)
-        tp1,tp2,tp3=mid+1.4*risk,mid+2.0*risk,mid+2.8*risk; invalid=f"1Hæ¼ãå®å¤ {rlow:,.4f} å²ã"
+        tp1,tp2,tp3=mid+TP1_R*risk,mid+TP2_R*risk,mid+TP3_R*risk; invalid=f"1Hæ¼ãå®å¤ {rlow:,.4f} å²ã"
     else:
         entry_low=p+.08*atr; entry_high=p+.32*atr; stop=max(entry_high+.75*atr,rh+.15*atr); mid=(entry_low+entry_high)/2; risk=max(stop-mid,p*.003)
-        tp1,tp2,tp3=mid-1.4*risk,mid-2.0*risk,mid-2.8*risk; invalid=f"1Hæ»ãé«å¤ {rh:,.4f} ä¸æã"
+        tp1,tp2,tp3=mid-TP1_R*risk,mid-TP2_R*risk,mid-TP3_R*risk; invalid=f"1Hæ»ãé«å¤ {rh:,.4f} ä¸æã"
     return Analysis(symbol,side,L,S,confidence,p,entry_low,entry_high,stop,tp1,tp2,tp3,reasons,invalid,candle_id,float(c15.high),float(c15.low))
 
 def load_state():
@@ -298,10 +309,42 @@ def touch_zone(pending,high,low):
     lo=min(pending["entry_low"],pending["entry_high"]); hi=max(pending["entry_low"],pending["entry_high"]); return high>=lo and low<=hi
 
 def make_position(state,p):
-    mid=(p["entry_low"]+p["entry_high"])/2; risk_per_unit=abs(mid-p["stop"]); risk_yen=state["paper_balance"]*RISK_PCT
-    qty=min(risk_yen/max(risk_per_unit,1e-12),(state["paper_balance"]*2)/mid)
-    state["position"]={"symbol":p["symbol"],"side":p["side"],"entry":mid,"qty_initial":qty,"qty_remaining":qty,"stop":p["stop"],"original_stop":p["stop"],"tp1":p["tp1"],"tp2":p["tp2"],"tp3":p["tp3"],"tp1_done":False,"tp2_done":False,"tp3_done":False,"realized_pnl":0.0,"opened_at":now_utc().isoformat()}
-    return f"ð¯ ä»®æ³ç´å® {p['symbol']} {p['side']}\nä¿¡é ¼åº¦: {p['confidence']}/100\nç´å®: {mid:,.4f}\næ°é: {qty:.8f}"
+    mid=(p["entry_low"]+p["entry_high"])/2
+    risk_per_unit=abs(mid-p["stop"])
+    risk_yen=state["paper_balance"]*RISK_PCT
+    qty=min(
+        risk_yen/max(risk_per_unit,1e-12),
+        (state["paper_balance"]*2)/mid
+    )
+
+    state["position"]={
+        "symbol":p["symbol"],
+        "side":p["side"],
+        "entry":mid,
+        "qty_initial":qty,
+        "qty_remaining":qty,
+        "stop":p["stop"],
+        "original_stop":p["stop"],
+        "initial_risk":risk_per_unit,
+        "tp1":p["tp1"],
+        "tp2":p["tp2"],
+        "tp3":p["tp3"],
+        "tp1_done":False,
+        "tp2_done":False,
+        "tp3_done":False,
+        "realized_pnl":0.0,
+        "opened_at":now_utc().isoformat(),
+        "max_r":0.0,
+        "exit_logic":"FX_STYLE_V2"
+    }
+
+    return (
+        f"ð¯ ä»®æ³ç´å® {p['symbol']} {p['side']}\n"
+        f"ä¿¡é ¼åº¦: {p['confidence']}/100\n"
+        f"ç´å®: {mid:,.4f}\n"
+        f"æ°é: {qty:.8f}\n"
+        f"TP1=1.0R / TP2=1.5R / TP3=2.2R"
+    )
 
 def manage_pending(state,analyses):
     p=state.get("pending")
@@ -314,28 +357,262 @@ def manage_pending(state,analyses):
     if touch_zone(p,a.candle_high,a.candle_low): msg=make_position(state,p); state["pending"]=None; return msg
     return None
 
-def manage_position(state,analyses):
-    pos=state.get("position")
-    if not pos: return []
+def fetch_live_tickers():
+    out={}
+    for symbol in SYMBOLS:
+        try:
+            data=api_get("/v1/ticker",{"symbol":symbol},retries=3)
+            if data:
+                out[symbol]=data[0]
+        except Exception as e:
+            print(f"[TICKER-WARN] {symbol}: {e}",flush=True)
+    return out
+
+def live_exit_price(symbol,side,tickers):
+    t=tickers.get(symbol)
+    if not t:
+        return None
+    # LONGæ±ºæ¸ã¯BIDãSHORTæ±ºæ¸ã¯ASKãåªå
+    key="bid" if side=="LONG" else "ask"
+    if t.get(key) is not None:
+        return float(t[key])
+    if t.get("last") is not None:
+        return float(t["last"])
+    return None
+
+def migrate_position_exit(pos):
+    """æ§ãã¸ã·ã§ã³ãæ°ããRãã¼ã¹åºå£ã¸èªåç§»è¡ã"""
+    if pos.get("exit_logic")=="FX_STYLE_V2":
+        return
+
+    entry=float(pos["entry"])
+    original_stop=float(pos.get("original_stop",pos["stop"]))
+    risk=max(abs(entry-original_stop),entry*.003,1e-12)
+
+    pos["original_stop"]=original_stop
+    pos["initial_risk"]=risk
+    pos["opened_at"]=pos.get("opened_at") or now_utc().isoformat()
+    pos["max_r"]=float(pos.get("max_r",0.0))
+
+    if pos["side"]=="LONG":
+        pos["tp1"]=entry+TP1_R*risk
+        pos["tp2"]=entry+TP2_R*risk
+        pos["tp3"]=entry+TP3_R*risk
+    else:
+        pos["tp1"]=entry-TP1_R*risk
+        pos["tp2"]=entry-TP2_R*risk
+        pos["tp3"]=entry-TP3_R*risk
+
+    pos["exit_logic"]="FX_STYLE_V2"
+
+def position_r(pos,price):
+    risk=max(float(pos.get("initial_risk",abs(pos["entry"]-pos.get("original_stop",pos["stop"])))),1e-12)
+    if pos["side"]=="LONG":
+        return (price-pos["entry"])/risk
+    return (pos["entry"]-price)/risk
+
+def strong_reversal_against_position(pos,analyses):
     a=next((x for x in analyses if x.symbol==pos["symbol"]),None)
-    if not a: return []
-    high,low,side=a.candle_high,a.candle_low,pos["side"]; msgs=[]
-    tp_hit=lambda level: high>=level if side=="LONG" else low<=level
-    stop_hit=lambda level: low<=level if side=="LONG" else high>=level
+    if not a:
+        return False
+
+    if pos["side"]=="LONG":
+        return (
+            a.score_short>=ENTRY_THRESHOLD and
+            a.score_short>=a.score_long+OPPOSITE_GAP
+        )
+
+    return (
+        a.score_long>=ENTRY_THRESHOLD and
+        a.score_long>=a.score_short+OPPOSITE_GAP
+    )
+
+def close_remaining(state,pos,price,event,label):
+    q=max(pos["qty_remaining"],0)
+    side=pos["side"]
+
+    pnl=(
+        (price-pos["entry"])*q
+        if side=="LONG"
+        else (pos["entry"]-price)*q
+    )
+
+    pos["realized_pnl"]+=pnl
+    state["paper_balance"]+=pos["realized_pnl"]
+
+    state["consecutive_losses"]=(
+        state.get("consecutive_losses",0)+1
+        if pos["realized_pnl"]<0
+        else 0
+    )
+
+    record_trade([
+        now_utc().isoformat(),
+        pos["symbol"],
+        side,
+        pos["entry"],
+        price,
+        q,
+        pnl,
+        state["paper_balance"],
+        event
+    ])
+
+    msg=(
+        f"{label} {pos['symbol']}\\n"
+        f"æçµæç: {pos['realized_pnl']:+,.0f}å\\n"
+        f"æ®é«: {state['paper_balance']:,.0f}å"
+    )
+
+    state["position"]=None
+    return msg
+
+def manage_position(state,analyses,tickers):
+    pos=state.get("position")
+    if not pos:
+        return []
+
+    migrate_position_exit(pos)
+
+    price=live_exit_price(pos["symbol"],pos["side"],tickers)
+    if price is None:
+        print(f"[POSITION-WARN] {pos['symbol']}: live price unavailable",flush=True)
+        return []
+
+    side=pos["side"]
+    msgs=[]
+
+    cur_r=position_r(pos,price)
+    pos["max_r"]=max(float(pos.get("max_r",0.0)),cur_r)
+
+    opened=datetime.fromisoformat(pos["opened_at"])
+    age_h=(now_utc()-opened).total_seconds()/3600
+
+    tp_hit=lambda level: price>=level if side=="LONG" else price<=level
+    stop_hit=lambda level: price<=level if side=="LONG" else price>=level
+
+    print(
+        f"[POSITION] {pos['symbol']} {side} "
+        f"ENTRY={pos['entry']:.4f} NOW={price:.4f} "
+        f"R={cur_r:+.2f} MAX_R={pos['max_r']:+.2f} AGE={age_h:.1f}h "
+        f"STOP={pos['stop']:.4f} "
+        f"TP1={pos['tp1']:.4f} TP2={pos['tp2']:.4f} TP3={pos['tp3']:.4f}",
+        flush=True
+    )
+
+    # 1. STOPæåªå
     if stop_hit(pos["stop"]):
-        q=max(pos["qty_remaining"],0); pnl=(pos["stop"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["stop"])*q
-        pos["realized_pnl"]+=pnl; state["paper_balance"]+=pos["realized_pnl"]; state["consecutive_losses"]=state.get("consecutive_losses",0)+1 if pos["realized_pnl"]<0 else 0
-        record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["stop"],q,pnl,state["paper_balance"],"STOP_END"])
-        msgs.append(f"ð {pos['symbol']} STOP\næçµæç: {pos['realized_pnl']:+,.0f}å\næ®é«: {state['paper_balance']:,.0f}å"); state["position"]=None; return msgs
-    if not pos["tp1_done"] and tp_hit(pos["tp1"]):
-        q=pos["qty_initial"]*TP1_PCT; pnl=(pos["tp1"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp1"])*q
-        pos["qty_remaining"]-=q; pos["realized_pnl"]+=pnl; pos["tp1_done"]=True; pos["stop"]=pos["entry"]; record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp1"],q,pnl,state["paper_balance"],"TP1"]); msgs.append(f"â {pos['symbol']} TP1 30%å©ç¢º: {pnl:+,.0f}å\nSTOPãå»ºå¤ã¸ç§»å")
-    if not pos["tp2_done"] and tp_hit(pos["tp2"]):
-        q=pos["qty_initial"]*TP2_PCT; pnl=(pos["tp2"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp2"])*q
-        pos["qty_remaining"]-=q; pos["realized_pnl"]+=pnl; pos["tp2_done"]=True; pos["stop"]=pos["tp1"]; record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp2"],q,pnl,state["paper_balance"],"TP2"]); msgs.append(f"â {pos['symbol']} TP2 40%å©ç¢º: {pnl:+,.0f}å\nSTOPãTP1ã¸ç§»å")
-    if not pos["tp3_done"] and tp_hit(pos["tp3"]):
-        q=max(pos["qty_remaining"],0); pnl=(pos["tp3"]-pos["entry"])*q if side=="LONG" else (pos["entry"]-pos["tp3"])*q
-        pos["realized_pnl"]+=pnl; state["paper_balance"]+=pos["realized_pnl"]; state["consecutive_losses"]=0; record_trade([now_utc().isoformat(),pos["symbol"],side,pos["entry"],pos["tp3"],q,pnl,state["paper_balance"],"TP3_END"]); msgs.append(f"ð {pos['symbol']} TP3å°é\næçµæç: {pos['realized_pnl']:+,.0f}å\næ®é«: {state['paper_balance']:,.0f}å"); state["position"]=None
+        msgs.append(
+            close_remaining(
+                state,pos,price,"STOP_END","ð ä»®æ³STOP"
+            )
+        )
+        return msgs
+
+    # 2. åå¯¾æ¹åã®å¼·ã·ã°ãã«ã§æ¤é
+    if strong_reversal_against_position(pos,analyses):
+        msgs.append(
+            close_remaining(
+                state,pos,price,"REVERSAL_END","ð ä»®æ³åè»¢æ±ºæ¸"
+            )
+        )
+        return msgs
+
+    # 3. æå¤§12æéã§æéåã
+    if age_h>=MAX_HOLD_HOURS:
+        msgs.append(
+            close_remaining(
+                state,pos,price,"TIME_END","â° ä»®æ³æéåãæ±ºæ¸"
+            )
+        )
+        return msgs
+
+    # 4. 8æéå¾ãTP1æªéãã¤+0.3Rä»¥ä¸ãªãæ¤é
+    if (
+        age_h>=REVIEW_HOURS and
+        not pos.get("tp1_done",False) and
+        cur_r<=REVIEW_CLOSE_R
+    ):
+        msgs.append(
+            close_remaining(
+                state,pos,price,"REVIEW_END","ð ä»®æ³è¦ç´ãæ±ºæ¸"
+            )
+        )
+        return msgs
+
+    # 5. +1.5Rä»¥ä¸ã¾ã§ä¼¸ã³ãå¾ãæé«å¤ãã0.6Ræ»ãããå¨æ±ºæ¸
+    if (
+        pos["max_r"]>=TRAIL_START_R and
+        cur_r<=pos["max_r"]-TRAIL_GIVEBACK_R
+    ):
+        msgs.append(
+            close_remaining(
+                state,pos,price,"TRAIL_END","ð ä»®æ³ãã¬ã¼ãªã³ã°æ±ºæ¸"
+            )
+        )
+        return msgs
+
+    # 6. TP1 = +1.0R / 30%
+    if not pos.get("tp1_done",False) and tp_hit(pos["tp1"]):
+        q=pos["qty_initial"]*TP1_PCT
+        pnl=(
+            (price-pos["entry"])*q
+            if side=="LONG"
+            else (pos["entry"]-price)*q
+        )
+        pos["qty_remaining"]-=q
+        pos["realized_pnl"]+=pnl
+        pos["tp1_done"]=True
+        pos["stop"]=pos["entry"]
+
+        record_trade([
+            now_utc().isoformat(),pos["symbol"],side,pos["entry"],
+            price,q,pnl,state["paper_balance"],"TP1"
+        ])
+
+        msgs.append(
+            f"â {pos['symbol']} TP1 30%å©ç¢º: {pnl:+,.0f}å\\n"
+            f"STOPãå»ºå¤ã¸"
+        )
+
+    # 7. TP2 = +1.5R / 40%
+    if not pos.get("tp2_done",False) and tp_hit(pos["tp2"]):
+        q=pos["qty_initial"]*TP2_PCT
+        pnl=(
+            (price-pos["entry"])*q
+            if side=="LONG"
+            else (pos["entry"]-price)*q
+        )
+        pos["qty_remaining"]-=q
+        pos["realized_pnl"]+=pnl
+        pos["tp2_done"]=True
+
+        risk=float(pos["initial_risk"])
+        pos["stop"]=(
+            pos["entry"]+risk
+            if side=="LONG"
+            else pos["entry"]-risk
+        )
+
+        record_trade([
+            now_utc().isoformat(),pos["symbol"],side,pos["entry"],
+            price,q,pnl,state["paper_balance"],"TP2"
+        ])
+
+        msgs.append(
+            f"â {pos['symbol']} TP2 40%å©ç¢º: {pnl:+,.0f}å\\n"
+            f"STOPã+1Rã¸"
+        )
+
+    # 8. TP3 = +2.2R / æ®ãå¨æ±ºæ¸
+    if tp_hit(pos["tp3"]):
+        msgs.append(
+            close_remaining(
+                state,pos,price,"TP3_END","ð ä»®æ³TP3æ±ºæ¸"
+            )
+        )
+        return msgs
+
     return msgs
 
 def log_signals(analyses):
@@ -389,7 +666,7 @@ def create_pending(state,a):
 def notify(text):
     print(text,flush=True)
     if NTFY_TOPIC:
-        r=requests.post(f"https://ntfy.sh/{NTFY_TOPIC}",data=text.encode("utf-8"),headers={"Title":"Musigny 4-Crypto BOT v5"},timeout=15); r.raise_for_status()
+        r=requests.post(f"https://ntfy.sh/{NTFY_TOPIC}",data=text.encode("utf-8"),headers={"Title":"Musigny 4-Crypto BOT v8"},timeout=15); r.raise_for_status()
 
 def fmt_candidate(a,ranking,state):
     strength="ð¥å¼·ã·ã°ãã«" if a.confidence>=STRONG_THRESHOLD else "åè£"
@@ -415,13 +692,21 @@ def main():
             failed_symbols.append(symbol)
             print(f"[DATA-SKIP] {symbol}: skip this cycle ({e})", flush=True)
     state=load_state()
+    tickers=fetch_live_tickers()
+
+    # ä¿æä¸­ãã¸ã·ã§ã³ã¯ææ°ä¾¡æ ¼ã§åã«æ±ºæ¸ç£è¦
+    for m in manage_position(state,analyses,tickers):
+        notify("ð "+m)
+
     if not analyses:
-        print("[DATA-WAIT] No symbols available. No trade; wait for next cycle.", flush=True)
+        print("[DATA-WAIT] No symbols available. Position monitoring only.", flush=True)
         save_state(state); return
-    if failed_symbols: print("[DATA-INFO] skipped symbols: "+", ".join(failed_symbols), flush=True)
+
+    if failed_symbols:
+        print("[DATA-INFO] skipped symbols: "+", ".join(failed_symbols), flush=True)
+
     print_analysis_summary(analyses, failed_symbols)
     log_signals(analyses)
-    for m in manage_position(state,analyses): notify("ð "+m)
     if not state.get("position"):
         msg=manage_pending(state,analyses)
         if msg:
