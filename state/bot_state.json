@@ -1,7 +1,19 @@
 {
   "paper_balance": 101941.53630967898,
-  "pending": null,
-  "last_notified": "08cf182c7c08c18d",
+  "pending": {
+    "symbol": "XRP",
+    "side": "LONG",
+    "confidence": 67,
+    "entry_low": 221.2102285714286,
+    "entry_high": 221.50105714285715,
+    "stop": 219.82423214285714,
+    "tp1": 222.8870535714286,
+    "tp2": 223.65275892857147,
+    "tp3": 224.72474642857148,
+    "created_at": "2026-09-06T07:36:27.633528+00:00",
+    "candle_id": "2026-09-06 07:15:00+00:00"
+  },
+  "last_notified": "6877600ad1978313",
   "daily_date": "2026-09-06",
   "daily_start_balance": 100231.03947470934,
   "consecutive_losses": 0,
