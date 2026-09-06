@@ -1,18 +1,6 @@
 {
   "paper_balance": 101571.06613936627,
-  "pending": {
-    "symbol": "SOL",
-    "side": "LONG",
-    "confidence": 67,
-    "entry_low": 16551.245714285713,
-    "entry_high": 16584.81142857143,
-    "stop": 16380.021428571428,
-    "tp1": 16756.035714285714,
-    "tp2": 16850.039285714287,
-    "tp3": 16981.644285714287,
-    "created_at": "2026-09-06T15:00:45.390572+00:00",
-    "candle_id": "2026-09-06 14:30:00+00:00"
-  },
+  "pending": null,
   "last_notified": "4b0aedaa02772bc5",
   "daily_date": "2026-09-07",
   "daily_start_balance": 101571.06613936627,
@@ -39,6 +27,29 @@
       "entry_half_spread": 0.0660000000000025,
       "opened_at": "2026-09-06T07:42:20.755294+00:00",
       "max_r": 0.9248708590351828,
+      "exit_logic": "FX_STYLE_V2_NET"
+    },
+    {
+      "symbol": "SOL",
+      "side": "LONG",
+      "entry": 16568.02857142857,
+      "qty_initial": 4.051883266074034,
+      "qty_remaining": 4.051883266074034,
+      "stop": 16380.021428571428,
+      "original_stop": 16380.021428571428,
+      "initial_risk": 188.00714285714275,
+      "tp1": 16756.035714285714,
+      "tp2": 16850.039285714287,
+      "tp3": 16981.644285714287,
+      "tp1_done": false,
+      "tp2_done": false,
+      "tp3_done": false,
+      "realized_pnl": 0.0,
+      "realized_gross_pnl": 0.0,
+      "realized_cost": 0.0,
+      "entry_half_spread": 7.0,
+      "opened_at": "2026-09-06T15:06:57.326800+00:00",
+      "max_r": 0.0,
       "exit_logic": "FX_STYLE_V2_NET"
     }
   ]
