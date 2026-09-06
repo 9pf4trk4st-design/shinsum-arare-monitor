@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Musigny 4-Crypto BOT v8 - FX-style short-term exits
+# Musigny 4-Crypto BOT v9 - FX-style exits + net profit notifications
 from __future__ import annotations
 import os, json, math, csv, hashlib, time, sys
 from dataclasses import dataclass
@@ -25,7 +25,7 @@ SYMBOLS = ["BTC", "ETH", "XRP", "SOL"]
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")
 STATE_DIR = Path(os.getenv("STATE_DIR", "state")); STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "bot_state.json"
-TRADES_FILE = STATE_DIR / "paper_trades.csv"
+TRADES_FILE = STATE_DIR / "paper_trades_net.csv"
 SIGNALS_FILE = STATE_DIR / "signal_log.csv"
 
 EMA_PERIOD = 12
@@ -49,6 +49,14 @@ MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "12"))
 TRAIL_START_R = float(os.getenv("TRAIL_START_R", "1.5"))
 TRAIL_GIVEBACK_R = float(os.getenv("TRAIL_GIVEBACK_R", "0.6"))
 REVIEW_CLOSE_R = float(os.getenv("REVIEW_CLOSE_R", "0.3"))
+
+# ===== 実運用に近づけるためのコスト設定 =====
+# GMOコインの暗号資産FXを想定すると通常の取引手数料は0。
+# 別サービス/注文方式を使う場合は環境変数で変更可能。
+TRADE_FEE_RATE = float(os.getenv("TRADE_FEE_RATE", "0.0"))
+
+# 日本時間6:00をまたいだ場合のレバレッジ手数料（0.04%/日）
+LEVERAGE_DAILY_RATE = float(os.getenv("LEVERAGE_DAILY_RATE", "0.0004"))
 RCI_EXTREME = 75.0
 RCI_STRONG_EXTREME = 85.0
 
@@ -312,13 +320,18 @@ def record_trade(row):
     exists=TRADES_FILE.exists()
     with TRADES_FILE.open("a",newline="",encoding="utf-8") as f:
         w=csv.writer(f)
-        if not exists: w.writerow(["time","symbol","side","entry","exit","qty_closed","pnl","balance","event"])
+        if not exists:
+            w.writerow([
+                "time","symbol","side","entry","exit","qty_closed",
+                "gross_pnl","trading_cost","leverage_fee","total_cost",
+                "net_pnl","balance","event"
+            ])
         w.writerow(row)
 
 def touch_zone(pending,high,low):
     lo=min(pending["entry_low"],pending["entry_high"]); hi=max(pending["entry_low"],pending["entry_high"]); return high>=lo and low<=hi
 
-def make_position(state,p):
+def make_position(state,p,tickers):
     mid=(p["entry_low"]+p["entry_high"])/2
     risk_per_unit=abs(mid-p["stop"])
     risk_yen=state["paper_balance"]*RISK_PCT
@@ -326,6 +339,16 @@ def make_position(state,p):
         risk_yen/max(risk_per_unit,1e-12),
         (state["paper_balance"]*2)/mid
     )
+
+    # エントリー側のスプレッドを想定コストとして保存。
+    # EXITはLONG=BID / SHORT=ASKを使うため、出口側スプレッドは価格に含まれる。
+    t=tickers.get(p["symbol"],{})
+    try:
+        bid=float(t.get("bid"))
+        ask=float(t.get("ask"))
+        entry_half_spread=max(ask-bid,0.0)/2
+    except Exception:
+        entry_half_spread=0.0
 
     state["position"]={
         "symbol":p["symbol"],
@@ -342,10 +365,16 @@ def make_position(state,p):
         "tp1_done":False,
         "tp2_done":False,
         "tp3_done":False,
+
+        # realized_pnlは「純利益」
         "realized_pnl":0.0,
+        "realized_gross_pnl":0.0,
+        "realized_cost":0.0,
+
+        "entry_half_spread":entry_half_spread,
         "opened_at":now_utc().isoformat(),
         "max_r":0.0,
-        "exit_logic":"FX_STYLE_V2"
+        "exit_logic":"FX_STYLE_V2_NET"
     }
 
     return (
@@ -353,10 +382,11 @@ def make_position(state,p):
         f"信頼度: {p['confidence']}/100\n"
         f"約定: {mid:,.4f}\n"
         f"数量: {qty:.8f}\n"
-        f"TP1=1.0R / TP2=1.5R / TP3=2.2R"
+        f"TP1=1.0R / TP2=1.5R / TP3=2.2R\n"
+        f"※以後の損益通知は想定コスト差引後の純利益"
     )
 
-def manage_pending(state,analyses):
+def manage_pending(state,analyses,tickers):
     p=state.get("pending")
     if not p: return None
     if now_utc()-datetime.fromisoformat(p["created_at"])>timedelta(hours=PENDING_EXPIRE_HOURS): state["pending"]=None; return f"⌛ {p['symbol']} {p['side']}候補失効"
@@ -364,7 +394,7 @@ def manage_pending(state,analyses):
     if not a: return None
     if p["side"]=="LONG" and a.candle_low<=p["stop"]: state["pending"]=None; return f"❌ {p['symbol']} LONG候補取消"
     if p["side"]=="SHORT" and a.candle_high>=p["stop"]: state["pending"]=None; return f"❌ {p['symbol']} SHORT候補取消"
-    if touch_zone(p,a.candle_high,a.candle_low): msg=make_position(state,p); state["pending"]=None; return msg
+    if touch_zone(p,a.candle_high,a.candle_low): msg=make_position(state,p,tickers); state["pending"]=None; return msg
     return None
 
 def fetch_live_tickers():
@@ -391,10 +421,7 @@ def live_exit_price(symbol,side,tickers):
     return None
 
 def migrate_position_exit(pos):
-    """旧ポジションも新しいRベース出口へ自動移行。"""
-    if pos.get("exit_logic")=="FX_STYLE_V2":
-        return
-
+    """旧ポジションも新しいRベース＋純利益管理へ自動移行。"""
     entry=float(pos["entry"])
     original_stop=float(pos.get("original_stop",pos["stop"]))
     risk=max(abs(entry-original_stop),entry*.003,1e-12)
@@ -404,16 +431,22 @@ def migrate_position_exit(pos):
     pos["opened_at"]=pos.get("opened_at") or now_utc().isoformat()
     pos["max_r"]=float(pos.get("max_r",0.0))
 
-    if pos["side"]=="LONG":
-        pos["tp1"]=entry+TP1_R*risk
-        pos["tp2"]=entry+TP2_R*risk
-        pos["tp3"]=entry+TP3_R*risk
-    else:
-        pos["tp1"]=entry-TP1_R*risk
-        pos["tp2"]=entry-TP2_R*risk
-        pos["tp3"]=entry-TP3_R*risk
+    if not str(pos.get("exit_logic","")).startswith("FX_STYLE_V2"):
+        if pos["side"]=="LONG":
+            pos["tp1"]=entry+TP1_R*risk
+            pos["tp2"]=entry+TP2_R*risk
+            pos["tp3"]=entry+TP3_R*risk
+        else:
+            pos["tp1"]=entry-TP1_R*risk
+            pos["tp2"]=entry-TP2_R*risk
+            pos["tp3"]=entry-TP3_R*risk
 
-    pos["exit_logic"]="FX_STYLE_V2"
+    # 旧stateとの互換
+    legacy=float(pos.get("realized_pnl",0.0))
+    pos.setdefault("realized_gross_pnl",legacy)
+    pos.setdefault("realized_cost",0.0)
+    pos.setdefault("entry_half_spread",0.0)
+    pos["exit_logic"]="FX_STYLE_V2_NET"
 
 def position_r(pos,price):
     risk=max(float(pos.get("initial_risk",abs(pos["entry"]-pos.get("original_stop",pos["stop"])))),1e-12)
@@ -437,17 +470,101 @@ def strong_reversal_against_position(pos,analyses):
         a.score_long>=a.score_short+OPPOSITE_GAP
     )
 
-def close_remaining(state,pos,price,event,label):
-    q=max(pos["qty_remaining"],0)
-    side=pos["side"]
+def leverage_fee_crossings(opened_at,closed_at):
+    """保有中に日本時間06:00を何回またいだか。"""
+    try:
+        opened=datetime.fromisoformat(opened_at)
+        if opened.tzinfo is None:
+            opened=opened.replace(tzinfo=timezone.utc)
+    except Exception:
+        return 0
 
-    pnl=(
-        (price-pos["entry"])*q
+    closed=closed_at
+    if closed.tzinfo is None:
+        closed=closed.replace(tzinfo=timezone.utc)
+
+    oj=opened.astimezone(timezone(timedelta(hours=9)))
+    cj=closed.astimezone(timezone(timedelta(hours=9)))
+
+    # 開始日から終了日までの06:00 JSTを数える
+    d=oj.date()
+    count=0
+    while d<=cj.date():
+        boundary=datetime(d.year,d.month,d.day,6,0,0,tzinfo=timezone(timedelta(hours=9)))
+        if oj < boundary <= cj:
+            count+=1
+        d+=timedelta(days=1)
+    return count
+
+
+def calc_close_cost(pos,price,qty,closed_at=None):
+    """
+    想定コスト:
+      1) エントリー側の半スプレッド
+      2) 売買手数料（環境変数。暗号資産FX想定の初期値0）
+      3) 06:00 JSTまたぎのレバレッジ手数料
+    EXIT側のスプレッドはBID/ASK決済価格に既に反映済み。
+    """
+    closed_at=closed_at or now_utc()
+    entry=float(pos["entry"])
+
+    entry_spread_cost=float(pos.get("entry_half_spread",0.0))*qty
+
+    entry_fee=entry*qty*TRADE_FEE_RATE
+    exit_fee=price*qty*TRADE_FEE_RATE
+    trading_cost=entry_spread_cost+entry_fee+exit_fee
+
+    crossings=leverage_fee_crossings(pos.get("opened_at",closed_at.isoformat()),closed_at)
+    leverage_fee=entry*qty*LEVERAGE_DAILY_RATE*crossings
+
+    total_cost=trading_cost+leverage_fee
+    return trading_cost,leverage_fee,total_cost
+
+
+def settle_piece(state,pos,price,qty,event):
+    side=pos["side"]
+    gross=(
+        (price-pos["entry"])*qty
         if side=="LONG"
-        else (pos["entry"]-price)*q
+        else (pos["entry"]-price)*qty
     )
 
-    pos["realized_pnl"]+=pnl
+    trading_cost,leverage_fee,total_cost=calc_close_cost(
+        pos,price,qty,now_utc()
+    )
+    net=gross-total_cost
+
+    pos["realized_gross_pnl"]=float(pos.get("realized_gross_pnl",0.0))+gross
+    pos["realized_cost"]=float(pos.get("realized_cost",0.0))+total_cost
+    pos["realized_pnl"]=float(pos.get("realized_pnl",0.0))+net
+
+    record_trade([
+        now_utc().isoformat(),
+        pos["symbol"],
+        side,
+        pos["entry"],
+        price,
+        qty,
+        gross,
+        trading_cost,
+        leverage_fee,
+        total_cost,
+        net,
+        state["paper_balance"],
+        event
+    ])
+
+    return gross,trading_cost,leverage_fee,total_cost,net
+
+
+def close_remaining(state,pos,price,event,label):
+    q=max(pos["qty_remaining"],0)
+
+    gross,trading_cost,leverage_fee,total_cost,net=settle_piece(
+        state,pos,price,q,event
+    )
+
+    # トレード全体の純利益だけを残高へ反映
     state["paper_balance"]+=pos["realized_pnl"]
 
     state["consecutive_losses"]=(
@@ -456,21 +573,13 @@ def close_remaining(state,pos,price,event,label):
         else 0
     )
 
-    record_trade([
-        now_utc().isoformat(),
-        pos["symbol"],
-        side,
-        pos["entry"],
-        price,
-        q,
-        pnl,
-        state["paper_balance"],
-        event
-    ])
-
     msg=(
         f"{label} {pos['symbol']}\n"
-        f"最終損益: {pos['realized_pnl']:+,.0f}円\n"
+        f"今回売買損益: {gross:+,.0f}円\n"
+        f"今回想定コスト: -{total_cost:,.0f}円\n"
+        f"トレード総売買損益: {pos['realized_gross_pnl']:+,.0f}円\n"
+        f"トレード総コスト: -{pos['realized_cost']:,.0f}円\n"
+        f"最終純利益: {pos['realized_pnl']:+,.0f}円\n"
         f"残高: {state['paper_balance']:,.0f}円"
     )
 
@@ -565,36 +674,29 @@ def manage_position(state,analyses,tickers):
     # 6. TP1 = +1.0R / 30%
     if not pos.get("tp1_done",False) and tp_hit(pos["tp1"]):
         q=pos["qty_initial"]*TP1_PCT
-        pnl=(
-            (price-pos["entry"])*q
-            if side=="LONG"
-            else (pos["entry"]-price)*q
+        gross,trading_cost,leverage_fee,total_cost,net=settle_piece(
+            state,pos,price,q,"TP1"
         )
         pos["qty_remaining"]-=q
-        pos["realized_pnl"]+=pnl
         pos["tp1_done"]=True
         pos["stop"]=pos["entry"]
 
-        record_trade([
-            now_utc().isoformat(),pos["symbol"],side,pos["entry"],
-            price,q,pnl,state["paper_balance"],"TP1"
-        ])
-
         msgs.append(
-            f"✅ {pos['symbol']} TP1 30%利確: {pnl:+,.0f}円\n"
+            f"✅ {pos['symbol']} TP1 30%利確\n"
+            f"売買損益: {gross:+,.0f}円\n"
+            f"想定コスト: -{total_cost:,.0f}円\n"
+            f"純利益: {net:+,.0f}円\n"
+            f"累計純利益: {pos['realized_pnl']:+,.0f}円\n"
             f"STOPを建値へ"
         )
 
     # 7. TP2 = +1.5R / 40%
     if not pos.get("tp2_done",False) and tp_hit(pos["tp2"]):
         q=pos["qty_initial"]*TP2_PCT
-        pnl=(
-            (price-pos["entry"])*q
-            if side=="LONG"
-            else (pos["entry"]-price)*q
+        gross,trading_cost,leverage_fee,total_cost,net=settle_piece(
+            state,pos,price,q,"TP2"
         )
         pos["qty_remaining"]-=q
-        pos["realized_pnl"]+=pnl
         pos["tp2_done"]=True
 
         risk=float(pos["initial_risk"])
@@ -604,13 +706,12 @@ def manage_position(state,analyses,tickers):
             else pos["entry"]-risk
         )
 
-        record_trade([
-            now_utc().isoformat(),pos["symbol"],side,pos["entry"],
-            price,q,pnl,state["paper_balance"],"TP2"
-        ])
-
         msgs.append(
-            f"✅ {pos['symbol']} TP2 40%利確: {pnl:+,.0f}円\n"
+            f"✅ {pos['symbol']} TP2 40%利確\n"
+            f"売買損益: {gross:+,.0f}円\n"
+            f"想定コスト: -{total_cost:,.0f}円\n"
+            f"純利益: {net:+,.0f}円\n"
+            f"累計純利益: {pos['realized_pnl']:+,.0f}円\n"
             f"STOPを+1Rへ"
         )
 
@@ -680,7 +781,7 @@ def notify(t):
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=t.encode("utf-8"),
             headers={
-                "Title": "Musigny 4-Crypto BOT v8",
+                "Title": "Musigny 4-Crypto BOT v9",
                 "Content-Type": "text/plain; charset=utf-8",
             },
             timeout=15,
@@ -743,7 +844,7 @@ def main():
     print_analysis_summary(analyses, failed_symbols)
     log_signals(analyses)
     if not state.get("position"):
-        msg=manage_pending(state,analyses)
+        msg=manage_pending(state,analyses,tickers)
         if msg:
             if msg.startswith("🎯 仮想約定"): notify(msg)
             else: print(msg,flush=True)
