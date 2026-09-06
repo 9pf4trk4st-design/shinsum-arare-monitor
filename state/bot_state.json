@@ -17,8 +17,11 @@
     "tp3_done": false,
     "realized_pnl": 0.0,
     "opened_at": "2026-09-06T07:00:39.911556+00:00",
-    "max_r": 0.0,
-    "exit_logic": "FX_STYLE_V2"
+    "max_r": 0.02843881932490139,
+    "exit_logic": "FX_STYLE_V2_NET",
+    "realized_gross_pnl": 0.0,
+    "realized_cost": 0.0,
+    "entry_half_spread": 0.0
   },
   "pending": null,
   "last_notified": "08cf182c7c08c18d",
