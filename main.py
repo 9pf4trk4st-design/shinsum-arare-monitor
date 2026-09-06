@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Musigny 4-Crypto BOT v9 - FX-style exits + net profit notifications
+# Musigny 4-Crypto BOT v10 - max 2 simultaneous positions + net profit
 from __future__ import annotations
 import os, json, math, csv, hashlib, time, sys
 from dataclasses import dataclass
@@ -37,6 +37,7 @@ PAPER_BALANCE_DEFAULT = float(os.getenv("PAPER_BALANCE", "100000"))
 RISK_PCT = float(os.getenv("RISK_PCT", "0.0075"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
 TP1_PCT, TP2_PCT, TP3_PCT = 0.30, 0.40, 0.30
 PENDING_EXPIRE_HOURS = int(os.getenv("PENDING_EXPIRE_HOURS", "8"))
 
@@ -301,19 +302,46 @@ def analyze(symbol,frames):
 
 def load_state():
     if STATE_FILE.exists():
-        try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except: pass
-    return {"paper_balance":PAPER_BALANCE_DEFAULT,"position":None,"pending":None,"last_notified":None,"daily_date":None,"daily_start_balance":PAPER_BALANCE_DEFAULT,"consecutive_losses":0}
+        try:
+            s=json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if "positions" not in s:
+                old=s.get("position")
+                s["positions"]=[old] if old else []
+            s.pop("position",None)
+            s.setdefault("pending",None)
+            s.setdefault("last_notified",None)
+            s.setdefault("paper_balance",PAPER_BALANCE_DEFAULT)
+            s.setdefault("daily_date",None)
+            s.setdefault("daily_start_balance",s["paper_balance"])
+            s.setdefault("consecutive_losses",0)
+            return s
+        except Exception:
+            pass
+    return {
+        "paper_balance":PAPER_BALANCE_DEFAULT,
+        "positions":[],
+        "pending":None,
+        "last_notified":None,
+        "daily_date":None,
+        "daily_start_balance":PAPER_BALANCE_DEFAULT,
+        "consecutive_losses":0
+    }
 
 def save_state(s): STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding="utf-8")
 
 def can_open(state):
     jst=now_jst().date().isoformat()
-    if state.get("daily_date")!=jst: state["daily_date"]=jst; state["daily_start_balance"]=state["paper_balance"]; state["consecutive_losses"]=0
+    if state.get("daily_date")!=jst:
+        state["daily_date"]=jst
+        state["daily_start_balance"]=state["paper_balance"]
+        state["consecutive_losses"]=0
     dd=(state["paper_balance"]-state["daily_start_balance"])/max(state["daily_start_balance"],1)
-    if dd<=-MAX_DAILY_LOSS_PCT: return False,"1日最大損失到達"
-    if state.get("consecutive_losses",0)>=MAX_CONSECUTIVE_LOSSES: return False,"3連敗停止"
-    if state.get("position"): return False,"ポジション保有中"
+    if dd<=-MAX_DAILY_LOSS_PCT:
+        return False,"1日最大損失到達"
+    if state.get("consecutive_losses",0)>=MAX_CONSECUTIVE_LOSSES:
+        return False,"3連敗停止"
+    if len(state.get("positions",[]))>=MAX_OPEN_POSITIONS:
+        return False,f"最大{MAX_OPEN_POSITIONS}ポジション保有中"
     return True,"OK"
 
 def record_trade(row):
@@ -340,17 +368,14 @@ def make_position(state,p,tickers):
         (state["paper_balance"]*2)/mid
     )
 
-    # エントリー側のスプレッドを想定コストとして保存。
-    # EXITはLONG=BID / SHORT=ASKを使うため、出口側スプレッドは価格に含まれる。
     t=tickers.get(p["symbol"],{})
     try:
-        bid=float(t.get("bid"))
-        ask=float(t.get("ask"))
+        bid=float(t.get("bid")); ask=float(t.get("ask"))
         entry_half_spread=max(ask-bid,0.0)/2
     except Exception:
         entry_half_spread=0.0
 
-    state["position"]={
+    new_position={
         "symbol":p["symbol"],
         "side":p["side"],
         "entry":mid,
@@ -365,25 +390,24 @@ def make_position(state,p,tickers):
         "tp1_done":False,
         "tp2_done":False,
         "tp3_done":False,
-
-        # realized_pnlは「純利益」
         "realized_pnl":0.0,
         "realized_gross_pnl":0.0,
         "realized_cost":0.0,
-
         "entry_half_spread":entry_half_spread,
         "opened_at":now_utc().isoformat(),
         "max_r":0.0,
         "exit_logic":"FX_STYLE_V2_NET"
     }
+    state.setdefault("positions",[]).append(new_position)
 
     return (
         f"🎯 仮想約定 {p['symbol']} {p['side']}\n"
         f"信頼度: {p['confidence']}/100\n"
         f"約定: {mid:,.4f}\n"
         f"数量: {qty:.8f}\n"
+        f"保有数: {len(state['positions'])}/{MAX_OPEN_POSITIONS}\n"
         f"TP1=1.0R / TP2=1.5R / TP3=2.2R\n"
-        f"※以後の損益通知は想定コスト差引後の純利益"
+        f"※損益通知は想定コスト差引後の純利益"
     )
 
 def manage_pending(state,analyses,tickers):
@@ -557,23 +581,17 @@ def settle_piece(state,pos,price,qty,event):
     return gross,trading_cost,leverage_fee,total_cost,net
 
 
-def close_remaining(state,pos,price,event,label):
+def close_remaining_multi(state,pos,price,event,label):
     q=max(pos["qty_remaining"],0)
-
     gross,trading_cost,leverage_fee,total_cost,net=settle_piece(
         state,pos,price,q,event
     )
-
-    # トレード全体の純利益だけを残高へ反映
     state["paper_balance"]+=pos["realized_pnl"]
-
     state["consecutive_losses"]=(
         state.get("consecutive_losses",0)+1
-        if pos["realized_pnl"]<0
-        else 0
+        if pos["realized_pnl"]<0 else 0
     )
-
-    msg=(
+    return (
         f"{label} {pos['symbol']}\n"
         f"今回売買損益: {gross:+,.0f}円\n"
         f"今回想定コスト: -{total_cost:,.0f}円\n"
@@ -582,148 +600,78 @@ def close_remaining(state,pos,price,event,label):
         f"最終純利益: {pos['realized_pnl']:+,.0f}円\n"
         f"残高: {state['paper_balance']:,.0f}円"
     )
-
-    state["position"]=None
-    return msg
-
-def manage_position(state,analyses,tickers):
-    pos=state.get("position")
-    if not pos:
+def manage_positions(state,analyses,tickers):
+    positions=state.get("positions",[])
+    if not positions:
         return []
 
-    migrate_position_exit(pos)
-
-    price=live_exit_price(pos["symbol"],pos["side"],tickers)
-    if price is None:
-        print(f"[POSITION-WARN] {pos['symbol']}: live price unavailable",flush=True)
-        return []
-
-    side=pos["side"]
     msgs=[]
+    survivors=[]
 
-    cur_r=position_r(pos,price)
-    pos["max_r"]=max(float(pos.get("max_r",0.0)),cur_r)
+    for pos in positions:
+        migrate_position_exit(pos)
+        price=live_exit_price(pos["symbol"],pos["side"],tickers)
+        if price is None:
+            print(f"[POSITION-WARN] {pos['symbol']}: live price unavailable",flush=True)
+            survivors.append(pos)
+            continue
 
-    opened=datetime.fromisoformat(pos["opened_at"])
-    age_h=(now_utc()-opened).total_seconds()/3600
+        side=pos["side"]
+        cur_r=position_r(pos,price)
+        pos["max_r"]=max(float(pos.get("max_r",0.0)),cur_r)
+        opened=datetime.fromisoformat(pos["opened_at"])
+        age_h=(now_utc()-opened).total_seconds()/3600
+        tp_hit=lambda level: price>=level if side=="LONG" else price<=level
+        stop_hit=lambda level: price<=level if side=="LONG" else price>=level
 
-    tp_hit=lambda level: price>=level if side=="LONG" else price<=level
-    stop_hit=lambda level: price<=level if side=="LONG" else price>=level
-
-    print(
-        f"[POSITION] {pos['symbol']} {side} "
-        f"ENTRY={pos['entry']:.4f} NOW={price:.4f} "
-        f"R={cur_r:+.2f} MAX_R={pos['max_r']:+.2f} AGE={age_h:.1f}h "
-        f"STOP={pos['stop']:.4f} "
-        f"TP1={pos['tp1']:.4f} TP2={pos['tp2']:.4f} TP3={pos['tp3']:.4f}",
-        flush=True
-    )
-
-    # 1. STOP最優先
-    if stop_hit(pos["stop"]):
-        msgs.append(
-            close_remaining(
-                state,pos,price,"STOP_END","🛑 仮想STOP"
-            )
-        )
-        return msgs
-
-    # 2. 反対方向の強シグナルで撤退
-    if strong_reversal_against_position(pos,analyses):
-        msgs.append(
-            close_remaining(
-                state,pos,price,"REVERSAL_END","🔄 仮想反転決済"
-            )
-        )
-        return msgs
-
-    # 3. 最大12時間で時間切れ
-    if age_h>=MAX_HOLD_HOURS:
-        msgs.append(
-            close_remaining(
-                state,pos,price,"TIME_END","⏰ 仮想時間切れ決済"
-            )
-        )
-        return msgs
-
-    # 4. 8時間後、TP1未達かつ+0.3R以下なら撤退
-    if (
-        age_h>=REVIEW_HOURS and
-        not pos.get("tp1_done",False) and
-        cur_r<=REVIEW_CLOSE_R
-    ):
-        msgs.append(
-            close_remaining(
-                state,pos,price,"REVIEW_END","🕗 仮想見直し決済"
-            )
-        )
-        return msgs
-
-    # 5. +1.5R以上まで伸びた後、最高値から0.6R戻したら全決済
-    if (
-        pos["max_r"]>=TRAIL_START_R and
-        cur_r<=pos["max_r"]-TRAIL_GIVEBACK_R
-    ):
-        msgs.append(
-            close_remaining(
-                state,pos,price,"TRAIL_END","📉 仮想トレーリング決済"
-            )
-        )
-        return msgs
-
-    # 6. TP1 = +1.0R / 30%
-    if not pos.get("tp1_done",False) and tp_hit(pos["tp1"]):
-        q=pos["qty_initial"]*TP1_PCT
-        gross,trading_cost,leverage_fee,total_cost,net=settle_piece(
-            state,pos,price,q,"TP1"
-        )
-        pos["qty_remaining"]-=q
-        pos["tp1_done"]=True
-        pos["stop"]=pos["entry"]
-
-        msgs.append(
-            f"✅ {pos['symbol']} TP1 30%利確\n"
-            f"売買損益: {gross:+,.0f}円\n"
-            f"想定コスト: -{total_cost:,.0f}円\n"
-            f"純利益: {net:+,.0f}円\n"
-            f"累計純利益: {pos['realized_pnl']:+,.0f}円\n"
-            f"STOPを建値へ"
+        print(
+            f"[POSITION] {pos['symbol']} {side} ENTRY={pos['entry']:.4f} NOW={price:.4f} "
+            f"R={cur_r:+.2f} MAX_R={pos['max_r']:+.2f} AGE={age_h:.1f}h "
+            f"STOP={pos['stop']:.4f} TP1={pos['tp1']:.4f} TP2={pos['tp2']:.4f} TP3={pos['tp3']:.4f}",
+            flush=True
         )
 
-    # 7. TP2 = +1.5R / 40%
-    if not pos.get("tp2_done",False) and tp_hit(pos["tp2"]):
-        q=pos["qty_initial"]*TP2_PCT
-        gross,trading_cost,leverage_fee,total_cost,net=settle_piece(
-            state,pos,price,q,"TP2"
-        )
-        pos["qty_remaining"]-=q
-        pos["tp2_done"]=True
+        closed=False
+        if stop_hit(pos["stop"]):
+            msgs.append(close_remaining_multi(state,pos,price,"STOP_END","🛑 仮想STOP")); closed=True
+        elif strong_reversal_against_position(pos,analyses):
+            msgs.append(close_remaining_multi(state,pos,price,"REVERSAL_END","🔄 仮想反転決済")); closed=True
+        elif age_h>=MAX_HOLD_HOURS:
+            msgs.append(close_remaining_multi(state,pos,price,"TIME_END","⏰ 仮想時間切れ決済")); closed=True
+        elif age_h>=REVIEW_HOURS and not pos.get("tp1_done",False) and cur_r<=REVIEW_CLOSE_R:
+            msgs.append(close_remaining_multi(state,pos,price,"REVIEW_END","🕗 仮想見直し決済")); closed=True
+        elif pos["max_r"]>=TRAIL_START_R and cur_r<=pos["max_r"]-TRAIL_GIVEBACK_R:
+            msgs.append(close_remaining_multi(state,pos,price,"TRAIL_END","📉 仮想トレーリング決済")); closed=True
+        else:
+            if not pos.get("tp1_done",False) and tp_hit(pos["tp1"]):
+                q=pos["qty_initial"]*TP1_PCT
+                gross,trading_cost,leverage_fee,total_cost,net=settle_piece(state,pos,price,q,"TP1")
+                pos["qty_remaining"]-=q; pos["tp1_done"]=True; pos["stop"]=pos["entry"]
+                msgs.append(
+                    f"✅ {pos['symbol']} TP1 30%利確\n"
+                    f"売買損益: {gross:+,.0f}円\n想定コスト: -{total_cost:,.0f}円\n"
+                    f"純利益: {net:+,.0f}円\n累計純利益: {pos['realized_pnl']:+,.0f}円\nSTOPを建値へ"
+                )
 
-        risk=float(pos["initial_risk"])
-        pos["stop"]=(
-            pos["entry"]+risk
-            if side=="LONG"
-            else pos["entry"]-risk
-        )
+            if not pos.get("tp2_done",False) and tp_hit(pos["tp2"]):
+                q=pos["qty_initial"]*TP2_PCT
+                gross,trading_cost,leverage_fee,total_cost,net=settle_piece(state,pos,price,q,"TP2")
+                pos["qty_remaining"]-=q; pos["tp2_done"]=True
+                risk=float(pos["initial_risk"])
+                pos["stop"]=pos["entry"]+risk if side=="LONG" else pos["entry"]-risk
+                msgs.append(
+                    f"✅ {pos['symbol']} TP2 40%利確\n"
+                    f"売買損益: {gross:+,.0f}円\n想定コスト: -{total_cost:,.0f}円\n"
+                    f"純利益: {net:+,.0f}円\n累計純利益: {pos['realized_pnl']:+,.0f}円\nSTOPを+1Rへ"
+                )
 
-        msgs.append(
-            f"✅ {pos['symbol']} TP2 40%利確\n"
-            f"売買損益: {gross:+,.0f}円\n"
-            f"想定コスト: -{total_cost:,.0f}円\n"
-            f"純利益: {net:+,.0f}円\n"
-            f"累計純利益: {pos['realized_pnl']:+,.0f}円\n"
-            f"STOPを+1Rへ"
-        )
+            if tp_hit(pos["tp3"]):
+                msgs.append(close_remaining_multi(state,pos,price,"TP3_END","🏁 仮想TP3決済")); closed=True
 
-    # 8. TP3 = +2.2R / 残り全決済
-    if tp_hit(pos["tp3"]):
-        msgs.append(
-            close_remaining(
-                state,pos,price,"TP3_END","🏁 仮想TP3決済"
-            )
-        )
-        return msgs
+        if not closed:
+            survivors.append(pos)
 
+    state["positions"]=survivors
     return msgs
 
 def log_signals(analyses):
@@ -767,8 +715,16 @@ def print_analysis_summary(analyses, failed_symbols=None):
     print("======================================", flush=True)
     print("", flush=True)
 
-def choose_winner(analyses):
-    valid=[a for a in analyses if a.side!="WAIT" and a.confidence>=ENTRY_THRESHOLD]
+def choose_winner(analyses,state):
+    open_symbols={p["symbol"] for p in state.get("positions",[])}
+    pending_symbol=(state.get("pending") or {}).get("symbol")
+    valid=[
+        a for a in analyses
+        if a.side!="WAIT"
+        and a.confidence>=ENTRY_THRESHOLD
+        and a.symbol not in open_symbols
+        and a.symbol!=pending_symbol
+    ]
     return sorted(valid,key=lambda a:a.confidence,reverse=True)[0] if valid else None
 
 def create_pending(state,a):
@@ -781,7 +737,7 @@ def notify(t):
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=t.encode("utf-8"),
             headers={
-                "Title": "Musigny 4-Crypto BOT v9",
+                "Title": "Musigny 4-Crypto BOT v10",
                 "Content-Type": "text/plain; charset=utf-8",
             },
             timeout=15,
@@ -826,41 +782,65 @@ def main():
             analyses.append(analyze(symbol,frames))
         except Exception as e:
             failed_symbols.append(symbol)
-            print(f"[DATA-SKIP] {symbol}: skip this cycle ({e})", flush=True)
+            print(f"[DATA-SKIP] {symbol}: skip this cycle ({e})",flush=True)
+
     state=load_state()
     tickers=fetch_live_tickers()
 
-    # 保有中ポジションは最新価格で先に決済監視
-    for m in manage_position(state,analyses,tickers):
+    # 最大2ポジションをそれぞれ独立監視
+    for m in manage_positions(state,analyses,tickers):
         notify("📊 "+m)
 
     if not analyses:
-        print("[DATA-WAIT] No symbols available. Position monitoring only.", flush=True)
+        print("[DATA-WAIT] No symbols available. Position monitoring only.",flush=True)
         save_state(state); return
 
     if failed_symbols:
-        print("[DATA-INFO] skipped symbols: "+", ".join(failed_symbols), flush=True)
+        print("[DATA-INFO] skipped symbols: "+", ".join(failed_symbols),flush=True)
 
-    print_analysis_summary(analyses, failed_symbols)
+    print_analysis_summary(analyses,failed_symbols)
     log_signals(analyses)
-    if not state.get("position"):
+
+    # 待機注文があれば約定判定。1ポジション保有中でも2個目は約定可能。
+    if state.get("pending"):
         msg=manage_pending(state,analyses,tickers)
         if msg:
             if msg.startswith("🎯 仮想約定"): notify(msg)
             else: print(msg,flush=True)
-    if not state.get("position") and not state.get("pending"):
-        winner=choose_winner(analyses); ranking=rank_text(analyses)
+
+    # 空き枠があれば、保有中でない別銘柄から次候補を1つ作る
+    if len(state.get("positions",[]))<MAX_OPEN_POSITIONS and not state.get("pending"):
+        winner=choose_winner(analyses,state)
+        ranking=rank_text(analyses)
         if winner:
             key=hashlib.sha1(f"{winner.symbol}:{winner.candle_id}:{winner.side}".encode()).hexdigest()[:16]
             if state.get("last_notified")!=key:
                 ok,why=can_open(state)
-                if ok: create_pending(state,winner); print(fmt_candidate(winner,ranking,state),flush=True); state["last_notified"]=key
-                else: print("新規停止:",why)
-            else: print(ranking)
-        else: print("[TRADE] No entry candidate this cycle", flush=True); print(ranking, flush=True)
+                if ok:
+                    create_pending(state,winner)
+                    print(fmt_candidate(winner,ranking,state),flush=True)
+                    state["last_notified"]=key
+                else:
+                    print("新規停止:",why,flush=True)
+            else:
+                print(ranking,flush=True)
+        else:
+            print("[TRADE] No additional entry candidate this cycle",flush=True)
+            print(ranking,flush=True)
+
+    positions=state.get("positions",[])
+    if positions:
+        print(
+            f"[STATE] OPEN_POSITIONS: {len(positions)}/{MAX_OPEN_POSITIONS} | "+
+            ", ".join(p["symbol"] for p in positions),
+            flush=True
+        )
     else:
-        if state.get("position"): print("[STATE] OPEN_POSITION:", state["position"]["symbol"], flush=True)
-        elif state.get("pending"): print("[STATE] PENDING:", state["pending"]["symbol"], flush=True)
+        print(f"[STATE] OPEN_POSITIONS: 0/{MAX_OPEN_POSITIONS}",flush=True)
+
+    if state.get("pending"):
+        print("[STATE] PENDING:",state["pending"]["symbol"],flush=True)
+
     save_state(state)
 
 if __name__=="__main__": main()
