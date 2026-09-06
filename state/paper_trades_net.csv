@@ -1,0 +1,2 @@
+time,symbol,side,entry,exit,qty_closed,gross_pnl,trading_cost,leverage_fee,total_cost,net_pnl,balance,event
+2026-09-06T15:00:44.954531+00:00,ETH,LONG,392023.4428571429,387601.0,0.0837704821249072,-370.4701703127118,0.0,0.0,0.0,-370.4701703127118,101941.53630967898,REVIEW_END
