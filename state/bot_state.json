@@ -1,18 +1,6 @@
 {
   "paper_balance": 101941.53630967898,
-  "pending": {
-    "symbol": "XRP",
-    "side": "LONG",
-    "confidence": 67,
-    "entry_low": 221.2102285714286,
-    "entry_high": 221.50105714285715,
-    "stop": 219.82423214285714,
-    "tp1": 222.8870535714286,
-    "tp2": 223.65275892857147,
-    "tp3": 224.72474642857148,
-    "created_at": "2026-09-06T07:36:27.633528+00:00",
-    "candle_id": "2026-09-06 07:15:00+00:00"
-  },
+  "pending": null,
   "last_notified": "6877600ad1978313",
   "daily_date": "2026-09-06",
   "daily_start_balance": 100231.03947470934,
@@ -40,6 +28,29 @@
       "realized_gross_pnl": 0.0,
       "realized_cost": 0.0,
       "entry_half_spread": 0.0
+    },
+    {
+      "symbol": "XRP",
+      "side": "LONG",
+      "entry": 221.35564285714287,
+      "qty_initial": 499.2530842251521,
+      "qty_remaining": 499.2530842251521,
+      "stop": 219.82423214285714,
+      "original_stop": 219.82423214285714,
+      "initial_risk": 1.5314107142857267,
+      "tp1": 222.8870535714286,
+      "tp2": 223.65275892857147,
+      "tp3": 224.72474642857148,
+      "tp1_done": false,
+      "tp2_done": false,
+      "tp3_done": false,
+      "realized_pnl": 0.0,
+      "realized_gross_pnl": 0.0,
+      "realized_cost": 0.0,
+      "entry_half_spread": 0.0660000000000025,
+      "opened_at": "2026-09-06T07:42:20.755294+00:00",
+      "max_r": 0.0,
+      "exit_logic": "FX_STYLE_V2_NET"
     }
   ]
 }
