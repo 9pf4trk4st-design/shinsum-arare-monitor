@@ -49,7 +49,7 @@
       "realized_cost": 0.0,
       "entry_half_spread": 40.0,
       "opened_at": "2026-09-06T19:52:05.508204+00:00",
-      "max_r": 0.6761432820033083,
+      "max_r": 0.8319686770431828,
       "exit_logic": "FX_STYLE_V2_NET"
     }
   ]
