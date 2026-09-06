@@ -1,18 +1,6 @@
 {
   "paper_balance": 101085.97044617234,
-  "pending": {
-    "symbol": "ETH",
-    "side": "LONG",
-    "confidence": 60,
-    "entry_low": 389360.1885714286,
-    "entry_high": 389785.29714285716,
-    "stop": 385953.3071428572,
-    "tp1": 393192.1785714286,
-    "tp2": 395001.89642857143,
-    "tp3": 397535.5014285714,
-    "created_at": "2026-09-06T19:44:46.280724+00:00",
-    "candle_id": "2026-09-06 19:15:00+00:00"
-  },
+  "pending": null,
   "last_notified": "08cb2a821adee5e3",
   "daily_date": "2026-09-07",
   "daily_start_balance": 101571.06613936627,
@@ -39,6 +27,29 @@
       "entry_half_spread": 7.0,
       "opened_at": "2026-09-06T15:06:57.326800+00:00",
       "max_r": 0.43068272482048797,
+      "exit_logic": "FX_STYLE_V2_NET"
+    },
+    {
+      "symbol": "ETH",
+      "side": "LONG",
+      "entry": 389572.7428571429,
+      "qty_initial": 0.2094649106085622,
+      "qty_remaining": 0.2094649106085622,
+      "stop": 385953.3071428572,
+      "original_stop": 385953.3071428572,
+      "initial_risk": 3619.4357142857043,
+      "tp1": 393192.1785714286,
+      "tp2": 395001.89642857143,
+      "tp3": 397535.5014285714,
+      "tp1_done": false,
+      "tp2_done": false,
+      "tp3_done": false,
+      "realized_pnl": 0.0,
+      "realized_gross_pnl": 0.0,
+      "realized_cost": 0.0,
+      "entry_half_spread": 40.0,
+      "opened_at": "2026-09-06T19:52:05.508204+00:00",
+      "max_r": 0.0,
       "exit_logic": "FX_STYLE_V2_NET"
     }
   ]
