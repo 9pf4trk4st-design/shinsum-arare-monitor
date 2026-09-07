@@ -1,18 +1,6 @@
 {
   "paper_balance": 101034.69069139443,
-  "pending": {
-    "symbol": "BTC",
-    "side": "LONG",
-    "confidence": 93,
-    "entry_low": 12504274.028571429,
-    "entry_high": 12511200.257142857,
-    "stop": 12415671.107142856,
-    "tp1": 12599803.178571427,
-    "tp2": 12645836.19642857,
-    "tp3": 12710282.42142857,
-    "created_at": "2026-09-06T23:12:31.371549+00:00",
-    "candle_id": "2026-09-06 22:45:00+00:00"
-  },
+  "pending": null,
   "last_notified": "229d8d4b93b36d06",
   "daily_date": "2026-09-07",
   "daily_start_balance": 101571.06613936627,
@@ -39,6 +27,29 @@
       "entry_half_spread": 40.0,
       "opened_at": "2026-09-06T19:52:05.508204+00:00",
       "max_r": 1.1983241270837386,
+      "exit_logic": "FX_STYLE_V2_NET"
+    },
+    {
+      "symbol": "BTC",
+      "side": "LONG",
+      "entry": 12507737.142857142,
+      "qty_initial": 0.008230615930255375,
+      "qty_remaining": 0.008230615930255375,
+      "stop": 12415671.107142856,
+      "original_stop": 12415671.107142856,
+      "initial_risk": 92066.03571428545,
+      "tp1": 12599803.178571427,
+      "tp2": 12645836.19642857,
+      "tp3": 12710282.42142857,
+      "tp1_done": false,
+      "tp2_done": false,
+      "tp3_done": false,
+      "realized_pnl": 0.0,
+      "realized_gross_pnl": 0.0,
+      "realized_cost": 0.0,
+      "entry_half_spread": 237.0,
+      "opened_at": "2026-09-07T00:48:44.311479+00:00",
+      "max_r": 0.0,
       "exit_logic": "FX_STYLE_V2_NET"
     }
   ]
