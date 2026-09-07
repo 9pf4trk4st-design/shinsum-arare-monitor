@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Musigny 4-Crypto BOT v10 - max 2 simultaneous positions + net profit
+# Musigny 4-Crypto BOT v11 - higher-timeframe range rotation + net profit
 from __future__ import annotations
 import os, json, math, csv, hashlib, time, sys
 from dataclasses import dataclass
@@ -61,12 +61,25 @@ LEVERAGE_DAILY_RATE = float(os.getenv("LEVERAGE_DAILY_RATE", "0.0004"))
 RCI_EXTREME = 75.0
 RCI_STRONG_EXTREME = 85.0
 
+# ===== v11 レンジ回転設定 =====
+RANGE_LOOKBACK_1H = int(os.getenv("RANGE_LOOKBACK_1H", "48"))
+RANGE_EDGE_PCT = float(os.getenv("RANGE_EDGE_PCT", "0.22"))
+RANGE_BREAK_ATR = float(os.getenv("RANGE_BREAK_ATR", "0.18"))
+RANGE_MIN_TOUCHES = int(os.getenv("RANGE_MIN_TOUCHES", "2"))
+RANGE_MIN_WIDTH_PCT = float(os.getenv("RANGE_MIN_WIDTH_PCT", "0.006"))
+RANGE_MAX_WIDTH_PCT = float(os.getenv("RANGE_MAX_WIDTH_PCT", "0.08"))
+
 @dataclass
 class Analysis:
     symbol: str; side: str; score_long: int; score_short: int; confidence: int
     price: float; entry_low: float|None; entry_high: float|None; stop: float|None
     tp1: float|None; tp2: float|None; tp3: float|None; reasons: list[str]
     invalidation: str; candle_id: str; candle_high: float; candle_low: float
+    regime: str = "UNKNOWN"
+    range_low: float|None = None
+    range_high: float|None = None
+    range_mid: float|None = None
+    range_pos: float|None = None
 
 def now_utc(): return datetime.now(timezone.utc)
 def now_jst(): return now_utc() + timedelta(hours=9)
@@ -233,72 +246,279 @@ def score_fib(price,candle,levels):
             if candle.close<=lv<=candle.high and candle.close<candle.open: S+=w; rs.append(f"週足Fib{name}拒否")
     return L,S,rl,rs
 
+
+def _pivot_touch_count(vals, level, tol):
+    return sum(1 for v in vals if abs(v-level) <= tol)
+
+def detect_1h_range(H1):
+    x=H1.iloc[-max(RANGE_LOOKBACK_1H,30):].reset_index(drop=True)
+    highs,lows=pivot_levels(x,left=2,right=2)
+    if len(highs)<2 or len(lows)<2:
+        return None
+
+    hvals=[v for _,v in highs[-8:]]
+    lvals=[v for _,v in lows[-8:]]
+    rh=float(np.median(hvals[-min(4,len(hvals)):]))
+    rl=float(np.median(lvals[-min(4,len(lvals)):]))
+    if not math.isfinite(rh) or not math.isfinite(rl) or rh<=rl:
+        return None
+
+    width=rh-rl
+    mid=(rh+rl)/2
+    width_pct=width/max(mid,1e-12)
+    if width_pct<RANGE_MIN_WIDTH_PCT or width_pct>RANGE_MAX_WIDTH_PCT:
+        return None
+
+    atr=float(H1["atr"].iloc[-1]) if "atr" in H1 else width*0.1
+    tol=max(width*0.10, atr*0.35, mid*0.0015)
+
+    top_touches=_pivot_touch_count(hvals,rh,tol)
+    bot_touches=_pivot_touch_count(lvals,rl,tol)
+    if top_touches<RANGE_MIN_TOUCHES or bot_touches<RANGE_MIN_TOUCHES:
+        return None
+
+    return {
+        "low":rl, "high":rh, "mid":mid, "width":width,
+        "width_pct":width_pct, "atr":atr,
+        "top_touches":top_touches, "bottom_touches":bot_touches
+    }
+
+def market_regime(H4,H1,rg):
+    h4=trend_state_ind(H4)
+    h1=trend_state_ind(H1)
+
+    if h4=="BULL" and h1=="BULL":
+        return "UP"
+    if h4=="BEAR" and h1=="BEAR":
+        return "DOWN"
+
+    if rg is not None:
+        last=float(H1.iloc[-1]["close"])
+        atr=max(float(rg["atr"]),1e-12)
+        if last > rg["high"] + atr*RANGE_BREAK_ATR:
+            return "UP"
+        if last < rg["low"] - atr*RANGE_BREAK_ATR:
+            return "DOWN"
+        return "RANGE"
+
+    if h4=="BULL":
+        return "UP"
+    if h4=="BEAR":
+        return "DOWN"
+    return "MIXED"
+
+def range_position(price,rg):
+    if rg is None:
+        return None
+    return (price-rg["low"])/max(rg["width"],1e-12)
+
+def range_targets(side,entry,stop,rg):
+    low,high,mid=rg["low"],rg["high"],rg["mid"]
+    pad=rg["width"]*0.06
+
+    if side=="LONG":
+        tp1=max(entry+(mid-entry)*0.70, entry+abs(entry-stop)*0.8)
+        tp2=low+rg["width"]*0.78
+        tp3=high-pad
+        vals=sorted([tp1,tp2,tp3])
+        return vals[0],vals[1],vals[2]
+
+    tp1=min(entry-(entry-mid)*0.70, entry-abs(entry-stop)*0.8)
+    tp2=high-rg["width"]*0.78
+    tp3=low+pad
+    vals=sorted([tp1,tp2,tp3], reverse=True)
+    return vals[0],vals[1],vals[2]
+
+
 def analyze(symbol,frames):
     W,D,H4,H1,M15,M5=[indicators(frames[k]) for k in ("1week","1day","4hour","1hour","15min","5min")]
-    c15,p15,c5=M15.iloc[-1],M15.iloc[-2],M5.iloc[-1]; p=float(c15.close); L=S=0; rl=[]; rs=[]
+    c15,p15,c5=M15.iloc[-1],M15.iloc[-2],M5.iloc[-1]
+    p=float(c15.close)
 
-    # 4H・1Hの方向
-    for label,st,w in [("4H",trend_state_ind(H4),20),("1H",trend_state_ind(H1),15)]:
-        if st=="BULL": L+=w; rl.append(f"{label}上向き")
-        elif st=="BEAR": S+=w; rs.append(f"{label}下向き")
+    rg=detect_1h_range(H1)
+    regime=market_regime(H4,H1,rg)
+    rpos=range_position(p,rg)
 
-    # 週足・日足の青/緑RCI
+    L=S=0
+    rl=[]
+    rs=[]
+
     bias,bpts=higher_rci_bias(W,D)
-    if bias in ("UP","STRONG_UP"): L+=bpts; rl.append("週足・日足 青/緑RCI上向き")
-    elif bias in ("DOWN","STRONG_DOWN"): S+=bpts; rs.append("週足・日足 青/緑RCI下向き")
+    if bias in ("UP","STRONG_UP"):
+        L+=bpts; rl.append("週足・日足 青/緑RCI上向き")
+    elif bias in ("DOWN","STRONG_DOWN"):
+        S+=bpts; rs.append("週足・日足 青/緑RCI下向き")
 
-    # 15分をメイン
-    if c15.close>c15.ema12 and c15.ema_slope5>0: L+=12; rl.append("15分12EMA上")
-    elif c15.close<c15.ema12 and c15.ema_slope5<0: S+=12; rs.append("15分12EMA下")
+    if regime=="UP":
+        L+=20; rl.append("4H・1H 上昇環境")
+    elif regime=="DOWN":
+        S+=20; rs.append("4H・1H 下降環境")
+    elif regime=="RANGE":
+        rl.append("1Hレンジ相場")
+        rs.append("1Hレンジ相場")
+
+    if c15.close>c15.ema12 and c15.ema_slope5>0:
+        L+=8; rl.append("15分EMA上向き")
+    elif c15.close<c15.ema12 and c15.ema_slope5<0:
+        S+=8; rs.append("15分EMA下向き")
+
     if pd.notna(c15.rci8) and pd.notna(c15.rci25):
-        if c15.rci8>p15.rci8 and c15.rci25>=p15.rci25: L+=8; rl.append("15分RCI短中期上向き")
-        if c15.rci8<p15.rci8 and c15.rci25<=p15.rci25: S+=8; rs.append("15分RCI短中期下向き")
+        if c15.rci8>p15.rci8 and c15.rci25>=p15.rci25:
+            L+=8; rl.append("15分RCI短中期上向き")
+        if c15.rci8<p15.rci8 and c15.rci25<=p15.rci25:
+            S+=8; rs.append("15分RCI短中期下向き")
 
-    # Musigny式: 上位青緑方向 + 下位赤RCI端から反転
-    for label,ind,scale in [("4H",H4,1.0),("1H",H1,.9),("15分",M15,.85)]:
-        rev,pts=red_rci_reversal(ind); pts=int(round(pts*scale))
-        if bias in ("UP","STRONG_UP") and rev=="LONG": L+=pts; rl.append(f"{label}赤RCI下端→上向き反転")
-        elif bias in ("DOWN","STRONG_DOWN") and rev=="SHORT": S+=pts; rs.append(f"{label}赤RCI上端→下向き反転")
-        elif rev=="LONG": L+=3; rl.append(f"{label}赤RCI上向き反転(上位足一致なし)")
-        elif rev=="SHORT": S+=3; rs.append(f"{label}赤RCI下向き反転(上位足一致なし)")
-
-    # 5分は最終タイミングのみ
+    rev15,pts15=red_rci_reversal(M15)
     rev5,_=red_rci_reversal(M5)
-    if bias in ("UP","STRONG_UP") and rev5=="LONG": L+=8; rl.append("5分赤RCI下端→上向き(最終タイミング)")
-    if bias in ("DOWN","STRONG_DOWN") and rev5=="SHORT": S+=8; rs.append("5分赤RCI上端→下向き(最終タイミング)")
-    if c5.close>c5.ema12 and c5.ema_slope5>0: L+=3
-    elif c5.close<c5.ema12 and c5.ema_slope5<0: S+=3
 
-    # 1H構造
+    if rg is not None and rpos is not None:
+        near_low=rpos<=RANGE_EDGE_PCT
+        near_high=rpos>=1-RANGE_EDGE_PCT
+
+        if regime=="RANGE":
+            if near_low:
+                L+=20; rl.append(f"1Hレンジ下限側({rpos:.2f})")
+                if rev15=="LONG":
+                    L+=int(pts15*0.9); rl.append("15分赤RCI下端→上向き")
+                if rev5=="LONG":
+                    L+=10; rl.append("5分赤RCI下端→上向き(発射)")
+            if near_high:
+                S+=20; rs.append(f"1Hレンジ上限側({rpos:.2f})")
+                if rev15=="SHORT":
+                    S+=int(pts15*0.9); rs.append("15分赤RCI上端→下向き")
+                if rev5=="SHORT":
+                    S+=10; rs.append("5分赤RCI上端→下向き(発射)")
+
+        elif regime=="UP":
+            if near_low or rpos<=0.45:
+                L+=14; rl.append(f"上昇環境の押し目ゾーン({rpos:.2f})")
+                if rev15=="LONG":
+                    L+=int(pts15*0.9); rl.append("15分赤RCI下端→上向き")
+                if rev5=="LONG":
+                    L+=10; rl.append("5分赤RCI下端→上向き(発射)")
+            if near_high:
+                S-=12
+
+        elif regime=="DOWN":
+            if near_high or rpos>=0.55:
+                S+=14; rs.append(f"下降環境の戻りゾーン({rpos:.2f})")
+                if rev15=="SHORT":
+                    S+=int(pts15*0.9); rs.append("15分赤RCI上端→下向き")
+                if rev5=="SHORT":
+                    S+=10; rs.append("5分赤RCI上端→下向き(発射)")
+            if near_low:
+                L-=12
+
+    else:
+        for label,ind,scale in [("4H",H4,1.0),("1H",H1,.9),("15分",M15,.85)]:
+            rev,pts=red_rci_reversal(ind)
+            pts=int(round(pts*scale))
+            if bias in ("UP","STRONG_UP") and rev=="LONG":
+                L+=pts; rl.append(f"{label}赤RCI下端→上向き反転")
+            elif bias in ("DOWN","STRONG_DOWN") and rev=="SHORT":
+                S+=pts; rs.append(f"{label}赤RCI上端→下向き反転")
+        if bias in ("UP","STRONG_UP") and rev5=="LONG":
+            L+=8
+        if bias in ("DOWN","STRONG_DOWN") and rev5=="SHORT":
+            S+=8
+
     rh,rlow=structure(H1)
-    if p>rh: L+=10; rl.append("1H戻り高値突破")
-    elif p>rlow and abs(p-rlow)/p<.012 and c15.close>c15.open: L+=10; rl.append("1H押し安値反発")
-    if p<rlow: S+=10; rs.append("1H押し安値割れ")
-    elif p<rh and abs(p-rh)/p<.012 and c15.close<c15.open: S+=10; rs.append("1H戻り高値拒否")
+    if p>rh:
+        L+=6
+    if p<rlow:
+        S+=6
 
-    flo,fhi,fsource=major_fib(symbol,W); fL,fS,frL,frS=score_fib(p,c15,fib_levels(flo,fhi)); L+=fL; S+=fS; rl+=frL; rs+=frS
+    flo,fhi,fsource=major_fib(symbol,W)
+    fL,fS,frL,frS=score_fib(p,c15,fib_levels(flo,fhi))
+    L+=fL; S+=fS; rl+=frL; rs+=frS
+
     if pd.notna(c15.span_a) and pd.notna(c15.span_b):
         hi=max(c15.span_a,c15.span_b); lo=min(c15.span_a,c15.span_b)
-        if p>hi: L+=5; rl.append("15分雲上")
-        elif p<lo: S+=5; rs.append("15分雲下")
+        if p>hi: L+=4
+        elif p<lo: S+=4
+
     if pd.notna(c15.vol_ma20) and c15.volume>c15.vol_ma20*1.25:
-        if c15.close>c15.open: L+=4; rl.append("出来高増陽線")
-        elif c15.close<c15.open: S+=4; rs.append("出来高増陰線")
+        if c15.close>c15.open: L+=3
+        elif c15.close<c15.open: S+=3
 
-    side="WAIT"; confidence=max(L,S); reasons=[f"LONG {L}/SHORT {S}",f"Fib={fsource}"]
-    if L>=ENTRY_THRESHOLD and L>=S+OPPOSITE_GAP: side="LONG"; confidence=min(100,L); reasons=rl
-    elif S>=ENTRY_THRESHOLD and S>=L+OPPOSITE_GAP: side="SHORT"; confidence=min(100,S); reasons=rs
+    allow_long=True
+    allow_short=True
+    if regime=="UP":
+        allow_short=False
+    elif regime=="DOWN":
+        allow_long=False
+
+    side="WAIT"
+    confidence=max(L,S)
+    reasons=[f"LONG {L}/SHORT {S}",f"REGIME={regime}",f"Fib={fsource}"]
+
+    if allow_long and L>=ENTRY_THRESHOLD and L>=S+OPPOSITE_GAP:
+        side="LONG"; confidence=min(100,L); reasons=rl
+    elif allow_short and S>=ENTRY_THRESHOLD and S>=L+OPPOSITE_GAP:
+        side="SHORT"; confidence=min(100,S); reasons=rs
+
     candle_id=str(c15.time)
-    if side=="WAIT": return Analysis(symbol,side,L,S,confidence,p,None,None,None,None,None,None,reasons,"条件不足",candle_id,float(c15.high),float(c15.low))
 
-    atr=float(H1.atr.iloc[-1]); atr=atr if math.isfinite(atr) and atr>0 else p*.012
-    if side=="LONG":
-        entry_high=p-.08*atr; entry_low=p-.32*atr; stop=min(entry_low-.75*atr,rlow-.15*atr); mid=(entry_low+entry_high)/2; risk=max(mid-stop,p*.003)
-        tp1,tp2,tp3=mid+TP1_R*risk,mid+TP2_R*risk,mid+TP3_R*risk; invalid=f"1H押し安値 {rlow:,.4f} 割れ"
+    if side=="WAIT":
+        return Analysis(
+            symbol,side,L,S,confidence,p,
+            None,None,None,None,None,None,
+            reasons,"条件不足",candle_id,float(c15.high),float(c15.low),
+            regime,
+            rg["low"] if rg else None,
+            rg["high"] if rg else None,
+            rg["mid"] if rg else None,
+            rpos
+        )
+
+    atr=float(H1.atr.iloc[-1])
+    atr=atr if math.isfinite(atr) and atr>0 else p*.012
+
+    if rg is not None and regime=="RANGE":
+        pad=max(rg["width"]*0.08,atr*0.30)
+
+        if side=="LONG":
+            entry_high=min(p,rg["low"]+rg["width"]*0.22)
+            entry_low=max(rg["low"]-pad*0.10,entry_high-atr*0.20)
+            mid=(entry_low+entry_high)/2
+            stop=rg["low"]-pad
+            tp1,tp2,tp3=range_targets("LONG",mid,stop,rg)
+            invalid=f"1Hレンジ下限 {rg['low']:,.4f} 明確割れ"
+        else:
+            entry_low=max(p,rg["high"]-rg["width"]*0.22)
+            entry_high=min(rg["high"]+pad*0.10,entry_low+atr*0.20)
+            mid=(entry_low+entry_high)/2
+            stop=rg["high"]+pad
+            tp1,tp2,tp3=range_targets("SHORT",mid,stop,rg)
+            invalid=f"1Hレンジ上限 {rg['high']:,.4f} 明確上抜け"
     else:
-        entry_low=p+.08*atr; entry_high=p+.32*atr; stop=max(entry_high+.75*atr,rh+.15*atr); mid=(entry_low+entry_high)/2; risk=max(stop-mid,p*.003)
-        tp1,tp2,tp3=mid-TP1_R*risk,mid-TP2_R*risk,mid-TP3_R*risk; invalid=f"1H戻り高値 {rh:,.4f} 上抜け"
-    return Analysis(symbol,side,L,S,confidence,p,entry_low,entry_high,stop,tp1,tp2,tp3,reasons,invalid,candle_id,float(c15.high),float(c15.low))
+        if side=="LONG":
+            entry_high=p-.08*atr
+            entry_low=p-.32*atr
+            stop=min(entry_low-.75*atr,rlow-.15*atr)
+            mid=(entry_low+entry_high)/2
+            risk=max(mid-stop,p*.003)
+            tp1,tp2,tp3=mid+TP1_R*risk,mid+TP2_R*risk,mid+TP3_R*risk
+            invalid=f"1H押し安値 {rlow:,.4f} 割れ"
+        else:
+            entry_low=p+.08*atr
+            entry_high=p+.32*atr
+            stop=max(entry_high+.75*atr,rh+.15*atr)
+            mid=(entry_low+entry_high)/2
+            risk=max(stop-mid,p*.003)
+            tp1,tp2,tp3=mid-TP1_R*risk,mid-TP2_R*risk,mid-TP3_R*risk
+            invalid=f"1H戻り高値 {rh:,.4f} 上抜け"
+
+    return Analysis(
+        symbol,side,L,S,confidence,p,
+        entry_low,entry_high,stop,tp1,tp2,tp3,
+        reasons,invalid,candle_id,float(c15.high),float(c15.low),
+        regime,
+        rg["low"] if rg else None,
+        rg["high"] if rg else None,
+        rg["mid"] if rg else None,
+        rpos
+    )
 
 def load_state():
     if STATE_FILE.exists():
@@ -396,7 +616,11 @@ def make_position(state,p,tickers):
         "entry_half_spread":entry_half_spread,
         "opened_at":now_utc().isoformat(),
         "max_r":0.0,
-        "exit_logic":"FX_STYLE_V2_NET"
+        "exit_logic":"FX_STYLE_V2_NET",
+        "regime":getattr(p,"regime","UNKNOWN"),
+        "range_low":getattr(p,"range_low",None),
+        "range_high":getattr(p,"range_high",None),
+        "range_mid":getattr(p,"range_mid",None)
     }
     state.setdefault("positions",[]).append(new_position)
 
@@ -678,8 +902,8 @@ def log_signals(analyses):
     exists=SIGNALS_FILE.exists()
     with SIGNALS_FILE.open("a",newline="",encoding="utf-8") as f:
         w=csv.writer(f)
-        if not exists: w.writerow(["time","symbol","side","long","short","confidence","price"])
-        for a in analyses: w.writerow([now_utc().isoformat(),a.symbol,a.side,a.score_long,a.score_short,a.confidence,a.price])
+        if not exists: w.writerow(["time","symbol","side","long","short","confidence","price","regime","range_low","range_high","range_mid","range_pos"])
+        for a in analyses: w.writerow([now_utc().isoformat(),a.symbol,a.side,a.score_long,a.score_short,a.confidence,a.price,a.regime,a.range_low,a.range_high,a.range_mid,a.range_pos])
 
 def rank_text(analyses):
     ranking=sorted(analyses,key=lambda a:a.confidence,reverse=True)
@@ -708,7 +932,7 @@ def print_analysis_summary(analyses, failed_symbols=None):
         print(
             f"{symbol:>3} | {a.side:<5} | "
             f"LONG={a.score_long:>3} SHORT={a.score_short:>3} "
-            f"CONF={a.confidence:>3} {strength}",
+            f"CONF={a.confidence:>3} {strength} | REGIME={a.regime}",
             flush=True
         )
 
@@ -737,7 +961,7 @@ def notify(t):
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=t.encode("utf-8"),
             headers={
-                "Title": "Musigny 4-Crypto BOT v10",
+                "Title": "Musigny 4-Crypto BOT v11",
                 "Content-Type": "text/plain; charset=utf-8",
             },
             timeout=15,
@@ -745,6 +969,18 @@ def notify(t):
 
 def fmt_candidate(a,ranking,state):
     strength = "強シグナル" if a.confidence >= STRONG_THRESHOLD else "候補"
+
+    range_text = ""
+    if (
+        a.range_low is not None
+        and a.range_high is not None
+        and a.range_pos is not None
+    ):
+        range_text = (
+            f"1Hレンジ: {a.range_low:,.4f} - {a.range_high:,.4f} "
+            f"/ 位置={a.range_pos:.2f}\n"
+        )
+
     return (
         f"===== ENTRY {strength} =====\n"
         f"銘柄: {a.symbol}\n"
@@ -752,6 +988,8 @@ def fmt_candidate(a,ranking,state):
         f"信頼度: {a.confidence}/100\n"
         f"{ranking}\n"
         f"現在値: {a.price:,.4f}\n"
+        f"相場環境: {a.regime}\n"
+        f"{range_text}"
         f"待機エントリー帯: "
         f"{min(a.entry_low,a.entry_high):,.4f} - "
         f"{max(a.entry_low,a.entry_high):,.4f}\n"
