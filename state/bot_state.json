@@ -1,10 +1,10 @@
 {
-  "paper_balance": 100085.6074812825,
+  "paper_balance": 99258.04436339169,
   "pending": null,
   "last_notified": "8913ebb7955c6e1b",
   "daily_date": "2026-09-07",
   "daily_start_balance": 101571.06613936627,
-  "consecutive_losses": 0,
+  "consecutive_losses": 1,
   "positions": [
     {
       "symbol": "XRP",
@@ -26,30 +26,7 @@
       "realized_cost": 0.0,
       "entry_half_spread": 0.011500000000012278,
       "opened_at": "2026-09-07T07:44:29.664874+00:00",
-      "max_r": 0.6599733847549689,
-      "exit_logic": "FX_STYLE_V2_NET"
-    },
-    {
-      "symbol": "BTC",
-      "side": "LONG",
-      "entry": 12293885.014285713,
-      "qty_initial": 0.015526508369297544,
-      "qty_remaining": 0.015526508369297544,
-      "stop": 12245539.176428571,
-      "original_stop": 12245539.176428571,
-      "initial_risk": 48345.83785714209,
-      "tp1": 12342230.852142856,
-      "tp2": 12366403.771071427,
-      "tp3": 12400245.857571427,
-      "tp1_done": false,
-      "tp2_done": false,
-      "tp3_done": false,
-      "realized_pnl": 0.0,
-      "realized_gross_pnl": 0.0,
-      "realized_cost": 0.0,
-      "entry_half_spread": 454.0,
-      "opened_at": "2026-09-07T13:08:25.469046+00:00",
-      "max_r": 0.2298643731674381,
+      "max_r": 0.6828088572147805,
       "exit_logic": "FX_STYLE_V2_NET"
     }
   ]
