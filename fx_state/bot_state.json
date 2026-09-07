@@ -1,26 +1,32 @@
 {
-  "paper_balance": 100000.0,
-  "position": {
-    "symbol": "GBP_JPY",
+  "paper_balance": 100192.30919500663,
+  "position": null,
+  "pending": {
+    "symbol": "USD_JPY",
     "side": "SHORT",
-    "entry": 211.21423571428573,
-    "qty_initial": 221.7496256655149,
-    "qty_remaining": 221.7496256655149,
-    "stop": 214.59642857142856,
-    "original_stop": 214.59642857142856,
-    "initial_risk": 3.382192857142826,
-    "tp1": 207.8320428571429,
-    "tp2": 206.1409464285715,
-    "tp3": 203.7734114285715,
-    "tp1_done": false,
-    "tp2_done": false,
-    "realized_pnl": 0.0,
-    "opened_at": "2026-09-07T00:03:07.498616+00:00",
-    "max_r": 0.21087967020551576
+    "confidence": 64,
+    "entry_low": 155.57060714285714,
+    "entry_high": 155.627125,
+    "stop": 157.97451785714287,
+    "tp1": 153.22321428571428,
+    "tp2": 152.03538839285713,
+    "tp3": 150.37243214285712,
+    "rr1": 1.0,
+    "rr2": 1.5,
+    "created_at": "2026-09-07T08:04:34.778650+00:00",
+    "reasons": [
+      "4H_BEAR",
+      "1H_BEAR",
+      "W_D_RCI25_47_DOWN",
+      "15M_EMA_DOWN",
+      "15M_RCI_DOWN"
+    ],
+    "counter": [
+      "near repeated daily support"
+    ]
   },
-  "pending": null,
   "daily_date": "2026-09-07",
   "daily_start_balance": 100000.0,
   "consecutive_losses": 0,
-  "last_key": "50df1a085cedd2f3"
+  "last_key": "d4db760d44d7fe7c"
 }
