@@ -11,22 +11,22 @@
       "side": "SHORT",
       "entry": 219.12772857142858,
       "qty_initial": 164.30409894979672,
-      "qty_remaining": 164.30409894979672,
-      "stop": 223.68204642857143,
+      "qty_remaining": 115.0128692648577,
+      "stop": 219.12772857142858,
       "original_stop": 223.68204642857143,
       "initial_risk": 4.554317857142848,
       "tp1": 214.57341071428573,
       "tp2": 212.2962517857143,
       "tp3": 209.10822928571432,
-      "tp1_done": false,
+      "tp1_done": true,
       "tp2_done": false,
       "tp3_done": false,
-      "realized_pnl": 0.0,
-      "realized_gross_pnl": 0.0,
-      "realized_cost": 0.0,
+      "realized_pnl": 234.34177248898513,
+      "realized_gross_pnl": 234.90862163036255,
+      "realized_cost": 0.5668491413774039,
       "entry_half_spread": 0.011500000000012278,
       "opened_at": "2026-09-07T07:44:29.664874+00:00",
-      "max_r": 0.9566149548819116,
+      "max_r": 1.0464198417671187,
       "exit_logic": "FX_STYLE_V2_NET"
     },
     {
@@ -49,7 +49,7 @@
       "realized_cost": 0.0,
       "entry_half_spread": 279.0,
       "opened_at": "2026-09-07T14:26:07.383753+00:00",
-      "max_r": 0.14837271709882646,
+      "max_r": 0.18050382374374174,
       "exit_logic": "FX_STYLE_V2_NET"
     }
   ]
