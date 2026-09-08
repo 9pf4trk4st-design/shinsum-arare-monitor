@@ -1,26 +1,30 @@
 {
-  "paper_balance": 100721.5236008038,
-  "position": {
+  "paper_balance": 100662.35517996235,
+  "position": null,
+  "pending": {
     "symbol": "EUR_JPY",
     "side": "SHORT",
-    "entry": 178.72827678571429,
-    "qty_initial": 110.24010004895975,
-    "qty_remaining": 110.24010004895975,
-    "stop": 185.58069642857143,
-    "original_stop": 185.58069642857143,
-    "initial_risk": 6.852419642857143,
-    "tp1": 171.87585714285714,
-    "tp2": 168.44964732142859,
-    "tp3": 163.65295357142858,
-    "tp1_done": false,
-    "tp2_done": false,
-    "realized_pnl": 0.0,
-    "opened_at": "2026-09-08T07:37:51.341850+00:00",
-    "max_r": 0.015655314663354007
+    "confidence": 68,
+    "entry_low": 179.3729642857143,
+    "entry_high": 179.472875,
+    "stop": 185.61141071428574,
+    "tp1": 173.23442857142857,
+    "tp2": 170.14018303571427,
+    "tp3": 165.80823928571425,
+    "rr1": 1.0,
+    "rr2": 1.5,
+    "created_at": "2026-09-08T15:38:29.092841+00:00",
+    "reasons": [
+      "4H_BEAR",
+      "W_D_RCI25_47_DOWN",
+      "1H_RCI8_TOP_REV",
+      "15M_RCI8_TOP_REV",
+      "5M_SHORT_TIMING"
+    ],
+    "counter": []
   },
-  "pending": null,
-  "daily_date": "2026-09-08",
-  "daily_start_balance": 100579.11391193555,
-  "consecutive_losses": 0,
-  "last_key": "1f6d0f2e2576500c"
+  "daily_date": "2026-09-09",
+  "daily_start_balance": 100662.35517996235,
+  "consecutive_losses": 1,
+  "last_key": "6f9720373099590a"
 }
