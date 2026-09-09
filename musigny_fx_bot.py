@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Musigny FX Paper Bot v2 - PAPER ONLY
-# Exit strengthened / max leverage 5x
+# Musigny Foreign Exchange FX Paper Bot v3.1 - PAPER ONLY
+# Japanese notifications / net-profit oriented display / max leverage 10x
 
 from __future__ import annotations
 import csv, hashlib, json, math, os, time
@@ -23,19 +23,19 @@ NTFY_TOPIC=os.getenv('NTFY_TOPIC','')
 ENTRY_THRESHOLD=int(os.getenv('FX_ENTRY_THRESHOLD','62')); STRONG_THRESHOLD=int(os.getenv('FX_STRONG_THRESHOLD','72')); OPPOSITE_GAP=int(os.getenv('FX_OPPOSITE_GAP','10'))
 PAPER_BALANCE_DEFAULT=float(os.getenv('FX_PAPER_BALANCE','100000')); RISK_PCT=float(os.getenv('FX_RISK_PCT','0.0075'))
 MAX_DAILY_LOSS_PCT=float(os.getenv('FX_MAX_DAILY_LOSS_PCT','0.03')); MAX_CONSECUTIVE_LOSSES=int(os.getenv('FX_MAX_CONSECUTIVE_LOSSES','3'))
-MAX_LEVERAGE=float(os.getenv('FX_MAX_LEVERAGE','5'))
+MAX_LEVERAGE=float(os.getenv('FX_MAX_LEVERAGE','10'))
 
 MIN_RR=float(os.getenv('FX_MIN_RR','1.0')); PENDING_EXPIRE_HOURS=int(os.getenv('FX_PENDING_EXPIRE_HOURS','8')); EVENT_BLACKOUT_MINUTES=int(os.getenv('FX_EVENT_BLACKOUT_MINUTES','30'))
-RCI_PERIODS=(8,25,47); TP1_PCT=.30; TP2_PCT=.40
+RCI_PERIODS=(8,25,47); TP1_PCT=.50; TP2_PCT=.30
 
-TP1_R=float(os.getenv('FX_TP1_R','1.0'))
-TP2_R=float(os.getenv('FX_TP2_R','1.5'))
-TP3_R=float(os.getenv('FX_TP3_R','2.2'))
+TP1_R=float(os.getenv('FX_TP1_R','0.65'))
+TP2_R=float(os.getenv('FX_TP2_R','1.0'))
+TP3_R=float(os.getenv('FX_TP3_R','1.5'))
 REVIEW_HOURS=float(os.getenv('FX_REVIEW_HOURS','8'))
 MAX_HOLD_HOURS=float(os.getenv('FX_MAX_HOLD_HOURS','12'))
 TRAIL_START_R=float(os.getenv('FX_TRAIL_START_R','1.5'))
 TRAIL_GIVEBACK_R=float(os.getenv('FX_TRAIL_GIVEBACK_R','0.6'))
-REVIEW_CLOSE_R=float(os.getenv('FX_REVIEW_CLOSE_R','0.3'))
+REVIEW_CLOSE_R=float(os.getenv('FX_REVIEW_CLOSE_R','0.0'))
 
 @dataclass
 class Analysis:
@@ -258,7 +258,7 @@ def load_state():
 def save_state(s):STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding='utf-8')
 def notify(t):
     print(t,flush=True)
-    if NTFY_TOPIC:requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',data=t.encode('utf-8'),headers={'Title':'Musigny FX Paper Bot v2'},timeout=15).raise_for_status()
+    if NTFY_TOPIC:requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',data=t.encode('utf-8'),headers={'Title':'Musigny çºæ¿FX BOT v3.1'},timeout=15).raise_for_status()
 
 def can_open(s):
     d=now_jst().date().isoformat()
@@ -269,7 +269,7 @@ def can_open(s):
     if s.get('position'):return False,'POSITION_OPEN'
     return True,'OK'
 
-def create_pending(s,a):s['pending']={'symbol':a.symbol,'side':a.side,'confidence':a.confidence,'entry_low':a.entry_low,'entry_high':a.entry_high,'stop':a.stop,'tp1':a.tp1,'tp2':a.tp2,'tp3':a.tp3,'rr1':a.rr1,'rr2':a.rr2,'created_at':now_utc().isoformat(),'reasons':a.reasons[:10],'counter':a.counter[:10]}
+def create_pending(s,a):s['pending']={'symbol':a.symbol,'side':a.side,'confidence':a.confidence,'long':a.long,'short':a.short,'entry_low':a.entry_low,'entry_high':a.entry_high,'stop':a.stop,'tp1':a.tp1,'tp2':a.tp2,'tp3':a.tp3,'rr1':a.rr1,'rr2':a.rr2,'created_at':now_utc().isoformat(),'reasons':a.reasons[:10],'counter':a.counter[:10]}
 def touch(p,h,l):return h>=min(p['entry_low'],p['entry_high']) and l<=max(p['entry_low'],p['entry_high'])
 
 def quote_to_jpy(sym,tickers):
@@ -285,14 +285,58 @@ def max_qty_by_leverage(sym,entry,balance,tickers):
     max_notional_jpy=balance*MAX_LEVERAGE
     return max_notional_jpy/max(entry*q2j,1e-12)
 
+def jp_side(side):
+    return "ã­ã³ã°" if side=="LONG" else "ã·ã§ã¼ã" if side=="SHORT" else "è¦éã"
+
+def jp_reason(x):
+    mp={
+        "4H_BULL":"4æéè¶³ ä¸æ",
+        "4H_BEAR":"4æéè¶³ ä¸é",
+        "1H_BULL":"1æéè¶³ ä¸æ",
+        "1H_BEAR":"1æéè¶³ ä¸é",
+        "W_D_RCI25_47_UP":"é±è¶³ã»æ¥è¶³ RCI25/47ä¸åã",
+        "W_D_RCI25_47_DOWN":"é±è¶³ã»æ¥è¶³ RCI25/47ä¸åã",
+        "15M_EMA_UP":"15åè¶³ EMAä¸åã",
+        "15M_EMA_DOWN":"15åè¶³ EMAä¸åã",
+        "15M_RCI_UP":"15åè¶³ RCIä¸åã",
+        "15M_RCI_DOWN":"15åè¶³ RCIä¸åã",
+        "5M_LONG_TIMING":"5åè¶³ ã­ã³ã°ã¿ã¤ãã³ã°",
+        "5M_SHORT_TIMING":"5åè¶³ ã·ã§ã¼ãã¿ã¤ãã³ã°",
+    }
+    return mp.get(x,x)
+
 def make_pos(s,p,tickers):
     e=(p['entry_low']+p['entry_high'])/2
     risk_qty=s['paper_balance']*RISK_PCT/max(abs(e-p['stop']),1e-12)
     lev_qty=max_qty_by_leverage(p['symbol'],e,s['paper_balance'],tickers)
     qty=min(risk_qty,lev_qty)
-    s['position']={'symbol':p['symbol'],'side':p['side'],'entry':e,'qty_initial':qty,'qty_remaining':qty,'stop':p['stop'],'original_stop':p['stop'],'initial_risk':abs(e-p['stop']),'tp1':p['tp1'],'tp2':p['tp2'],'tp3':p['tp3'],'tp1_done':False,'tp2_done':False,'realized_pnl':0.0,'opened_at':now_utc().isoformat(),'max_r':0.0}
+    s['position']={
+        'symbol':p['symbol'],'side':p['side'],'entry':e,
+        'qty_initial':qty,'qty_remaining':qty,
+        'stop':p['stop'],'original_stop':p['stop'],
+        'initial_risk':abs(e-p['stop']),
+        'tp1':p['tp1'],'tp2':p['tp2'],'tp3':p['tp3'],
+        'tp1_done':False,'tp2_done':False,
+        'realized_pnl':0.0,'opened_at':now_utc().isoformat(),'max_r':0.0
+    }
     s['pending']=None
-    return f'FX PAPER OPEN {p["symbol"]} {p["side"]}\nEntry {e:.5f}\nSTOP {p["stop"]:.5f}\nTP1 {p["tp1"]:.5f} TP2 {p["tp2"]:.5f} TP3 {p["tp3"]:.5f}\nMax leverage {MAX_LEVERAGE:.1f}x'
+    reasons=' / '.join(jp_reason(x) for x in p.get('reasons',[])[:8]) or 'ãªã'
+    counter=' / '.join(jp_reason(x) for x in p.get('counter',[])[:5]) or 'ãªã'
+    return (
+        f'ð¯ çºæ¿FX ä»®æ³æ°è¦ç´å® {p["symbol"]}\n'
+        f'æ¹å: {jp_side(p["side"])}\n'
+        f'ä¿¡é ¼åº¦: {p.get("confidence",0)}/100\n'
+        f'ã­ã³ã°ç¹: {p.get("long","?")} / ã·ã§ã¼ãç¹: {p.get("short","?")}\n'
+        f'ç´å®ä¾¡æ ¼: {e:.5f}\n'
+        f'æåã: {p["stop"]:.5f}\n'
+        f'å©ç¢ºâ : {p["tp1"]:.5f}\n'
+        f'å©ç¢ºâ¡: {p["tp2"]:.5f}\n'
+        f'å©ç¢ºâ¢: {p["tp3"]:.5f}\n'
+        f'ã¨ã³ããªã¼æ ¹æ : {reasons}\n'
+        f'éæ¹åã®æ³¨æææ: {counter}\n'
+        f'æå¤§ã¬ãã¬ãã¸: {MAX_LEVERAGE:.1f}åï¼ãã¼ãã¼ï¼\n'
+        f'1åã®è¨±å®¹ãªã¹ã¯: {RISK_PCT*100:.2f}%'
+    )
 
 def manage_pending(s,analyses,tickers):
     p=s.get('pending')
@@ -318,7 +362,9 @@ def close_remaining(s,p,px,event,label):
     p['realized_pnl']+=pnl;s['paper_balance']+=p['realized_pnl']
     s['consecutive_losses']=s.get('consecutive_losses',0)+1 if p['realized_pnl']<0 else 0
     record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],event,True])
-    msg=f'{label} {p["symbol"]}\nFinal PnL {p["realized_pnl"]:+,.0f}\nBalance {s["paper_balance"]:,.0f}'
+    msg=(f'{label} {p["symbol"]}\n'
+         f'ç¢ºå®æç {p["realized_pnl"]:+,.0f}å\n'
+         f'ä»®æ³æ®é« {s["paper_balance"]:,.0f}å')
     s['position']=None
     return msg
 
@@ -343,31 +389,47 @@ def manage_position(s,tickers,analyses):
     print(f'[POSITION] {p["symbol"]} {side} ENTRY={p["entry"]:.5f} NOW={px:.5f} R={cur_r:+.2f} MAX_R={p["max_r"]:+.2f} AGE={age_h:.1f}h STOP={p["stop"]:.5f} TP1={p["tp1"]:.5f} TP2={p["tp2"]:.5f} TP3={p["tp3"]:.5f}',flush=True)
 
     if st(p['stop']):
-        msgs.append(close_remaining(s,p,px,'STOP_END','FX PAPER STOP'));return msgs
+        msgs.append(close_remaining(s,p,px,'STOP_END','ð çºæ¿FX ä»®æ³æåã'));return msgs
     if strong_reversal(p,analyses):
-        msgs.append(close_remaining(s,p,px,'REVERSAL_END','FX PAPER REVERSAL EXIT'));return msgs
+        msgs.append(close_remaining(s,p,px,'REVERSAL_END','ð çºæ¿FX ä»®æ³åè»¢æ±ºæ¸'));return msgs
     if age_h>=MAX_HOLD_HOURS:
-        msgs.append(close_remaining(s,p,px,'TIME_END','FX PAPER TIME EXIT'));return msgs
-    if age_h>=REVIEW_HOURS and not p['tp1_done'] and cur_r<=REVIEW_CLOSE_R:
-        msgs.append(close_remaining(s,p,px,'REVIEW_END','FX PAPER REVIEW EXIT'));return msgs
+        msgs.append(close_remaining(s,p,px,'TIME_END','â° çºæ¿FX ä»®æ³æéæ±ºæ¸'));return msgs
+    if age_h>=REVIEW_HOURS and not p['tp1_done']:
+        a=next((x for x in analyses if x.symbol==p['symbol']),None)
+        same_side=False
+        weak_or_reverse=False
+        if a:
+            if side=='LONG':
+                same_side=(a.long>=ENTRY_THRESHOLD and a.long>=a.short+OPPOSITE_GAP)
+                weak_or_reverse=(a.short>=a.long or a.long<ENTRY_THRESHOLD)
+            else:
+                same_side=(a.short>=ENTRY_THRESHOLD and a.short>=a.long+OPPOSITE_GAP)
+                weak_or_reverse=(a.long>=a.short or a.short<ENTRY_THRESHOLD)
+        # 8h is a re-evaluation point, not an automatic close.
+        # Continue if the original direction is still strong.
+        # Close only if the signal has weakened/reversed and the trade has not progressed.
+        if weak_or_reverse and cur_r<=REVIEW_CLOSE_R:
+            msgs.append(close_remaining(s,p,px,'REVIEW_END','ð çºæ¿FX ä»®æ³è¦ç´ãæ±ºæ¸'));return msgs
+        if same_side:
+            print(f'[REVIEW_KEEP] {p["symbol"]} {side} R={cur_r:+.2f} direction still valid',flush=True)
     if p['max_r']>=TRAIL_START_R and cur_r<=p['max_r']-TRAIL_GIVEBACK_R:
-        msgs.append(close_remaining(s,p,px,'TRAIL_END','FX PAPER TRAIL EXIT'));return msgs
+        msgs.append(close_remaining(s,p,px,'TRAIL_END','ð çºæ¿FX ä»®æ³è¿½å¾æ±ºæ¸'));return msgs
 
     if not p['tp1_done'] and tp(p['tp1']):
         q=p['qty_initial']*TP1_PCT;pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q
         p['qty_remaining']-=q;p['realized_pnl']+=pnl;p['tp1_done']=True;p['stop']=p['entry']
         record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP1',True])
-        msgs.append(f'FX PAPER TP1 {p["symbol"]} 30% PnL {pnl:+,.0f}')
+        msgs.append(f'â çºæ¿FX {p["symbol"]} å©ç¢ºâ  50%\nç¢ºå®æç {pnl:+,.0f}å')
 
     if not p['tp2_done'] and tp(p['tp2']):
         q=p['qty_initial']*TP2_PCT;pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q
         p['qty_remaining']-=q;p['realized_pnl']+=pnl;p['tp2_done']=True
         risk=float(p['initial_risk']);p['stop']=p['entry']+risk if side=='LONG' else p['entry']-risk
         record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP2',True])
-        msgs.append(f'FX PAPER TP2 {p["symbol"]} 40% PnL {pnl:+,.0f}')
+        msgs.append(f'â çºæ¿FX {p["symbol"]} å©ç¢ºâ¡ 30%\nç¢ºå®æç {pnl:+,.0f}å')
 
     if tp(p['tp3']):
-        msgs.append(close_remaining(s,p,px,'TP3_END','FX PAPER TP3'));return msgs
+        msgs.append(close_remaining(s,p,px,'TP3_END','ð çºæ¿FX ä»®æ³æçµå©ç¢º'));return msgs
     return msgs
 
 def log_signals(a):
