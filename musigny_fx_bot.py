@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Musigny Foreign Exchange FX Paper Bot v3.1 - PAPER ONLY
+# Musigny Foreign Exchange FX Paper Bot v3.2 - PAPER ONLY
 # Japanese notifications / net-profit oriented display / max leverage 10x
 
 from __future__ import annotations
@@ -257,8 +257,21 @@ def load_state():
 
 def save_state(s):STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding='utf-8')
 def notify(t):
-    print(t,flush=True)
-    if NTFY_TOPIC:requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',data=t.encode('utf-8'),headers={'Title':'Musigny çºæ¿FX BOT v3.1'},timeout=15).raise_for_status()
+    # ntfyã¸UTF-8ã®ãã¬ã¼ã³ãã­ã¹ãã¨ãã¦æç¤ºéä¿¡ããã
+    # æ¥æ¬èªæ¬æã®æå­åãé²æ­¢ã
+    t = str(t)
+    print(t, flush=True)
+    if NTFY_TOPIC:
+        headers = {
+            'Title': 'Musigny FX BOT v3.2',
+            'Content-Type': 'text/plain; charset=utf-8',
+        }
+        requests.post(
+            f'https://ntfy.sh/{NTFY_TOPIC}',
+            data=t.encode('utf-8'),
+            headers=headers,
+            timeout=15
+        ).raise_for_status()
 
 def can_open(s):
     d=now_jst().date().isoformat()
