@@ -1,26 +1,9 @@
 {
-  "paper_balance": 100779.09500860899,
-  "position": {
-    "symbol": "USD_JPY",
-    "side": "SHORT",
-    "entry": 153.6443464285714,
-    "qty_initial": 173.5073408452998,
-    "qty_remaining": 173.5073408452998,
-    "stop": 158.00060714285715,
-    "original_stop": 158.00060714285715,
-    "initial_risk": 4.356260714285753,
-    "tp1": 149.28808571428564,
-    "tp2": 147.10995535714278,
-    "tp3": 144.06057285714274,
-    "tp1_done": false,
-    "tp2_done": false,
-    "realized_pnl": 0.0,
-    "opened_at": "2026-09-09T01:11:17.753741+00:00",
-    "max_r": 0.12908925003668054
-  },
+  "paper_balance": 100774.47041830639,
+  "position": null,
   "pending": null,
   "daily_date": "2026-09-09",
   "daily_start_balance": 100662.35517996235,
-  "consecutive_losses": 0,
+  "consecutive_losses": 1,
   "last_key": "3aa58fa3bc5bad3b"
 }

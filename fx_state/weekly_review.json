@@ -1,12 +1,13 @@
 {
-  "generated_at": "2026-09-09T10:13:51.474486+00:00",
-  "events": 5,
-  "loss_events": 1,
-  "pnl_events": 779.0950086089713,
+  "generated_at": "2026-09-09T10:19:39.381409+00:00",
+  "events": 6,
+  "loss_events": 2,
+  "pnl_events": 774.4704183063652,
   "loss_symbols": {
-    "EUR_JPY": 1
+    "EUR_JPY": 1,
+    "USD_JPY": 1
   },
   "loss_sides": {
-    "SHORT": 1
+    "SHORT": 2
   }
 }
