@@ -27,6 +27,12 @@ MAX_LEVERAGE=float(os.getenv('FX_MAX_LEVERAGE','10'))
 
 MIN_RR=float(os.getenv('FX_MIN_RR','1.0')); PENDING_EXPIRE_HOURS=int(os.getenv('FX_PENDING_EXPIRE_HOURS','8')); EVENT_BLACKOUT_MINUTES=int(os.getenv('FX_EVENT_BLACKOUT_MINUTES','30'))
 RCI_PERIODS=(8,25,47); TP1_PCT=.50; TP2_PCT=.30
+EMA_FAST=9
+EMA_MAIN=12
+EARLY_ENTRY_ENABLED=os.getenv('FX_EARLY_ENTRY_ENABLED','1')=='1'
+EARLY_SIZE_PCT=float(os.getenv('FX_EARLY_SIZE_PCT','0.50'))
+EMA_NEAR_ATR=float(os.getenv('FX_EMA_NEAR_ATR','0.30'))
+CLOUD_NEAR_ATR=float(os.getenv('FX_CLOUD_NEAR_ATR','0.35'))
 
 TP1_R=float(os.getenv('FX_TP1_R','0.65'))
 TP2_R=float(os.getenv('FX_TP2_R','1.0'))
@@ -105,9 +111,24 @@ def rci(s,p):
     return pd.Series(out,index=s.index)
 
 def indicators(df):
-    x=df.copy(); x['ema12']=x['close'].ewm(span=12,adjust=False).mean(); x['ema_slope5']=x['ema12'].pct_change(5)
-    for p in RCI_PERIODS: x[f'rci{p}']=rci(x['close'],p)
-    pc=x['close'].shift(1); tr=pd.concat([(x['high']-x['low']),(x['high']-pc).abs(),(x['low']-pc).abs()],axis=1).max(axis=1); x['atr']=tr.rolling(14).mean(); return x
+    x=df.copy()
+    x['ema9']=x['close'].ewm(span=EMA_FAST,adjust=False).mean()
+    x['ema12']=x['close'].ewm(span=EMA_MAIN,adjust=False).mean()
+    x['ema9_slope3']=x['ema9'].pct_change(3)
+    x['ema_slope5']=x['ema12'].pct_change(5)
+    for p in RCI_PERIODS:
+        x[f'rci{p}']=rci(x['close'],p)
+    pc=x['close'].shift(1)
+    tr=pd.concat([(x['high']-x['low']),(x['high']-pc).abs(),(x['low']-pc).abs()],axis=1).max(axis=1)
+    x['atr']=tr.rolling(14).mean()
+    h9=x['high'].rolling(9).max(); l9=x['low'].rolling(9).min()
+    h26=x['high'].rolling(26).max(); l26=x['low'].rolling(26).min()
+    h52=x['high'].rolling(52).max(); l52=x['low'].rolling(52).min()
+    x['tenkan']=(h9+l9)/2
+    x['kijun']=(h26+l26)/2
+    x['span_a']=(x['tenkan']+x['kijun'])/2
+    x['span_b']=(h52+l52)/2
+    return x
 
 def line_dir(x,p):
     a=x.iloc[-1][f'rci{p}']; b=x.iloc[-2][f'rci{p}']
@@ -204,6 +225,80 @@ def news_block(sym):
     d=load_json(NEWS_FILE,{}); f=d.get(sym) or d.get('GLOBAL')
     return (bool(f.get('block_new_entries')),str(f.get('reason','NEWS_RISK'))) if isinstance(f,dict) else (False,'')
 
+def cloud_state(ind):
+    r=ind.iloc[-1]
+    if pd.isna(r['span_a']) or pd.isna(r['span_b']):
+        return 'NA',None,None
+    lo=min(float(r['span_a']),float(r['span_b']))
+    hi=max(float(r['span_a']),float(r['span_b']))
+    p=float(r['close'])
+    return ('ABOVE' if p>hi else 'BELOW' if p<lo else 'IN'),lo,hi
+
+def early_entry_signals(M15,M5,side):
+    c15=M15.iloc[-1]; p15=M15.iloc[-2]
+    c5=M5.iloc[-1]; p5=M5.iloc[-2]
+    atr=float(c15['atr']) if pd.notna(c15['atr']) and c15['atr']>0 else float(c15['close'])*.0015
+    state,clo,chi=cloud_state(M15)
+    score=0; reasons=[]
+    if side=='LONG':
+        if c15['rci8']<=-70 and c15['rci8']>p15['rci8']:
+            score+=10; reasons.append('15M_RCI8_EARLY_UP')
+        if c5['rci8']>p5['rci8']:
+            score+=8; reasons.append('5M_RCI8_LEAD_UP')
+        if c15['rci25']>=p15['rci25']:
+            score+=5; reasons.append('15M_RCI25_STABILIZE')
+        if abs(float(c15['close'])-float(c15['ema9']))<=EMA_NEAR_ATR*atr:
+            score+=6; reasons.append('15M_NEAR_EMA9')
+        if c15['close']>c15['ema9'] and c15['ema9_slope3']>=0:
+            score+=6; reasons.append('15M_EMA9_TURN_UP')
+        if c15['ema9']>=c15['ema12']:
+            score+=4; reasons.append('EMA9_ABOVE_EMA12')
+        if state=='IN':
+            score+=5; reasons.append('15M_IN_CLOUD')
+        elif clo is not None and abs(float(c15['close'])-clo)<=CLOUD_NEAR_ATR*atr:
+            score+=5; reasons.append('15M_NEAR_CLOUD_LOW')
+    else:
+        if c15['rci8']>=70 and c15['rci8']<p15['rci8']:
+            score+=10; reasons.append('15M_RCI8_EARLY_DOWN')
+        if c5['rci8']<p5['rci8']:
+            score+=8; reasons.append('5M_RCI8_LEAD_DOWN')
+        if c15['rci25']<=p15['rci25']:
+            score+=5; reasons.append('15M_RCI25_STABILIZE_DOWN')
+        if abs(float(c15['close'])-float(c15['ema9']))<=EMA_NEAR_ATR*atr:
+            score+=6; reasons.append('15M_NEAR_EMA9')
+        if c15['close']<c15['ema9'] and c15['ema9_slope3']<=0:
+            score+=6; reasons.append('15M_EMA9_TURN_DOWN')
+        if c15['ema9']<=c15['ema12']:
+            score+=4; reasons.append('EMA9_BELOW_EMA12')
+        if state=='IN':
+            score+=5; reasons.append('15M_IN_CLOUD')
+        elif chi is not None and abs(float(c15['close'])-chi)<=CLOUD_NEAR_ATR*atr:
+            score+=5; reasons.append('15M_NEAR_CLOUD_HIGH')
+    return score,reasons
+
+def entry_location(side,p,H1,M15):
+    c=M15.iloc[-1]
+    atr=float(H1['atr'].iloc[-1])
+    atr=atr if math.isfinite(atr) and atr>0 else p*.002
+    state,clo,chi=cloud_state(M15)
+    anchors=[float(c['ema9']),float(c['ema12'])]
+    if side=='LONG' and clo is not None: anchors.append(float(clo))
+    if side=='SHORT' and chi is not None: anchors.append(float(chi))
+    if side=='LONG':
+        usable=[a for a in anchors if a<=p+0.15*atr]
+        anchor=max(usable) if usable else p
+        return anchor-0.18*atr,min(p,anchor+0.08*atr),atr
+    usable=[a for a in anchors if a>=p-0.15*atr]
+    anchor=min(usable) if usable else p
+    return max(p,anchor-0.08*atr),anchor+0.18*atr,atr
+
+def tf_times(fs):
+    out={}
+    for k in ('5min','15min','1hour','4hour','1day','1week'):
+        try: out[k]=str(fs[k].iloc[-1]['time'])
+        except Exception: out[k]='NA'
+    return out
+
 def analyze(sym,fs,cn):
     W,D,H4,H1,M15,M5=[indicators(fs[k]) for k in ('1week','1day','4hour','1hour','15min','5min')]; c=M15.iloc[-1]; prev=M15.iloc[-2]; p=float(c['close']); L=S=0; rl=[];rs=[]; cl=[];cs=[]
     zone,wlo,whi=weekly_zone(W,p); sr,ds,dr,sh,rh=daily_sr(D,p)
@@ -230,16 +325,24 @@ def analyze(sym,fs,cn):
     a,b,ar,br=fib_score(p,c,wlo,whi);L+=a;S+=b;rl+=ar;rs+=br
     if zone=='UPPER_25':cl.append('upper 25% of 2Y range')
     if zone=='LOWER_25':cs.append('lower 25% of 2Y range')
+    earlyL,earlyLr=early_entry_signals(M15,M5,'LONG')
+    earlyS,earlySr=early_entry_signals(M15,M5,'SHORT')
+    if EARLY_ENTRY_ENABLED:
+        if hb in ('UP','STRONG_UP'):
+            L+=earlyL; rl+=earlyLr
+        elif hb in ('DOWN','STRONG_DOWN'):
+            S+=earlyS; rs+=earlySr
     side='WAIT'; conf=max(L,S); reasons=[f'L={L}',f'S={S}']; counter=[]
     if L>=ENTRY_THRESHOLD and L>=S+OPPOSITE_GAP:side='LONG';conf=min(100,L);reasons=rl;counter=cl
     elif S>=ENTRY_THRESHOLD and S>=L+OPPOSITE_GAP:side='SHORT';conf=min(100,S);reasons=rs;counter=cs
     cid=str(c['time'])
     if side=='WAIT':return Analysis(sym,side,L,S,conf,p,None,None,None,None,None,None,None,None,reasons,[],cid,float(c['high']),float(c['low']),zone,sr,cn)
-    atr=float(H1['atr'].iloc[-1]); atr=atr if math.isfinite(atr) and atr>0 else p*.002
     if side=='LONG':
-        eh=p-.10*atr; el=p-.35*atr; stop=min(el-.80*atr,(ds-.25*atr if ds else el-.80*atr)); mid=(el+eh)/2
+        el,eh,atr=entry_location('LONG',p,H1,M15)
+        stop=min(el-.80*atr,(ds-.25*atr if ds else el-.80*atr)); mid=(el+eh)/2
     else:
-        el=p+.10*atr; eh=p+.35*atr; stop=max(eh+.80*atr,(dr+.25*atr if dr else eh+.80*atr)); mid=(el+eh)/2
+        el,eh,atr=entry_location('SHORT',p,H1,M15)
+        stop=max(eh+.80*atr,(dr+.25*atr if dr else eh+.80*atr)); mid=(el+eh)/2
     risk=max(abs(mid-stop),p*.0008)
     if side=='LONG':
         t1=mid+TP1_R*risk;t2=mid+TP2_R*risk;t3=mid+TP3_R*risk
@@ -257,21 +360,18 @@ def load_state():
 
 def save_state(s):STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding='utf-8')
 def notify(t):
-    # ntfyã¸UTF-8ã®ãã¬ã¼ã³ãã­ã¹ãã¨ãã¦æç¤ºéä¿¡ããã
-    # æ¥æ¬èªæ¬æã®æå­åãé²æ­¢ã
-    t = str(t)
-    print(t, flush=True)
-    if NTFY_TOPIC:
-        headers = {
-            'Title': 'Musigny FX BOT v3.2',
-            'Content-Type': 'text/plain; charset=utf-8',
-        }
-        requests.post(
-            f'https://ntfy.sh/{NTFY_TOPIC}',
-            data=t.encode('utf-8'),
-            headers=headers,
-            timeout=15
-        ).raise_for_status()
+    t=str(t); print(t,flush=True)
+    if not NTFY_TOPIC:return
+    headers={'Title':'Musigny FX BOT v3.3','Content-Type':'text/plain; charset=utf-8'}
+    for attempt in range(3):
+        try:
+            r=requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',data=t.encode('utf-8'),headers=headers,timeout=15)
+            if r.status_code==429:
+                wait=10*(attempt+1); print(f'[NTFY-WARN] 429; retry in {wait}s',flush=True); time.sleep(wait); continue
+            r.raise_for_status(); return
+        except Exception as e:
+            if attempt<2: time.sleep(5*(attempt+1))
+            else: print(f'[NTFY-SKIP] notification failed; bot continues: {e}',flush=True); return
 
 def can_open(s):
     d=now_jst().date().isoformat()
@@ -282,7 +382,7 @@ def can_open(s):
     if s.get('position'):return False,'POSITION_OPEN'
     return True,'OK'
 
-def create_pending(s,a):s['pending']={'symbol':a.symbol,'side':a.side,'confidence':a.confidence,'long':a.long,'short':a.short,'entry_low':a.entry_low,'entry_high':a.entry_high,'stop':a.stop,'tp1':a.tp1,'tp2':a.tp2,'tp3':a.tp3,'rr1':a.rr1,'rr2':a.rr2,'created_at':now_utc().isoformat(),'reasons':a.reasons[:10],'counter':a.counter[:10]}
+def create_pending(s,a):s['pending']={'symbol':a.symbol,'side':a.side,'confidence':a.confidence,'long':a.long,'short':a.short,'entry_low':a.entry_low,'entry_high':a.entry_high,'stop':a.stop,'tp1':a.tp1,'tp2':a.tp2,'tp3':a.tp3,'rr1':a.rr1,'rr2':a.rr2,'created_at':now_utc().isoformat(),'reasons':a.reasons[:10],'counter':a.counter[:10],'early':a.confidence<STRONG_THRESHOLD}
 def touch(p,h,l):return h>=min(p['entry_low'],p['entry_high']) and l<=max(p['entry_low'],p['entry_high'])
 
 def quote_to_jpy(sym,tickers):
@@ -323,6 +423,7 @@ def make_pos(s,p,tickers):
     risk_qty=s['paper_balance']*RISK_PCT/max(abs(e-p['stop']),1e-12)
     lev_qty=max_qty_by_leverage(p['symbol'],e,s['paper_balance'],tickers)
     qty=min(risk_qty,lev_qty)
+    if p.get('early'): qty*=EARLY_SIZE_PCT
     s['position']={
         'symbol':p['symbol'],'side':p['side'],'entry':e,
         'qty_initial':qty,'qty_remaining':qty,
@@ -469,11 +570,17 @@ def weekly_review():
         losses=w[w['pnl']<0];out={'generated_at':now_utc().isoformat(),'events':len(w),'loss_events':len(losses),'pnl_events':float(w['pnl'].sum()),'loss_symbols':losses['symbol'].value_counts().to_dict(),'loss_sides':losses['side'].value_counts().to_dict()};WEEKLY_REVIEW.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
     except Exception as e:print('[WEEKLY_REVIEW_WARN]',e,flush=True)
 
+def print_tf_times(sym,fs):
+    tm=tf_times(fs)
+    print(f"[TF] {sym} | 5m={tm['5min']} | 15m={tm['15min']} | 1H={tm['1hour']} | 4H={tm['4hour']} | 1D={tm['1day']} | 1W={tm['1week']}",flush=True)
+
 def main():
     tick={x['symbol']:x for x in api_get('/v1/ticker')};market=any(tick.get(s,{}).get('status')=='OPEN' for s in SYMBOLS)
     allf={};failed=[]
     for s in SYMBOLS:
-        try:allf[s]={'5min':drop_open(fetch_intraday(s,'5min',3,8,80)),'15min':drop_open(fetch_intraday(s,'15min',5,10,80)),'1hour':drop_open(fetch_intraday(s,'1hour',20,12,120)),'4hour':drop_open(fetch_yearly(s,'4hour',3)),'1day':drop_open(fetch_yearly(s,'1day',3)),'1week':drop_open(fetch_yearly(s,'1week',3))}
+        try:
+            allf[s]={'5min':drop_open(fetch_intraday(s,'5min',3,8,80)),'15min':drop_open(fetch_intraday(s,'15min',5,10,80)),'1hour':drop_open(fetch_intraday(s,'1hour',20,12,120)),'4hour':drop_open(fetch_yearly(s,'4hour',3)),'1day':drop_open(fetch_yearly(s,'1day',3)),'1week':drop_open(fetch_yearly(s,'1week',3))}
+            print_tf_times(s,allf[s])
         except Exception as e:failed.append(s);print('[DATA_SKIP]',s,e,flush=True)
     corr=correlations(allf);a=[]
     for s,fs in allf.items():
