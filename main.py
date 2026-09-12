@@ -1,1084 +1,617 @@
 #!/usr/bin/env python3
-# Musigny 4-Crypto BOT v11 - higher-timeframe range rotation + net profit
-from __future__ import annotations
-import os, json, math, csv, hashlib, time, sys
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
+# -*- coding: utf-8 -*-
+# Musigny Foreign Exchange FX Paper Bot v3.2 - PAPER ONLY
+# Japanese notifications / net-profit oriented display / max leverage 10x
 
+from __future__ import annotations
+import csv, hashlib, json, math, os, time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
 
-# GitHub Actions / ntfy の日本語文字化け対策
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+PUBLIC='https://forex-api.coin.z.com/public'
+SYMBOLS=['USD_JPY','EUR_JPY','GBP_JPY','EUR_USD']
+PRICE_TYPE=os.getenv('FX_PRICE_TYPE','BID').upper()
+STATE_DIR=Path(os.getenv('FX_STATE_DIR','fx_state')); STATE_DIR.mkdir(parents=True,exist_ok=True)
+STATE_FILE=STATE_DIR/'bot_state.json'; TRADES_FILE=STATE_DIR/'paper_trades.csv'; SIGNALS_FILE=STATE_DIR/'signal_log.csv'; WEEKLY_REVIEW=STATE_DIR/'weekly_review.json'
+EVENT_FILE=Path(os.getenv('FX_EVENT_FILE','fx_events.json')); NEWS_FILE=Path(os.getenv('FX_NEWS_FILE','fx_news_flags.json'))
+NTFY_TOPIC=os.getenv('NTFY_TOPIC','')
 
-os.environ["PYTHONUTF8"] = "1"
-os.environ["PYTHONIOENCODING"] = "utf-8"
+ENTRY_THRESHOLD=int(os.getenv('FX_ENTRY_THRESHOLD','62')); STRONG_THRESHOLD=int(os.getenv('FX_STRONG_THRESHOLD','72')); OPPOSITE_GAP=int(os.getenv('FX_OPPOSITE_GAP','10'))
+PAPER_BALANCE_DEFAULT=float(os.getenv('FX_PAPER_BALANCE','100000')); RISK_PCT=float(os.getenv('FX_RISK_PCT','0.0075'))
+MAX_DAILY_LOSS_PCT=float(os.getenv('FX_MAX_DAILY_LOSS_PCT','0.03')); MAX_CONSECUTIVE_LOSSES=int(os.getenv('FX_MAX_CONSECUTIVE_LOSSES','3'))
+MAX_LEVERAGE=float(os.getenv('FX_MAX_LEVERAGE','10'))
 
-PUBLIC = "https://api.coin.z.com/public"
-SYMBOLS = ["BTC", "ETH", "XRP", "SOL"]
-NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")
-STATE_DIR = Path(os.getenv("STATE_DIR", "state")); STATE_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = STATE_DIR / "bot_state.json"
-TRADES_FILE = STATE_DIR / "paper_trades_net.csv"
-SIGNALS_FILE = STATE_DIR / "signal_log.csv"
+MIN_RR=float(os.getenv('FX_MIN_RR','1.0')); PENDING_EXPIRE_HOURS=int(os.getenv('FX_PENDING_EXPIRE_HOURS','8')); EVENT_BLACKOUT_MINUTES=int(os.getenv('FX_EVENT_BLACKOUT_MINUTES','30'))
+RCI_PERIODS=(8,25,47); TP1_PCT=.50; TP2_PCT=.30
+EMA_FAST=9
+EMA_MAIN=12
+EARLY_ENTRY_ENABLED=os.getenv('FX_EARLY_ENTRY_ENABLED','1')=='1'
+EARLY_SIZE_PCT=float(os.getenv('FX_EARLY_SIZE_PCT','0.50'))
+EMA_NEAR_ATR=float(os.getenv('FX_EMA_NEAR_ATR','0.30'))
+CLOUD_NEAR_ATR=float(os.getenv('FX_CLOUD_NEAR_ATR','0.35'))
 
-EMA_PERIOD = 12
-RCI_PERIODS = (8, 25, 47)
-ENTRY_THRESHOLD = int(os.getenv("ENTRY_THRESHOLD", "60"))
-STRONG_THRESHOLD = int(os.getenv("STRONG_THRESHOLD", "70"))
-OPPOSITE_GAP = int(os.getenv("OPPOSITE_GAP", "10"))
-PAPER_BALANCE_DEFAULT = float(os.getenv("PAPER_BALANCE", "100000"))
-RISK_PCT = float(os.getenv("RISK_PCT", "0.0075"))
-MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-TP1_PCT, TP2_PCT, TP3_PCT = 0.30, 0.40, 0.30
-PENDING_EXPIRE_HOURS = int(os.getenv("PENDING_EXPIRE_HOURS", "8"))
-
-# FX版と同じ短期出口
-TP1_R = float(os.getenv("TP1_R", "1.0"))
-TP2_R = float(os.getenv("TP2_R", "1.5"))
-TP3_R = float(os.getenv("TP3_R", "2.2"))
-REVIEW_HOURS = float(os.getenv("REVIEW_HOURS", "8"))
-MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "12"))
-TRAIL_START_R = float(os.getenv("TRAIL_START_R", "1.5"))
-TRAIL_GIVEBACK_R = float(os.getenv("TRAIL_GIVEBACK_R", "0.6"))
-REVIEW_CLOSE_R = float(os.getenv("REVIEW_CLOSE_R", "0.3"))
-
-# ===== 実運用に近づけるためのコスト設定 =====
-# GMOコインの暗号資産FXを想定すると通常の取引手数料は0。
-# 別サービス/注文方式を使う場合は環境変数で変更可能。
-TRADE_FEE_RATE = float(os.getenv("TRADE_FEE_RATE", "0.0"))
-
-# 日本時間6:00をまたいだ場合のレバレッジ手数料（0.04%/日）
-LEVERAGE_DAILY_RATE = float(os.getenv("LEVERAGE_DAILY_RATE", "0.0004"))
-RCI_EXTREME = 75.0
-RCI_STRONG_EXTREME = 85.0
-
-# ===== v11 レンジ回転設定 =====
-RANGE_LOOKBACK_1H = int(os.getenv("RANGE_LOOKBACK_1H", "48"))
-RANGE_EDGE_PCT = float(os.getenv("RANGE_EDGE_PCT", "0.22"))
-RANGE_BREAK_ATR = float(os.getenv("RANGE_BREAK_ATR", "0.18"))
-RANGE_MIN_TOUCHES = int(os.getenv("RANGE_MIN_TOUCHES", "2"))
-RANGE_MIN_WIDTH_PCT = float(os.getenv("RANGE_MIN_WIDTH_PCT", "0.006"))
-RANGE_MAX_WIDTH_PCT = float(os.getenv("RANGE_MAX_WIDTH_PCT", "0.08"))
+TP1_R=float(os.getenv('FX_TP1_R','0.65'))
+TP2_R=float(os.getenv('FX_TP2_R','1.0'))
+TP3_R=float(os.getenv('FX_TP3_R','1.5'))
+REVIEW_HOURS=float(os.getenv('FX_REVIEW_HOURS','8'))
+MAX_HOLD_HOURS=float(os.getenv('FX_MAX_HOLD_HOURS','12'))
+TRAIL_START_R=float(os.getenv('FX_TRAIL_START_R','1.5'))
+TRAIL_GIVEBACK_R=float(os.getenv('FX_TRAIL_GIVEBACK_R','0.6'))
+REVIEW_CLOSE_R=float(os.getenv('FX_REVIEW_CLOSE_R','0.0'))
 
 @dataclass
 class Analysis:
-    symbol: str; side: str; score_long: int; score_short: int; confidence: int
-    price: float; entry_low: float|None; entry_high: float|None; stop: float|None
-    tp1: float|None; tp2: float|None; tp3: float|None; reasons: list[str]
-    invalidation: str; candle_id: str; candle_high: float; candle_low: float
-    regime: str = "UNKNOWN"
-    range_low: float|None = None
-    range_high: float|None = None
-    range_mid: float|None = None
-    range_pos: float|None = None
+    symbol:str; side:str; long:int; short:int; confidence:int; price:float
+    entry_low:float|None; entry_high:float|None; stop:float|None; tp1:float|None; tp2:float|None; tp3:float|None
+    rr1:float|None; rr2:float|None; reasons:list[str]; counter:list[str]; candle_id:str; high:float; low:float
+    weekly_zone:str; daily_sr:str; corr_note:str
 
 def now_utc(): return datetime.now(timezone.utc)
-def now_jst(): return now_utc() + timedelta(hours=9)
+def now_jst(): return now_utc()+timedelta(hours=9)
 
-def api_get(path, params, retries=3):
-    last_error=None
-    for attempt in range(1,retries+1):
+def api_get(path,params=None,retries=3):
+    last=None
+    for i in range(retries):
         try:
-            r=requests.get(PUBLIC+path,params=params,timeout=25)
-            if r.status_code==404:
-                r.raise_for_status()
-            if r.status_code==429 or 500<=r.status_code<600:
-                last_error=requests.HTTPError(f"{r.status_code} temporary error",response=r)
-                if attempt<retries:
-                    wait=2*attempt
-                    print(f"[RETRY] GMO API HTTP {r.status_code}; retry in {wait}s")
-                    time.sleep(wait); continue
-                raise last_error
+            r=requests.get(PUBLIC+path,params=params or {},timeout=25)
+            if r.status_code in (429,500,502,503,504):
+                last=requests.HTTPError(f'HTTP {r.status_code}',response=r); time.sleep(2*(i+1)); continue
             r.raise_for_status(); j=r.json()
-            if int(j.get("status",1))!=0: raise RuntimeError(f"GMO API error: {j}")
-            return j.get("data",[]) or []
-        except (requests.Timeout,requests.ConnectionError) as e:
-            last_error=e
-            if attempt<retries:
-                wait=2*attempt
-                print(f"[RETRY] GMO API connection error; retry in {wait}s ({e})")
-                time.sleep(wait); continue
-            raise
-    if last_error: raise last_error
-    return []
-
-def frame_from_rows(rows):
-    out = pd.DataFrame([{
-        "time": pd.to_datetime(int(x["openTime"]), unit="ms", utc=True),
-        "open": float(x["open"]), "high": float(x["high"]), "low": float(x["low"]),
-        "close": float(x["close"]), "volume": float(x["volume"])
-    } for x in rows])
-    return out if out.empty else out.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-
-def fetch_intraday(symbol, interval, days, extra_days=10, min_rows=60):
-    frames=[]; api_day=now_jst()-timedelta(hours=6)
-    max_lookback=max(days+extra_days,days+2)
-    for i in range(max_lookback+1):
-        d=(api_day-timedelta(days=i)).strftime("%Y%m%d")
-        try:
-            f=frame_from_rows(api_get("/v1/klines",{"symbol":symbol,"interval":interval,"date":d},retries=3))
-            if not f.empty:
-                frames.append(f)
-                merged=pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
-                if len(merged)>=min_rows and i>=days: break
-        except requests.HTTPError as e:
-            if getattr(e.response,"status_code",None)==404:
-                print(f"[INFO] {symbol} {interval} {d}: no KLine; fallback older date"); continue
-            print(f"[WARN] {symbol} {interval} {d}: {e}")
+            if int(j.get('status',1))!=0: raise RuntimeError(f'GMO FX API error: {j}')
+            return j.get('data',[])
         except Exception as e:
-            print(f"[WARN] {symbol} {interval} {d}: {e}")
-    if not frames:
-        raise RuntimeError(f"No data for {symbol} {interval} (JST6時基準で{max_lookback+1}日探索)")
-    out=pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    if len(out)<min_rows: print(f"[WARN] {symbol} {interval}: only {len(out)} candles fetched")
-    return out
+            last=e
+            if i<retries-1: time.sleep(2*(i+1))
+    raise last or RuntimeError('API failed')
 
-def fetch_yearly(symbol, interval, years_back=3, extra_years=1):
-    frames=[]; y=now_utc().year
-    for year in range(y-years_back-extra_years,y+1):
+def frame(rows):
+    x=pd.DataFrame([{'time':pd.to_datetime(int(r['openTime']),unit='ms',utc=True),'open':float(r['open']),'high':float(r['high']),'low':float(r['low']),'close':float(r['close'])} for r in rows])
+    return x.sort_values('time').drop_duplicates('time').reset_index(drop=True) if not x.empty else x
+
+def fetch_intraday(sym,interval,days,extra=8,min_rows=60):
+    frames=[]; base=now_jst()-timedelta(hours=6)
+    for i in range(days+extra+1):
+        d=(base-timedelta(days=i)).strftime('%Y%m%d')
         try:
-            f=frame_from_rows(api_get("/v1/klines",{"symbol":symbol,"interval":interval,"date":str(year)},retries=3))
+            f=frame(api_get('/v1/klines',{'symbol':sym,'priceType':PRICE_TYPE,'interval':interval,'date':d}))
             if not f.empty: frames.append(f)
         except requests.HTTPError as e:
-            if getattr(e.response,"status_code",None)==404:
-                print(f"[INFO] {symbol} {interval} {year}: no KLine; skip year"); continue
-            print(f"[WARN] {symbol} {interval} {year}: {e}")
-        except Exception as e:
-            print(f"[WARN] {symbol} {interval} {year}: {e}")
-    if not frames: raise RuntimeError(f"No data for {symbol} {interval}")
-    return pd.concat(frames).sort_values("time").drop_duplicates("time").reset_index(drop=True)
+            if getattr(e.response,'status_code',None)==404: continue
+            print(f'[WARN] {sym} {interval} {d}: {e}',flush=True)
+        except Exception as e: print(f'[WARN] {sym} {interval} {d}: {e}',flush=True)
+        if frames:
+            m=pd.concat(frames).drop_duplicates('time')
+            if i>=days and len(m)>=min_rows: break
+    if not frames: raise RuntimeError(f'No data {sym} {interval}')
+    return pd.concat(frames).sort_values('time').drop_duplicates('time').reset_index(drop=True)
 
-def drop_open_candle(df): return df.iloc[:-1].copy().reset_index(drop=True) if len(df)>=3 else df
+def fetch_yearly(sym,interval,years=3):
+    frames=[]; y=now_utc().year
+    for yr in range(y-years,y+1):
+        try:
+            f=frame(api_get('/v1/klines',{'symbol':sym,'priceType':PRICE_TYPE,'interval':interval,'date':str(yr)}))
+            if not f.empty: frames.append(f)
+        except requests.HTTPError as e:
+            if getattr(e.response,'status_code',None)==404: continue
+        except Exception as e: print(f'[WARN] {sym} {interval} {yr}: {e}',flush=True)
+    if not frames: raise RuntimeError(f'No data {sym} {interval}')
+    return pd.concat(frames).sort_values('time').drop_duplicates('time').reset_index(drop=True)
 
-def rci(series, period):
-    out=np.full(len(series),np.nan); vals=series.to_numpy(float)
-    for i in range(period-1,len(vals)):
-        w=vals[i-period+1:i+1]; tr=np.arange(1,period+1,dtype=float)
-        pr=pd.Series(w).rank(method="average").to_numpy(float); d2=np.sum((tr-pr)**2)
-        out[i]=(1-6*d2/(period*(period**2-1)))*100
-    return pd.Series(out,index=series.index)
+def drop_open(df): return df.iloc[:-1].copy().reset_index(drop=True) if len(df)>=3 else df.copy()
 
-def ichimoku(df):
-    x=df.copy(); h9=x.high.rolling(9).max(); l9=x.low.rolling(9).min(); h26=x.high.rolling(26).max(); l26=x.low.rolling(26).min(); h52=x.high.rolling(52).max(); l52=x.low.rolling(52).min()
-    x["tenkan"]=(h9+l9)/2; x["kijun"]=(h26+l26)/2; x["span_a"]=(x.tenkan+x.kijun)/2; x["span_b"]=(h52+l52)/2
-    return x
+def rci(s,p):
+    out=np.full(len(s),np.nan); v=s.to_numpy(float)
+    for i in range(p-1,len(v)):
+        w=v[i-p+1:i+1]; tr=np.arange(1,p+1,dtype=float); pr=pd.Series(w).rank(method='average').to_numpy(float); d2=np.sum((tr-pr)**2)
+        out[i]=(1-6*d2/(p*(p**2-1)))*100
+    return pd.Series(out,index=s.index)
 
 def indicators(df):
-    x=df.copy(); x["ema12"]=x.close.ewm(span=EMA_PERIOD,adjust=False).mean(); x["ema_slope5"]=x.ema12.pct_change(5)
-    for p in RCI_PERIODS: x[f"rci{p}"]=rci(x.close,p)
-    x["atr"]=(x.high-x.low).rolling(14).mean(); x["vol_ma20"]=x.volume.rolling(20).mean(); return ichimoku(x)
+    x=df.copy()
+    x['ema9']=x['close'].ewm(span=EMA_FAST,adjust=False).mean()
+    x['ema12']=x['close'].ewm(span=EMA_MAIN,adjust=False).mean()
+    x['ema9_slope3']=x['ema9'].pct_change(3)
+    x['ema_slope5']=x['ema12'].pct_change(5)
+    for p in RCI_PERIODS:
+        x[f'rci{p}']=rci(x['close'],p)
+    pc=x['close'].shift(1)
+    tr=pd.concat([(x['high']-x['low']),(x['high']-pc).abs(),(x['low']-pc).abs()],axis=1).max(axis=1)
+    x['atr']=tr.rolling(14).mean()
+    h9=x['high'].rolling(9).max(); l9=x['low'].rolling(9).min()
+    h26=x['high'].rolling(26).max(); l26=x['low'].rolling(26).min()
+    h52=x['high'].rolling(52).max(); l52=x['low'].rolling(52).min()
+    x['tenkan']=(h9+l9)/2
+    x['kijun']=(h26+l26)/2
+    x['span_a']=(x['tenkan']+x['kijun'])/2
+    x['span_b']=(h52+l52)/2
+    return x
 
-def trend_state_ind(x):
-    r=x.iloc[-1]; bull=bear=0
-    if r.close>r.ema12 and r.ema_slope5>0: bull+=2
-    if r.close<r.ema12 and r.ema_slope5<0: bear+=2
-    if pd.notna(r.span_a) and pd.notna(r.span_b):
-        hi=max(r.span_a,r.span_b); lo=min(r.span_a,r.span_b)
-        if r.close>hi: bull+=2
-        elif r.close<lo: bear+=2
-    if pd.notna(r.rci25) and pd.notna(r.rci47):
-        if r.rci25>0 and r.rci47>-50: bull+=1
-        if r.rci25<0 and r.rci47<50: bear+=1
-    if bull>=bear+2: return "BULL"
-    if bear>=bull+2: return "BEAR"
-    return "NEUTRAL"
-
-def rci_dir(ind, period):
-    if len(ind)<2: return 0
-    a,b=ind.iloc[-2][f"rci{period}"],ind.iloc[-1][f"rci{period}"]
+def line_dir(x,p):
+    a=x.iloc[-1][f'rci{p}']; b=x.iloc[-2][f'rci{p}']
     if pd.isna(a) or pd.isna(b): return 0
-    return 1 if b-a>1 else -1 if b-a<-1 else 0
+    return 1 if a>b+1 else -1 if a<b-1 else 0
 
-def higher_rci_bias(W,D):
-    dirs=[rci_dir(W,25),rci_dir(W,47),rci_dir(D,25),rci_dir(D,47)]
-    up=sum(x>0 for x in dirs); down=sum(x<0 for x in dirs)
-    if up==4: return "STRONG_UP",14
-    if up>=3: return "UP",10
-    if down==4: return "STRONG_DOWN",14
-    if down>=3: return "DOWN",10
-    return "MIXED",0
+def higher_bias(W,D):
+    ds=[line_dir(W,25),line_dir(W,47),line_dir(D,25),line_dir(D,47)]; up=sum(v>0 for v in ds); dn=sum(v<0 for v in ds)
+    if up==4:return 'STRONG_UP',15
+    if up>=3:return 'UP',11
+    if dn==4:return 'STRONG_DOWN',15
+    if dn>=3:return 'DOWN',11
+    return 'MIXED',0
 
-def red_rci_reversal(ind):
-    vals=ind["rci8"].iloc[-4:].dropna()
-    if len(vals)<3: return None,0
-    prev,cur=float(vals.iloc[-2]),float(vals.iloc[-1]); lo,hi=float(vals.min()),float(vals.max())
-    rising=cur>prev+2; falling=cur<prev-2
-    if lo<=-RCI_STRONG_EXTREME and rising: return "LONG",16
-    if lo<=-RCI_EXTREME and rising: return "LONG",12
-    if hi>=RCI_STRONG_EXTREME and falling: return "SHORT",16
-    if hi>=RCI_EXTREME and falling: return "SHORT",12
+def red_reversal(x):
+    vals=x['rci8'].iloc[-4:].dropna()
+    if len(vals)<3:return None,0
+    prev=float(vals.iloc[-2]); cur=float(vals.iloc[-1]); mn=float(vals.min()); mx=float(vals.max())
+    if mn<=-85 and cur>prev+2:return 'LONG',16
+    if mn<=-75 and cur>prev+2:return 'LONG',12
+    if mx>=85 and cur<prev-2:return 'SHORT',16
+    if mx>=75 and cur<prev-2:return 'SHORT',12
     return None,0
 
-def pivot_levels(df,left=3,right=3):
-    highs=[]; lows=[]; h=df.high.to_numpy(); l=df.low.to_numpy()
-    for i in range(left,len(df)-right):
-        if h[i]>=np.max(h[i-left:i+right+1]): highs.append((i,h[i]))
-        if l[i]<=np.min(l[i-left:i+right+1]): lows.append((i,l[i]))
-    return highs,lows
+def trend(x):
+    r=x.iloc[-1]; bull=bear=0
+    if r['close']>r['ema12'] and r['ema_slope5']>0: bull+=2
+    if r['close']<r['ema12'] and r['ema_slope5']<0: bear+=2
+    if r['rci25']>0 and r['rci47']>-50: bull+=1
+    if r['rci25']<0 and r['rci47']<50: bear+=1
+    return 'BULL' if bull>=bear+2 else 'BEAR' if bear>=bull+2 else 'NEUTRAL'
 
-def structure(df):
-    x=df.iloc[-180:].reset_index(drop=True); highs,lows=pivot_levels(x)
-    return (highs[-1][1] if highs else x.high.iloc[-30:].max(), lows[-1][1] if lows else x.low.iloc[-30:].min())
+def pivots(df,l=2,r=2):
+    H=[];L=[]; h=df['high'].to_numpy(); lo=df['low'].to_numpy()
+    for i in range(l,len(df)-r):
+        if h[i]>=np.max(h[i-l:i+r+1]):H.append(h[i])
+        if lo[i]<=np.min(lo[i-l:i+r+1]):L.append(lo[i])
+    return H,L
 
-def fib_levels(low,high):
-    d=high-low; return {"0.236":high-d*.236,"0.382":high-d*.382,"0.5":high-d*.5,"0.618":high-d*.618,"0.786":high-d*.786}
+def weekly_zone(W,p):
+    w=W.iloc[-104:]; lo=float(w['low'].min()); hi=float(w['high'].max()); q1=lo+(hi-lo)*.25; q3=lo+(hi-lo)*.75; mid=(lo+hi)/2
+    zone='LOWER_25' if p<=q1 else 'LOWER_MID' if p<=mid else 'UPPER_MID' if p<=q3 else 'UPPER_25'; return zone,lo,hi
 
-def major_fib(symbol,weekly):
-    lo=os.getenv(f"FIB_{symbol}_LOW"); hi=os.getenv(f"FIB_{symbol}_HIGH")
-    if lo and hi and float(hi)>float(lo): return float(lo),float(hi),"固定"
-    w=weekly.iloc[-160:]; return float(w.low.min()),float(w.high.max()),"自動"
+def daily_sr(D,p):
+    x=D.iloc[-95:]; H,L=pivots(x); tol=max(p*.0025,1e-6)
+    def cluster(vals):
+        gs=[]
+        for v in sorted(vals):
+            for g in gs:
+                if abs(v-g['m'])<=tol: g['v'].append(v); g['m']=float(np.mean(g['v'])); break
+            else: gs.append({'m':v,'v':[v]})
+        return gs
+    sg=cluster([v for v in L if v<p]); rg=cluster([v for v in H if v>p]); s=max(sg,key=lambda g:g['m']) if sg else None; r=min(rg,key=lambda g:g['m']) if rg else None
+    sp=s['m'] if s else None; rp=r['m'] if r else None; sh=len(s['v']) if s else 0; rh=len(r['v']) if r else 0
+    return f'S={sp if sp else "NA"}({sh}) R={rp if rp else "NA"}({rh})',sp,rp,sh,rh
 
-def score_fib(price,candle,levels):
-    L=S=0; rl=[]; rs=[]
-    for name,lv in levels.items():
-        if abs(price-lv)/price<=.008:
-            w=12 if name in ("0.382","0.618") else 8 if name=="0.5" else 4
-            if candle.low<=lv<=candle.close and candle.close>candle.open: L+=w; rl.append(f"週足Fib{name}反発")
-            if candle.close<=lv<=candle.high and candle.close<candle.open: S+=w; rs.append(f"週足Fib{name}拒否")
+def fib_score(p,c,lo,hi):
+    d=hi-lo; levels={'382':hi-d*.382,'500':hi-d*.5,'618':hi-d*.618,'786':hi-d*.786}; L=S=0; rl=[];rs=[]
+    for n,lv in levels.items():
+        if abs(p-lv)/max(p,1e-9)<=.005:
+            w=10 if n in ('382','618') else 7 if n=='500' else 3
+            if c['low']<=lv<=c['close'] and c['close']>c['open']: L+=w; rl.append(f'W_FIB_{n}_BOUNCE')
+            if c['close']<=lv<=c['high'] and c['close']<c['open']: S+=w; rs.append(f'W_FIB_{n}_REJECT')
     return L,S,rl,rs
 
+def correlations(allf):
+    ss=[]
+    for sym,fs in allf.items():
+        if len(fs['1hour'])>=50: ss.append(fs['1hour'].set_index('time')['close'].pct_change().rename(sym))
+    if len(ss)<2:return {}
+    df=pd.concat(ss,axis=1,join='inner').dropna().tail(120); c=df.corr(); out={}
+    for s in c.columns: out[s]=sorted([(o,float(c.loc[s,o])) for o in c.columns if o!=s],key=lambda z:abs(z[1]),reverse=True)
+    return out
 
-def _pivot_touch_count(vals, level, tol):
-    return sum(1 for v in vals if abs(v-level) <= tol)
+def corr_note(sym,c):
+    if sym not in c or not c[sym]:return 'CORR_NA'
+    o,v=c[sym][0]; return f'CORR {o}={v:+.2f}'
 
-def detect_1h_range(H1):
-    x=H1.iloc[-max(RANGE_LOOKBACK_1H,30):].reset_index(drop=True)
-    highs,lows=pivot_levels(x,left=2,right=2)
-    if len(highs)<2 or len(lows)<2:
-        return None
+def load_json(path,default):
+    try:return json.loads(path.read_text(encoding='utf-8')) if path.exists() else default
+    except:return default
 
-    hvals=[v for _,v in highs[-8:]]
-    lvals=[v for _,v in lows[-8:]]
-    rh=float(np.median(hvals[-min(4,len(hvals)):]))
-    rl=float(np.median(lvals[-min(4,len(lvals)):]))
-    if not math.isfinite(rh) or not math.isfinite(rl) or rh<=rl:
-        return None
+def event_block(sym):
+    now=now_utc(); pair=set(sym.split('_'))
+    for e in load_json(EVENT_FILE,[]):
+        try:
+            if str(e.get('impact','')).upper()!='HIGH':continue
+            t=datetime.fromisoformat(str(e['time_utc']).replace('Z','+00:00'))
+            if pair.intersection(set(e.get('currencies',[]))) and abs((now-t).total_seconds())<=EVENT_BLACKOUT_MINUTES*60:return True,e.get('name','HIGH_EVENT')
+        except:pass
+    return False,''
 
-    width=rh-rl
-    mid=(rh+rl)/2
-    width_pct=width/max(mid,1e-12)
-    if width_pct<RANGE_MIN_WIDTH_PCT or width_pct>RANGE_MAX_WIDTH_PCT:
-        return None
+def news_block(sym):
+    d=load_json(NEWS_FILE,{}); f=d.get(sym) or d.get('GLOBAL')
+    return (bool(f.get('block_new_entries')),str(f.get('reason','NEWS_RISK'))) if isinstance(f,dict) else (False,'')
 
-    atr=float(H1["atr"].iloc[-1]) if "atr" in H1 else width*0.1
-    tol=max(width*0.10, atr*0.35, mid*0.0015)
+def cloud_state(ind):
+    r=ind.iloc[-1]
+    if pd.isna(r['span_a']) or pd.isna(r['span_b']):
+        return 'NA',None,None
+    lo=min(float(r['span_a']),float(r['span_b']))
+    hi=max(float(r['span_a']),float(r['span_b']))
+    p=float(r['close'])
+    return ('ABOVE' if p>hi else 'BELOW' if p<lo else 'IN'),lo,hi
 
-    top_touches=_pivot_touch_count(hvals,rh,tol)
-    bot_touches=_pivot_touch_count(lvals,rl,tol)
-    if top_touches<RANGE_MIN_TOUCHES or bot_touches<RANGE_MIN_TOUCHES:
-        return None
-
-    return {
-        "low":rl, "high":rh, "mid":mid, "width":width,
-        "width_pct":width_pct, "atr":atr,
-        "top_touches":top_touches, "bottom_touches":bot_touches
-    }
-
-def market_regime(H4,H1,rg):
-    h4=trend_state_ind(H4)
-    h1=trend_state_ind(H1)
-
-    if h4=="BULL" and h1=="BULL":
-        return "UP"
-    if h4=="BEAR" and h1=="BEAR":
-        return "DOWN"
-
-    if rg is not None:
-        last=float(H1.iloc[-1]["close"])
-        atr=max(float(rg["atr"]),1e-12)
-        if last > rg["high"] + atr*RANGE_BREAK_ATR:
-            return "UP"
-        if last < rg["low"] - atr*RANGE_BREAK_ATR:
-            return "DOWN"
-        return "RANGE"
-
-    if h4=="BULL":
-        return "UP"
-    if h4=="BEAR":
-        return "DOWN"
-    return "MIXED"
-
-def range_position(price,rg):
-    if rg is None:
-        return None
-    return (price-rg["low"])/max(rg["width"],1e-12)
-
-def range_targets(side,entry,stop,rg):
-    low,high,mid=rg["low"],rg["high"],rg["mid"]
-    pad=rg["width"]*0.06
-
-    if side=="LONG":
-        tp1=max(entry+(mid-entry)*0.70, entry+abs(entry-stop)*0.8)
-        tp2=low+rg["width"]*0.78
-        tp3=high-pad
-        vals=sorted([tp1,tp2,tp3])
-        return vals[0],vals[1],vals[2]
-
-    tp1=min(entry-(entry-mid)*0.70, entry-abs(entry-stop)*0.8)
-    tp2=high-rg["width"]*0.78
-    tp3=low+pad
-    vals=sorted([tp1,tp2,tp3], reverse=True)
-    return vals[0],vals[1],vals[2]
-
-
-def analyze(symbol,frames):
-    W,D,H4,H1,M15,M5=[indicators(frames[k]) for k in ("1week","1day","4hour","1hour","15min","5min")]
-    c15,p15,c5=M15.iloc[-1],M15.iloc[-2],M5.iloc[-1]
-    p=float(c15.close)
-
-    rg=detect_1h_range(H1)
-    regime=market_regime(H4,H1,rg)
-    rpos=range_position(p,rg)
-
-    L=S=0
-    rl=[]
-    rs=[]
-
-    bias,bpts=higher_rci_bias(W,D)
-    if bias in ("UP","STRONG_UP"):
-        L+=bpts; rl.append("週足・日足 青/緑RCI上向き")
-    elif bias in ("DOWN","STRONG_DOWN"):
-        S+=bpts; rs.append("週足・日足 青/緑RCI下向き")
-
-    if regime=="UP":
-        L+=20; rl.append("4H・1H 上昇環境")
-    elif regime=="DOWN":
-        S+=20; rs.append("4H・1H 下降環境")
-    elif regime=="RANGE":
-        rl.append("1Hレンジ相場")
-        rs.append("1Hレンジ相場")
-
-    if c15.close>c15.ema12 and c15.ema_slope5>0:
-        L+=8; rl.append("15分EMA上向き")
-    elif c15.close<c15.ema12 and c15.ema_slope5<0:
-        S+=8; rs.append("15分EMA下向き")
-
-    if pd.notna(c15.rci8) and pd.notna(c15.rci25):
-        if c15.rci8>p15.rci8 and c15.rci25>=p15.rci25:
-            L+=8; rl.append("15分RCI短中期上向き")
-        if c15.rci8<p15.rci8 and c15.rci25<=p15.rci25:
-            S+=8; rs.append("15分RCI短中期下向き")
-
-    rev15,pts15=red_rci_reversal(M15)
-    rev5,_=red_rci_reversal(M5)
-
-    if rg is not None and rpos is not None:
-        near_low=rpos<=RANGE_EDGE_PCT
-        near_high=rpos>=1-RANGE_EDGE_PCT
-
-        if regime=="RANGE":
-            if near_low:
-                L+=20; rl.append(f"1Hレンジ下限側({rpos:.2f})")
-                if rev15=="LONG":
-                    L+=int(pts15*0.9); rl.append("15分赤RCI下端→上向き")
-                if rev5=="LONG":
-                    L+=10; rl.append("5分赤RCI下端→上向き(発射)")
-            if near_high:
-                S+=20; rs.append(f"1Hレンジ上限側({rpos:.2f})")
-                if rev15=="SHORT":
-                    S+=int(pts15*0.9); rs.append("15分赤RCI上端→下向き")
-                if rev5=="SHORT":
-                    S+=10; rs.append("5分赤RCI上端→下向き(発射)")
-
-        elif regime=="UP":
-            if near_low or rpos<=0.45:
-                L+=14; rl.append(f"上昇環境の押し目ゾーン({rpos:.2f})")
-                if rev15=="LONG":
-                    L+=int(pts15*0.9); rl.append("15分赤RCI下端→上向き")
-                if rev5=="LONG":
-                    L+=10; rl.append("5分赤RCI下端→上向き(発射)")
-            if near_high:
-                S-=12
-
-        elif regime=="DOWN":
-            if near_high or rpos>=0.55:
-                S+=14; rs.append(f"下降環境の戻りゾーン({rpos:.2f})")
-                if rev15=="SHORT":
-                    S+=int(pts15*0.9); rs.append("15分赤RCI上端→下向き")
-                if rev5=="SHORT":
-                    S+=10; rs.append("5分赤RCI上端→下向き(発射)")
-            if near_low:
-                L-=12
-
+def early_entry_signals(M15,M5,side):
+    c15=M15.iloc[-1]; p15=M15.iloc[-2]
+    c5=M5.iloc[-1]; p5=M5.iloc[-2]
+    atr=float(c15['atr']) if pd.notna(c15['atr']) and c15['atr']>0 else float(c15['close'])*.0015
+    state,clo,chi=cloud_state(M15)
+    score=0; reasons=[]
+    if side=='LONG':
+        if c15['rci8']<=-70 and c15['rci8']>p15['rci8']:
+            score+=10; reasons.append('15M_RCI8_EARLY_UP')
+        if c5['rci8']>p5['rci8']:
+            score+=8; reasons.append('5M_RCI8_LEAD_UP')
+        if c15['rci25']>=p15['rci25']:
+            score+=5; reasons.append('15M_RCI25_STABILIZE')
+        if abs(float(c15['close'])-float(c15['ema9']))<=EMA_NEAR_ATR*atr:
+            score+=6; reasons.append('15M_NEAR_EMA9')
+        if c15['close']>c15['ema9'] and c15['ema9_slope3']>=0:
+            score+=6; reasons.append('15M_EMA9_TURN_UP')
+        if c15['ema9']>=c15['ema12']:
+            score+=4; reasons.append('EMA9_ABOVE_EMA12')
+        if state=='IN':
+            score+=5; reasons.append('15M_IN_CLOUD')
+        elif clo is not None and abs(float(c15['close'])-clo)<=CLOUD_NEAR_ATR*atr:
+            score+=5; reasons.append('15M_NEAR_CLOUD_LOW')
     else:
-        for label,ind,scale in [("4H",H4,1.0),("1H",H1,.9),("15分",M15,.85)]:
-            rev,pts=red_rci_reversal(ind)
-            pts=int(round(pts*scale))
-            if bias in ("UP","STRONG_UP") and rev=="LONG":
-                L+=pts; rl.append(f"{label}赤RCI下端→上向き反転")
-            elif bias in ("DOWN","STRONG_DOWN") and rev=="SHORT":
-                S+=pts; rs.append(f"{label}赤RCI上端→下向き反転")
-        if bias in ("UP","STRONG_UP") and rev5=="LONG":
-            L+=8
-        if bias in ("DOWN","STRONG_DOWN") and rev5=="SHORT":
-            S+=8
+        if c15['rci8']>=70 and c15['rci8']<p15['rci8']:
+            score+=10; reasons.append('15M_RCI8_EARLY_DOWN')
+        if c5['rci8']<p5['rci8']:
+            score+=8; reasons.append('5M_RCI8_LEAD_DOWN')
+        if c15['rci25']<=p15['rci25']:
+            score+=5; reasons.append('15M_RCI25_STABILIZE_DOWN')
+        if abs(float(c15['close'])-float(c15['ema9']))<=EMA_NEAR_ATR*atr:
+            score+=6; reasons.append('15M_NEAR_EMA9')
+        if c15['close']<c15['ema9'] and c15['ema9_slope3']<=0:
+            score+=6; reasons.append('15M_EMA9_TURN_DOWN')
+        if c15['ema9']<=c15['ema12']:
+            score+=4; reasons.append('EMA9_BELOW_EMA12')
+        if state=='IN':
+            score+=5; reasons.append('15M_IN_CLOUD')
+        elif chi is not None and abs(float(c15['close'])-chi)<=CLOUD_NEAR_ATR*atr:
+            score+=5; reasons.append('15M_NEAR_CLOUD_HIGH')
+    return score,reasons
 
-    rh,rlow=structure(H1)
-    if p>rh:
-        L+=6
-    if p<rlow:
-        S+=6
+def entry_location(side,p,H1,M15):
+    c=M15.iloc[-1]
+    atr=float(H1['atr'].iloc[-1])
+    atr=atr if math.isfinite(atr) and atr>0 else p*.002
+    state,clo,chi=cloud_state(M15)
+    anchors=[float(c['ema9']),float(c['ema12'])]
+    if side=='LONG' and clo is not None: anchors.append(float(clo))
+    if side=='SHORT' and chi is not None: anchors.append(float(chi))
+    if side=='LONG':
+        usable=[a for a in anchors if a<=p+0.15*atr]
+        anchor=max(usable) if usable else p
+        return anchor-0.18*atr,min(p,anchor+0.08*atr),atr
+    usable=[a for a in anchors if a>=p-0.15*atr]
+    anchor=min(usable) if usable else p
+    return max(p,anchor-0.08*atr),anchor+0.18*atr,atr
 
-    flo,fhi,fsource=major_fib(symbol,W)
-    fL,fS,frL,frS=score_fib(p,c15,fib_levels(flo,fhi))
-    L+=fL; S+=fS; rl+=frL; rs+=frS
+def tf_times(fs):
+    out={}
+    for k in ('5min','15min','1hour','4hour','1day','1week'):
+        try: out[k]=str(fs[k].iloc[-1]['time'])
+        except Exception: out[k]='NA'
+    return out
 
-    if pd.notna(c15.span_a) and pd.notna(c15.span_b):
-        hi=max(c15.span_a,c15.span_b); lo=min(c15.span_a,c15.span_b)
-        if p>hi: L+=4
-        elif p<lo: S+=4
-
-    if pd.notna(c15.vol_ma20) and c15.volume>c15.vol_ma20*1.25:
-        if c15.close>c15.open: L+=3
-        elif c15.close<c15.open: S+=3
-
-    allow_long=True
-    allow_short=True
-    if regime=="UP":
-        allow_short=False
-    elif regime=="DOWN":
-        allow_long=False
-
-    side="WAIT"
-    confidence=max(L,S)
-    reasons=[f"LONG {L}/SHORT {S}",f"REGIME={regime}",f"Fib={fsource}"]
-
-    if allow_long and L>=ENTRY_THRESHOLD and L>=S+OPPOSITE_GAP:
-        side="LONG"; confidence=min(100,L); reasons=rl
-    elif allow_short and S>=ENTRY_THRESHOLD and S>=L+OPPOSITE_GAP:
-        side="SHORT"; confidence=min(100,S); reasons=rs
-
-    candle_id=str(c15.time)
-
-    if side=="WAIT":
-        return Analysis(
-            symbol,side,L,S,confidence,p,
-            None,None,None,None,None,None,
-            reasons,"条件不足",candle_id,float(c15.high),float(c15.low),
-            regime,
-            rg["low"] if rg else None,
-            rg["high"] if rg else None,
-            rg["mid"] if rg else None,
-            rpos
-        )
-
-    atr=float(H1.atr.iloc[-1])
-    atr=atr if math.isfinite(atr) and atr>0 else p*.012
-
-    if rg is not None and regime=="RANGE":
-        pad=max(rg["width"]*0.08,atr*0.30)
-
-        if side=="LONG":
-            entry_high=min(p,rg["low"]+rg["width"]*0.22)
-            entry_low=max(rg["low"]-pad*0.10,entry_high-atr*0.20)
-            mid=(entry_low+entry_high)/2
-            stop=rg["low"]-pad
-            tp1,tp2,tp3=range_targets("LONG",mid,stop,rg)
-            invalid=f"1Hレンジ下限 {rg['low']:,.4f} 明確割れ"
-        else:
-            entry_low=max(p,rg["high"]-rg["width"]*0.22)
-            entry_high=min(rg["high"]+pad*0.10,entry_low+atr*0.20)
-            mid=(entry_low+entry_high)/2
-            stop=rg["high"]+pad
-            tp1,tp2,tp3=range_targets("SHORT",mid,stop,rg)
-            invalid=f"1Hレンジ上限 {rg['high']:,.4f} 明確上抜け"
+def analyze(sym,fs,cn):
+    W,D,H4,H1,M15,M5=[indicators(fs[k]) for k in ('1week','1day','4hour','1hour','15min','5min')]; c=M15.iloc[-1]; prev=M15.iloc[-2]; p=float(c['close']); L=S=0; rl=[];rs=[]; cl=[];cs=[]
+    zone,wlo,whi=weekly_zone(W,p); sr,ds,dr,sh,rh=daily_sr(D,p)
+    for lab,x,w in [('4H',H4,18),('1H',H1,13)]:
+        st=trend(x)
+        if st=='BULL':L+=w;rl.append(lab+'_BULL');cs.append(lab+' bullish')
+        elif st=='BEAR':S+=w;rs.append(lab+'_BEAR');cl.append(lab+' bearish')
+    hb,hp=higher_bias(W,D)
+    if hb in ('UP','STRONG_UP'):L+=hp;rl.append('W_D_RCI25_47_UP');cs.append('W/D RCI25/47 rising')
+    elif hb in ('DOWN','STRONG_DOWN'):S+=hp;rs.append('W_D_RCI25_47_DOWN');cl.append('W/D RCI25/47 falling')
+    if c['close']>c['ema12'] and c['ema_slope5']>0:L+=11;rl.append('15M_EMA_UP')
+    elif c['close']<c['ema12'] and c['ema_slope5']<0:S+=11;rs.append('15M_EMA_DOWN')
+    if c['rci8']>prev['rci8'] and c['rci25']>=prev['rci25']:L+=7;rl.append('15M_RCI_UP')
+    if c['rci8']<prev['rci8'] and c['rci25']<=prev['rci25']:S+=7;rs.append('15M_RCI_DOWN')
+    for lab,x,sc in [('4H',H4,1),('1H',H1,.9),('15M',M15,.85)]:
+        rev,pts=red_reversal(x); pts=int(round(pts*sc))
+        if hb in ('UP','STRONG_UP') and rev=='LONG':L+=pts;rl.append(lab+'_RCI8_BOTTOM_REV')
+        elif hb in ('DOWN','STRONG_DOWN') and rev=='SHORT':S+=pts;rs.append(lab+'_RCI8_TOP_REV')
+    rev,_=red_reversal(M5)
+    if hb in ('UP','STRONG_UP') and rev=='LONG':L+=7;rl.append('5M_LONG_TIMING')
+    if hb in ('DOWN','STRONG_DOWN') and rev=='SHORT':S+=7;rs.append('5M_SHORT_TIMING')
+    if ds and abs(p-ds)/p<=.004:L+=min(10,3+sh*2);rl.append(f'DAILY_SUPPORT_{sh}');cs.append('near repeated daily support')
+    if dr and abs(p-dr)/p<=.004:S+=min(10,3+rh*2);rs.append(f'DAILY_RESIST_{rh}');cl.append('near repeated daily resistance')
+    a,b,ar,br=fib_score(p,c,wlo,whi);L+=a;S+=b;rl+=ar;rs+=br
+    if zone=='UPPER_25':cl.append('upper 25% of 2Y range')
+    if zone=='LOWER_25':cs.append('lower 25% of 2Y range')
+    earlyL,earlyLr=early_entry_signals(M15,M5,'LONG')
+    earlyS,earlySr=early_entry_signals(M15,M5,'SHORT')
+    if EARLY_ENTRY_ENABLED:
+        if hb in ('UP','STRONG_UP'):
+            L+=earlyL; rl+=earlyLr
+        elif hb in ('DOWN','STRONG_DOWN'):
+            S+=earlyS; rs+=earlySr
+    side='WAIT'; conf=max(L,S); reasons=[f'L={L}',f'S={S}']; counter=[]
+    if L>=ENTRY_THRESHOLD and L>=S+OPPOSITE_GAP:side='LONG';conf=min(100,L);reasons=rl;counter=cl
+    elif S>=ENTRY_THRESHOLD and S>=L+OPPOSITE_GAP:side='SHORT';conf=min(100,S);reasons=rs;counter=cs
+    cid=str(c['time'])
+    if side=='WAIT':return Analysis(sym,side,L,S,conf,p,None,None,None,None,None,None,None,None,reasons,[],cid,float(c['high']),float(c['low']),zone,sr,cn)
+    if side=='LONG':
+        el,eh,atr=entry_location('LONG',p,H1,M15)
+        stop=min(el-.80*atr,(ds-.25*atr if ds else el-.80*atr)); mid=(el+eh)/2
     else:
-        if side=="LONG":
-            entry_high=p-.08*atr
-            entry_low=p-.32*atr
-            stop=min(entry_low-.75*atr,rlow-.15*atr)
-            mid=(entry_low+entry_high)/2
-            risk=max(mid-stop,p*.003)
-            tp1,tp2,tp3=mid+TP1_R*risk,mid+TP2_R*risk,mid+TP3_R*risk
-            invalid=f"1H押し安値 {rlow:,.4f} 割れ"
-        else:
-            entry_low=p+.08*atr
-            entry_high=p+.32*atr
-            stop=max(entry_high+.75*atr,rh+.15*atr)
-            mid=(entry_low+entry_high)/2
-            risk=max(stop-mid,p*.003)
-            tp1,tp2,tp3=mid-TP1_R*risk,mid-TP2_R*risk,mid-TP3_R*risk
-            invalid=f"1H戻り高値 {rh:,.4f} 上抜け"
-
-    return Analysis(
-        symbol,side,L,S,confidence,p,
-        entry_low,entry_high,stop,tp1,tp2,tp3,
-        reasons,invalid,candle_id,float(c15.high),float(c15.low),
-        regime,
-        rg["low"] if rg else None,
-        rg["high"] if rg else None,
-        rg["mid"] if rg else None,
-        rpos
-    )
+        el,eh,atr=entry_location('SHORT',p,H1,M15)
+        stop=max(eh+.80*atr,(dr+.25*atr if dr else eh+.80*atr)); mid=(el+eh)/2
+    risk=max(abs(mid-stop),p*.0008)
+    if side=='LONG':
+        t1=mid+TP1_R*risk;t2=mid+TP2_R*risk;t3=mid+TP3_R*risk
+    else:
+        t1=mid-TP1_R*risk;t2=mid-TP2_R*risk;t3=mid-TP3_R*risk
+    rr1=abs(t1-mid)/abs(mid-stop);rr2=abs(t2-mid)/abs(mid-stop)
+    if rr1<MIN_RR:return Analysis(sym,'WAIT',L,S,conf,p,None,None,None,None,None,None,rr1,rr2,reasons,counter+[f'RR_LOW={rr1:.2f}'],cid,float(c['high']),float(c['low']),zone,sr,cn)
+    return Analysis(sym,side,L,S,conf,p,el,eh,stop,t1,t2,t3,rr1,rr2,reasons,counter,cid,float(c['high']),float(c['low']),zone,sr,cn)
 
 def load_state():
     if STATE_FILE.exists():
+        try:return json.loads(STATE_FILE.read_text(encoding='utf-8'))
+        except:pass
+    return {'paper_balance':PAPER_BALANCE_DEFAULT,'position':None,'pending':None,'daily_date':None,'daily_start_balance':PAPER_BALANCE_DEFAULT,'consecutive_losses':0,'last_key':None}
+
+def save_state(s):STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding='utf-8')
+def notify(t):
+    t=str(t); print(t,flush=True)
+    if not NTFY_TOPIC:return
+    headers={'Title':'Musigny FX BOT v3.3','Content-Type':'text/plain; charset=utf-8'}
+    for attempt in range(3):
         try:
-            s=json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if "positions" not in s:
-                old=s.get("position")
-                s["positions"]=[old] if old else []
-            s.pop("position",None)
-            s.setdefault("pending",None)
-            s.setdefault("last_notified",None)
-            s.setdefault("paper_balance",PAPER_BALANCE_DEFAULT)
-            s.setdefault("daily_date",None)
-            s.setdefault("daily_start_balance",s["paper_balance"])
-            s.setdefault("consecutive_losses",0)
-            return s
-        except Exception:
-            pass
-    return {
-        "paper_balance":PAPER_BALANCE_DEFAULT,
-        "positions":[],
-        "pending":None,
-        "last_notified":None,
-        "daily_date":None,
-        "daily_start_balance":PAPER_BALANCE_DEFAULT,
-        "consecutive_losses":0
+            r=requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',data=t.encode('utf-8'),headers=headers,timeout=15)
+            if r.status_code==429:
+                wait=10*(attempt+1); print(f'[NTFY-WARN] 429; retry in {wait}s',flush=True); time.sleep(wait); continue
+            r.raise_for_status(); return
+        except Exception as e:
+            if attempt<2: time.sleep(5*(attempt+1))
+            else: print(f'[NTFY-SKIP] notification failed; bot continues: {e}',flush=True); return
+
+def can_open(s):
+    d=now_jst().date().isoformat()
+    if s.get('daily_date')!=d:s['daily_date']=d;s['daily_start_balance']=s['paper_balance']
+    dd=(s['paper_balance']-s['daily_start_balance'])/max(s['daily_start_balance'],1)
+    if dd<=-MAX_DAILY_LOSS_PCT:return False,'DAILY_LOSS_LIMIT'
+    if s.get('consecutive_losses',0)>=MAX_CONSECUTIVE_LOSSES:return False,'CONSECUTIVE_LOSS_LIMIT'
+    if s.get('position'):return False,'POSITION_OPEN'
+    return True,'OK'
+
+def create_pending(s,a):s['pending']={'symbol':a.symbol,'side':a.side,'confidence':a.confidence,'long':a.long,'short':a.short,'entry_low':a.entry_low,'entry_high':a.entry_high,'stop':a.stop,'tp1':a.tp1,'tp2':a.tp2,'tp3':a.tp3,'rr1':a.rr1,'rr2':a.rr2,'created_at':now_utc().isoformat(),'reasons':a.reasons[:10],'counter':a.counter[:10],'early':a.confidence<STRONG_THRESHOLD}
+def touch(p,h,l):return h>=min(p['entry_low'],p['entry_high']) and l<=max(p['entry_low'],p['entry_high'])
+
+def quote_to_jpy(sym,tickers):
+    quote=sym.split('_')[1]
+    if quote=='JPY': return 1.0
+    if quote=='USD':
+        t=tickers.get('USD_JPY')
+        if t:return float(t['bid'])
+    return 1.0
+
+def max_qty_by_leverage(sym,entry,balance,tickers):
+    q2j=quote_to_jpy(sym,tickers)
+    max_notional_jpy=balance*MAX_LEVERAGE
+    return max_notional_jpy/max(entry*q2j,1e-12)
+
+def jp_side(side):
+    return "ã­ã³ã°" if side=="LONG" else "ã·ã§ã¼ã" if side=="SHORT" else "è¦éã"
+
+def jp_reason(x):
+    mp={
+        "4H_BULL":"4æéè¶³ ä¸æ",
+        "4H_BEAR":"4æéè¶³ ä¸é",
+        "1H_BULL":"1æéè¶³ ä¸æ",
+        "1H_BEAR":"1æéè¶³ ä¸é",
+        "W_D_RCI25_47_UP":"é±è¶³ã»æ¥è¶³ RCI25/47ä¸åã",
+        "W_D_RCI25_47_DOWN":"é±è¶³ã»æ¥è¶³ RCI25/47ä¸åã",
+        "15M_EMA_UP":"15åè¶³ EMAä¸åã",
+        "15M_EMA_DOWN":"15åè¶³ EMAä¸åã",
+        "15M_RCI_UP":"15åè¶³ RCIä¸åã",
+        "15M_RCI_DOWN":"15åè¶³ RCIä¸åã",
+        "5M_LONG_TIMING":"5åè¶³ ã­ã³ã°ã¿ã¤ãã³ã°",
+        "5M_SHORT_TIMING":"5åè¶³ ã·ã§ã¼ãã¿ã¤ãã³ã°",
     }
+    return mp.get(x,x)
 
-def save_state(s): STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding="utf-8")
+def make_pos(s,p,tickers):
+    e=(p['entry_low']+p['entry_high'])/2
+    risk_qty=s['paper_balance']*RISK_PCT/max(abs(e-p['stop']),1e-12)
+    lev_qty=max_qty_by_leverage(p['symbol'],e,s['paper_balance'],tickers)
+    qty=min(risk_qty,lev_qty)
+    if p.get('early'): qty*=EARLY_SIZE_PCT
+    s['position']={
+        'symbol':p['symbol'],'side':p['side'],'entry':e,
+        'qty_initial':qty,'qty_remaining':qty,
+        'stop':p['stop'],'original_stop':p['stop'],
+        'initial_risk':abs(e-p['stop']),
+        'tp1':p['tp1'],'tp2':p['tp2'],'tp3':p['tp3'],
+        'tp1_done':False,'tp2_done':False,
+        'realized_pnl':0.0,'opened_at':now_utc().isoformat(),'max_r':0.0
+    }
+    s['pending']=None
+    reasons=' / '.join(jp_reason(x) for x in p.get('reasons',[])[:8]) or 'ãªã'
+    counter=' / '.join(jp_reason(x) for x in p.get('counter',[])[:5]) or 'ãªã'
+    return (
+        f'ð¯ çºæ¿FX ä»®æ³æ°è¦ç´å® {p["symbol"]}\n'
+        f'æ¹å: {jp_side(p["side"])}\n'
+        f'ä¿¡é ¼åº¦: {p.get("confidence",0)}/100\n'
+        f'ã­ã³ã°ç¹: {p.get("long","?")} / ã·ã§ã¼ãç¹: {p.get("short","?")}\n'
+        f'ç´å®ä¾¡æ ¼: {e:.5f}\n'
+        f'æåã: {p["stop"]:.5f}\n'
+        f'å©ç¢ºâ : {p["tp1"]:.5f}\n'
+        f'å©ç¢ºâ¡: {p["tp2"]:.5f}\n'
+        f'å©ç¢ºâ¢: {p["tp3"]:.5f}\n'
+        f'ã¨ã³ããªã¼æ ¹æ : {reasons}\n'
+        f'éæ¹åã®æ³¨æææ: {counter}\n'
+        f'æå¤§ã¬ãã¬ãã¸: {MAX_LEVERAGE:.1f}åï¼ãã¼ãã¼ï¼\n'
+        f'1åã®è¨±å®¹ãªã¹ã¯: {RISK_PCT*100:.2f}%'
+    )
 
-def can_open(state):
-    jst=now_jst().date().isoformat()
-    if state.get("daily_date")!=jst:
-        state["daily_date"]=jst
-        state["daily_start_balance"]=state["paper_balance"]
-        state["consecutive_losses"]=0
-    dd=(state["paper_balance"]-state["daily_start_balance"])/max(state["daily_start_balance"],1)
-    if dd<=-MAX_DAILY_LOSS_PCT:
-        return False,"1日最大損失到達"
-    if state.get("consecutive_losses",0)>=MAX_CONSECUTIVE_LOSSES:
-        return False,"3連敗停止"
-    if len(state.get("positions",[]))>=MAX_OPEN_POSITIONS:
-        return False,f"最大{MAX_OPEN_POSITIONS}ポジション保有中"
-    return True,"OK"
+def manage_pending(s,analyses,tickers):
+    p=s.get('pending')
+    if not p:return None
+    if now_utc()-datetime.fromisoformat(p['created_at'])>timedelta(hours=PENDING_EXPIRE_HOURS):s['pending']=None;return None
+    a=next((x for x in analyses if x.symbol==p['symbol']),None)
+    if a and touch(p,a.high,a.low):return make_pos(s,p,tickers)
+    return None
 
-def record_trade(row):
-    exists=TRADES_FILE.exists()
-    with TRADES_FILE.open("a",newline="",encoding="utf-8") as f:
+def live_exit_price(sym,side,tickers):
+    t=tickers.get(sym); return float(t['bid'] if side=='LONG' else t['ask']) if t else None
+
+def record(row):
+    ex=TRADES_FILE.exists()
+    with TRADES_FILE.open('a',newline='',encoding='utf-8') as f:
         w=csv.writer(f)
-        if not exists:
-            w.writerow([
-                "time","symbol","side","entry","exit","qty_closed",
-                "gross_pnl","trading_cost","leverage_fee","total_cost",
-                "net_pnl","balance","event"
-            ])
+        if not ex:w.writerow(['time','symbol','side','entry','exit','qty','pnl','balance','event','rule_followed'])
         w.writerow(row)
 
-def touch_zone(pending,high,low):
-    lo=min(pending["entry_low"],pending["entry_high"]); hi=max(pending["entry_low"],pending["entry_high"]); return high>=lo and low<=hi
+def close_remaining(s,p,px,event,label):
+    q=max(p['qty_remaining'],0); side=p['side']
+    pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q
+    p['realized_pnl']+=pnl;s['paper_balance']+=p['realized_pnl']
+    s['consecutive_losses']=s.get('consecutive_losses',0)+1 if p['realized_pnl']<0 else 0
+    record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],event,True])
+    msg=(f'{label} {p["symbol"]}\n'
+         f'ç¢ºå®æç {p["realized_pnl"]:+,.0f}å\n'
+         f'ä»®æ³æ®é« {s["paper_balance"]:,.0f}å')
+    s['position']=None
+    return msg
 
-def make_position(state,p,tickers):
-    mid=(p["entry_low"]+p["entry_high"])/2
-    risk_per_unit=abs(mid-p["stop"])
-    risk_yen=state["paper_balance"]*RISK_PCT
-    qty=min(
-        risk_yen/max(risk_per_unit,1e-12),
-        (state["paper_balance"]*2)/mid
-    )
+def position_r(p,px):
+    risk=max(float(p.get('initial_risk',abs(p['entry']-p.get('original_stop',p['stop'])))),1e-12)
+    return (px-p['entry'])/risk if p['side']=='LONG' else (p['entry']-px)/risk
 
-    t=tickers.get(p["symbol"],{})
-    try:
-        bid=float(t.get("bid")); ask=float(t.get("ask"))
-        entry_half_spread=max(ask-bid,0.0)/2
-    except Exception:
-        entry_half_spread=0.0
+def strong_reversal(p,analyses):
+    a=next((x for x in analyses if x.symbol==p['symbol']),None)
+    if not a:return False
+    if p['side']=='LONG':return a.short>=ENTRY_THRESHOLD and a.short>=a.long+OPPOSITE_GAP
+    return a.long>=ENTRY_THRESHOLD and a.long>=a.short+OPPOSITE_GAP
 
-    new_position={
-        "symbol":p["symbol"],
-        "side":p["side"],
-        "entry":mid,
-        "qty_initial":qty,
-        "qty_remaining":qty,
-        "stop":p["stop"],
-        "original_stop":p["stop"],
-        "initial_risk":risk_per_unit,
-        "tp1":p["tp1"],
-        "tp2":p["tp2"],
-        "tp3":p["tp3"],
-        "tp1_done":False,
-        "tp2_done":False,
-        "tp3_done":False,
-        "realized_pnl":0.0,
-        "realized_gross_pnl":0.0,
-        "realized_cost":0.0,
-        "entry_half_spread":entry_half_spread,
-        "opened_at":now_utc().isoformat(),
-        "max_r":0.0,
-        "exit_logic":"FX_STYLE_V2_NET",
-        "regime":getattr(p,"regime","UNKNOWN"),
-        "range_low":getattr(p,"range_low",None),
-        "range_high":getattr(p,"range_high",None),
-        "range_mid":getattr(p,"range_mid",None)
-    }
-    state.setdefault("positions",[]).append(new_position)
+def manage_position(s,tickers,analyses):
+    p=s.get('position');msgs=[]
+    if not p:return msgs
+    px=live_exit_price(p['symbol'],p['side'],tickers)
+    if px is None:return msgs
+    side=p['side'];tp=lambda lv:px>=lv if side=='LONG' else px<=lv;st=lambda lv:px<=lv if side=='LONG' else px>=lv
+    cur_r=position_r(p,px);p['max_r']=max(float(p.get('max_r',0)),cur_r)
+    age_h=(now_utc()-datetime.fromisoformat(p['opened_at'])).total_seconds()/3600
+    print(f'[POSITION] {p["symbol"]} {side} ENTRY={p["entry"]:.5f} NOW={px:.5f} R={cur_r:+.2f} MAX_R={p["max_r"]:+.2f} AGE={age_h:.1f}h STOP={p["stop"]:.5f} TP1={p["tp1"]:.5f} TP2={p["tp2"]:.5f} TP3={p["tp3"]:.5f}',flush=True)
 
-    return (
-        f"🎯 仮想約定 {p['symbol']} {p['side']}\n"
-        f"信頼度: {p['confidence']}/100\n"
-        f"約定: {mid:,.4f}\n"
-        f"数量: {qty:.8f}\n"
-        f"保有数: {len(state['positions'])}/{MAX_OPEN_POSITIONS}\n"
-        f"TP1=1.0R / TP2=1.5R / TP3=2.2R\n"
-        f"※損益通知は想定コスト差引後の純利益"
-    )
+    if st(p['stop']):
+        msgs.append(close_remaining(s,p,px,'STOP_END','ð çºæ¿FX ä»®æ³æåã'));return msgs
+    if strong_reversal(p,analyses):
+        msgs.append(close_remaining(s,p,px,'REVERSAL_END','ð çºæ¿FX ä»®æ³åè»¢æ±ºæ¸'));return msgs
+    if age_h>=MAX_HOLD_HOURS:
+        msgs.append(close_remaining(s,p,px,'TIME_END','â° çºæ¿FX ä»®æ³æéæ±ºæ¸'));return msgs
+    if age_h>=REVIEW_HOURS and not p['tp1_done']:
+        a=next((x for x in analyses if x.symbol==p['symbol']),None)
+        same_side=False
+        weak_or_reverse=False
+        if a:
+            if side=='LONG':
+                same_side=(a.long>=ENTRY_THRESHOLD and a.long>=a.short+OPPOSITE_GAP)
+                weak_or_reverse=(a.short>=a.long or a.long<ENTRY_THRESHOLD)
+            else:
+                same_side=(a.short>=ENTRY_THRESHOLD and a.short>=a.long+OPPOSITE_GAP)
+                weak_or_reverse=(a.long>=a.short or a.short<ENTRY_THRESHOLD)
+        # 8h is a re-evaluation point, not an automatic close.
+        # Continue if the original direction is still strong.
+        # Close only if the signal has weakened/reversed and the trade has not progressed.
+        if weak_or_reverse and cur_r<=REVIEW_CLOSE_R:
+            msgs.append(close_remaining(s,p,px,'REVIEW_END','ð çºæ¿FX ä»®æ³è¦ç´ãæ±ºæ¸'));return msgs
+        if same_side:
+            print(f'[REVIEW_KEEP] {p["symbol"]} {side} R={cur_r:+.2f} direction still valid',flush=True)
+    if p['max_r']>=TRAIL_START_R and cur_r<=p['max_r']-TRAIL_GIVEBACK_R:
+        msgs.append(close_remaining(s,p,px,'TRAIL_END','ð çºæ¿FX ä»®æ³è¿½å¾æ±ºæ¸'));return msgs
 
-def manage_pending(state,analyses,tickers):
-    p=state.get("pending")
-    if not p: return None
-    if now_utc()-datetime.fromisoformat(p["created_at"])>timedelta(hours=PENDING_EXPIRE_HOURS): state["pending"]=None; return f"⌛ {p['symbol']} {p['side']}候補失効"
-    a=next((x for x in analyses if x.symbol==p["symbol"]),None)
-    if not a: return None
-    if p["side"]=="LONG" and a.candle_low<=p["stop"]: state["pending"]=None; return f"❌ {p['symbol']} LONG候補取消"
-    if p["side"]=="SHORT" and a.candle_high>=p["stop"]: state["pending"]=None; return f"❌ {p['symbol']} SHORT候補取消"
-    if touch_zone(p,a.candle_high,a.candle_low): msg=make_position(state,p,tickers); state["pending"]=None; return msg
-    return None
+    if not p['tp1_done'] and tp(p['tp1']):
+        q=p['qty_initial']*TP1_PCT;pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q
+        p['qty_remaining']-=q;p['realized_pnl']+=pnl;p['tp1_done']=True;p['stop']=p['entry']
+        record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP1',True])
+        msgs.append(f'â çºæ¿FX {p["symbol"]} å©ç¢ºâ  50%\nç¢ºå®æç {pnl:+,.0f}å')
 
-def fetch_live_tickers():
-    out={}
-    for symbol in SYMBOLS:
-        try:
-            data=api_get("/v1/ticker",{"symbol":symbol},retries=3)
-            if data:
-                out[symbol]=data[0]
-        except Exception as e:
-            print(f"[TICKER-WARN] {symbol}: {e}",flush=True)
-    return out
+    if not p['tp2_done'] and tp(p['tp2']):
+        q=p['qty_initial']*TP2_PCT;pnl=(px-p['entry'])*q if side=='LONG' else (p['entry']-px)*q
+        p['qty_remaining']-=q;p['realized_pnl']+=pnl;p['tp2_done']=True
+        risk=float(p['initial_risk']);p['stop']=p['entry']+risk if side=='LONG' else p['entry']-risk
+        record([now_utc().isoformat(),p['symbol'],side,p['entry'],px,q,pnl,s['paper_balance'],'TP2',True])
+        msgs.append(f'â çºæ¿FX {p["symbol"]} å©ç¢ºâ¡ 30%\nç¢ºå®æç {pnl:+,.0f}å')
 
-def live_exit_price(symbol,side,tickers):
-    t=tickers.get(symbol)
-    if not t:
-        return None
-    # LONG決済はBID、SHORT決済はASKを優先
-    key="bid" if side=="LONG" else "ask"
-    if t.get(key) is not None:
-        return float(t[key])
-    if t.get("last") is not None:
-        return float(t["last"])
-    return None
-
-def migrate_position_exit(pos):
-    """旧ポジションも新しいRベース＋純利益管理へ自動移行。"""
-    entry=float(pos["entry"])
-    original_stop=float(pos.get("original_stop",pos["stop"]))
-    risk=max(abs(entry-original_stop),entry*.003,1e-12)
-
-    pos["original_stop"]=original_stop
-    pos["initial_risk"]=risk
-    pos["opened_at"]=pos.get("opened_at") or now_utc().isoformat()
-    pos["max_r"]=float(pos.get("max_r",0.0))
-
-    if not str(pos.get("exit_logic","")).startswith("FX_STYLE_V2"):
-        if pos["side"]=="LONG":
-            pos["tp1"]=entry+TP1_R*risk
-            pos["tp2"]=entry+TP2_R*risk
-            pos["tp3"]=entry+TP3_R*risk
-        else:
-            pos["tp1"]=entry-TP1_R*risk
-            pos["tp2"]=entry-TP2_R*risk
-            pos["tp3"]=entry-TP3_R*risk
-
-    # 旧stateとの互換
-    legacy=float(pos.get("realized_pnl",0.0))
-    pos.setdefault("realized_gross_pnl",legacy)
-    pos.setdefault("realized_cost",0.0)
-    pos.setdefault("entry_half_spread",0.0)
-    pos["exit_logic"]="FX_STYLE_V2_NET"
-
-def position_r(pos,price):
-    risk=max(float(pos.get("initial_risk",abs(pos["entry"]-pos.get("original_stop",pos["stop"])))),1e-12)
-    if pos["side"]=="LONG":
-        return (price-pos["entry"])/risk
-    return (pos["entry"]-price)/risk
-
-def strong_reversal_against_position(pos,analyses):
-    a=next((x for x in analyses if x.symbol==pos["symbol"]),None)
-    if not a:
-        return False
-
-    if pos["side"]=="LONG":
-        return (
-            a.score_short>=ENTRY_THRESHOLD and
-            a.score_short>=a.score_long+OPPOSITE_GAP
-        )
-
-    return (
-        a.score_long>=ENTRY_THRESHOLD and
-        a.score_long>=a.score_short+OPPOSITE_GAP
-    )
-
-def leverage_fee_crossings(opened_at,closed_at):
-    """保有中に日本時間06:00を何回またいだか。"""
-    try:
-        opened=datetime.fromisoformat(opened_at)
-        if opened.tzinfo is None:
-            opened=opened.replace(tzinfo=timezone.utc)
-    except Exception:
-        return 0
-
-    closed=closed_at
-    if closed.tzinfo is None:
-        closed=closed.replace(tzinfo=timezone.utc)
-
-    oj=opened.astimezone(timezone(timedelta(hours=9)))
-    cj=closed.astimezone(timezone(timedelta(hours=9)))
-
-    # 開始日から終了日までの06:00 JSTを数える
-    d=oj.date()
-    count=0
-    while d<=cj.date():
-        boundary=datetime(d.year,d.month,d.day,6,0,0,tzinfo=timezone(timedelta(hours=9)))
-        if oj < boundary <= cj:
-            count+=1
-        d+=timedelta(days=1)
-    return count
-
-
-def calc_close_cost(pos,price,qty,closed_at=None):
-    """
-    想定コスト:
-      1) エントリー側の半スプレッド
-      2) 売買手数料（環境変数。暗号資産FX想定の初期値0）
-      3) 06:00 JSTまたぎのレバレッジ手数料
-    EXIT側のスプレッドはBID/ASK決済価格に既に反映済み。
-    """
-    closed_at=closed_at or now_utc()
-    entry=float(pos["entry"])
-
-    entry_spread_cost=float(pos.get("entry_half_spread",0.0))*qty
-
-    entry_fee=entry*qty*TRADE_FEE_RATE
-    exit_fee=price*qty*TRADE_FEE_RATE
-    trading_cost=entry_spread_cost+entry_fee+exit_fee
-
-    crossings=leverage_fee_crossings(pos.get("opened_at",closed_at.isoformat()),closed_at)
-    leverage_fee=entry*qty*LEVERAGE_DAILY_RATE*crossings
-
-    total_cost=trading_cost+leverage_fee
-    return trading_cost,leverage_fee,total_cost
-
-
-def settle_piece(state,pos,price,qty,event):
-    side=pos["side"]
-    gross=(
-        (price-pos["entry"])*qty
-        if side=="LONG"
-        else (pos["entry"]-price)*qty
-    )
-
-    trading_cost,leverage_fee,total_cost=calc_close_cost(
-        pos,price,qty,now_utc()
-    )
-    net=gross-total_cost
-
-    pos["realized_gross_pnl"]=float(pos.get("realized_gross_pnl",0.0))+gross
-    pos["realized_cost"]=float(pos.get("realized_cost",0.0))+total_cost
-    pos["realized_pnl"]=float(pos.get("realized_pnl",0.0))+net
-
-    record_trade([
-        now_utc().isoformat(),
-        pos["symbol"],
-        side,
-        pos["entry"],
-        price,
-        qty,
-        gross,
-        trading_cost,
-        leverage_fee,
-        total_cost,
-        net,
-        state["paper_balance"],
-        event
-    ])
-
-    return gross,trading_cost,leverage_fee,total_cost,net
-
-
-def close_remaining_multi(state,pos,price,event,label):
-    q=max(pos["qty_remaining"],0)
-    gross,trading_cost,leverage_fee,total_cost,net=settle_piece(
-        state,pos,price,q,event
-    )
-    state["paper_balance"]+=pos["realized_pnl"]
-    state["consecutive_losses"]=(
-        state.get("consecutive_losses",0)+1
-        if pos["realized_pnl"]<0 else 0
-    )
-    return (
-        f"{label} {pos['symbol']}\n"
-        f"今回売買損益: {gross:+,.0f}円\n"
-        f"今回想定コスト: -{total_cost:,.0f}円\n"
-        f"トレード総売買損益: {pos['realized_gross_pnl']:+,.0f}円\n"
-        f"トレード総コスト: -{pos['realized_cost']:,.0f}円\n"
-        f"最終純利益: {pos['realized_pnl']:+,.0f}円\n"
-        f"残高: {state['paper_balance']:,.0f}円"
-    )
-def manage_positions(state,analyses,tickers):
-    positions=state.get("positions",[])
-    if not positions:
-        return []
-
-    msgs=[]
-    survivors=[]
-
-    for pos in positions:
-        migrate_position_exit(pos)
-        price=live_exit_price(pos["symbol"],pos["side"],tickers)
-        if price is None:
-            print(f"[POSITION-WARN] {pos['symbol']}: live price unavailable",flush=True)
-            survivors.append(pos)
-            continue
-
-        side=pos["side"]
-        cur_r=position_r(pos,price)
-        pos["max_r"]=max(float(pos.get("max_r",0.0)),cur_r)
-        opened=datetime.fromisoformat(pos["opened_at"])
-        age_h=(now_utc()-opened).total_seconds()/3600
-        tp_hit=lambda level: price>=level if side=="LONG" else price<=level
-        stop_hit=lambda level: price<=level if side=="LONG" else price>=level
-
-        print(
-            f"[POSITION] {pos['symbol']} {side} ENTRY={pos['entry']:.4f} NOW={price:.4f} "
-            f"R={cur_r:+.2f} MAX_R={pos['max_r']:+.2f} AGE={age_h:.1f}h "
-            f"STOP={pos['stop']:.4f} TP1={pos['tp1']:.4f} TP2={pos['tp2']:.4f} TP3={pos['tp3']:.4f}",
-            flush=True
-        )
-
-        closed=False
-        if stop_hit(pos["stop"]):
-            msgs.append(close_remaining_multi(state,pos,price,"STOP_END","🛑 仮想STOP")); closed=True
-        elif strong_reversal_against_position(pos,analyses):
-            msgs.append(close_remaining_multi(state,pos,price,"REVERSAL_END","🔄 仮想反転決済")); closed=True
-        elif age_h>=MAX_HOLD_HOURS:
-            msgs.append(close_remaining_multi(state,pos,price,"TIME_END","⏰ 仮想時間切れ決済")); closed=True
-        elif age_h>=REVIEW_HOURS and not pos.get("tp1_done",False) and cur_r<=REVIEW_CLOSE_R:
-            msgs.append(close_remaining_multi(state,pos,price,"REVIEW_END","🕗 仮想見直し決済")); closed=True
-        elif pos["max_r"]>=TRAIL_START_R and cur_r<=pos["max_r"]-TRAIL_GIVEBACK_R:
-            msgs.append(close_remaining_multi(state,pos,price,"TRAIL_END","📉 仮想トレーリング決済")); closed=True
-        else:
-            if not pos.get("tp1_done",False) and tp_hit(pos["tp1"]):
-                q=pos["qty_initial"]*TP1_PCT
-                gross,trading_cost,leverage_fee,total_cost,net=settle_piece(state,pos,price,q,"TP1")
-                pos["qty_remaining"]-=q; pos["tp1_done"]=True; pos["stop"]=pos["entry"]
-                msgs.append(
-                    f"✅ {pos['symbol']} TP1 30%利確\n"
-                    f"売買損益: {gross:+,.0f}円\n想定コスト: -{total_cost:,.0f}円\n"
-                    f"純利益: {net:+,.0f}円\n累計純利益: {pos['realized_pnl']:+,.0f}円\nSTOPを建値へ"
-                )
-
-            if not pos.get("tp2_done",False) and tp_hit(pos["tp2"]):
-                q=pos["qty_initial"]*TP2_PCT
-                gross,trading_cost,leverage_fee,total_cost,net=settle_piece(state,pos,price,q,"TP2")
-                pos["qty_remaining"]-=q; pos["tp2_done"]=True
-                risk=float(pos["initial_risk"])
-                pos["stop"]=pos["entry"]+risk if side=="LONG" else pos["entry"]-risk
-                msgs.append(
-                    f"✅ {pos['symbol']} TP2 40%利確\n"
-                    f"売買損益: {gross:+,.0f}円\n想定コスト: -{total_cost:,.0f}円\n"
-                    f"純利益: {net:+,.0f}円\n累計純利益: {pos['realized_pnl']:+,.0f}円\nSTOPを+1Rへ"
-                )
-
-            if tp_hit(pos["tp3"]):
-                msgs.append(close_remaining_multi(state,pos,price,"TP3_END","🏁 仮想TP3決済")); closed=True
-
-        if not closed:
-            survivors.append(pos)
-
-    state["positions"]=survivors
+    if tp(p['tp3']):
+        msgs.append(close_remaining(s,p,px,'TP3_END','ð çºæ¿FX ä»®æ³æçµå©ç¢º'));return msgs
     return msgs
 
-def log_signals(analyses):
-    exists=SIGNALS_FILE.exists()
-    with SIGNALS_FILE.open("a",newline="",encoding="utf-8") as f:
+def log_signals(a):
+    ex=SIGNALS_FILE.exists()
+    with SIGNALS_FILE.open('a',newline='',encoding='utf-8') as f:
         w=csv.writer(f)
-        if not exists: w.writerow(["time","symbol","side","long","short","confidence","price","regime","range_low","range_high","range_mid","range_pos"])
-        for a in analyses: w.writerow([now_utc().isoformat(),a.symbol,a.side,a.score_long,a.score_short,a.confidence,a.price,a.regime,a.range_low,a.range_high,a.range_mid,a.range_pos])
+        if not ex:w.writerow(['time','symbol','side','long','short','confidence','price','weekly_zone','daily_sr','corr','rr1','rr2','counter'])
+        for x in a:w.writerow([now_utc().isoformat(),x.symbol,x.side,x.long,x.short,x.confidence,x.price,x.weekly_zone,x.daily_sr,x.corr_note,x.rr1,x.rr2,' | '.join(x.counter)])
 
-def rank_text(analyses):
-    ranking=sorted(analyses,key=lambda a:a.confidence,reverse=True)
-    return "\n".join(
-        f"#{i+1} {a.symbol}: {a.side if a.side!='WAIT' else 'WAIT'} {a.confidence}"
-        for i,a in enumerate(ranking)
-    )
+def print_summary(a,failed):
+    by={x.symbol:x for x in a};print('========== MUSIGNY FX ANALYSIS ==========',flush=True)
+    for s in SYMBOLS:
+        x=by.get(s)
+        if not x:print(f'{s:>7} | DATA_SKIP',flush=True);continue
+        strong='STRONG' if x.side!='WAIT' and x.confidence>=STRONG_THRESHOLD else ''
+        print(f'{s:>7} | {x.side:<5} | L={x.long:>3} S={x.short:>3} CONF={x.confidence:>3} {strong} | {x.weekly_zone} | {x.daily_sr} | {x.corr_note}',flush=True)
+    print('=========================================',flush=True)
 
-def print_analysis_summary(analyses, failed_symbols=None):
-    """GitHub Actionsで文字化けしにくいASCII中心の分析一覧。"""
-    failed_symbols = failed_symbols or []
-    by_symbol = {a.symbol: a for a in analyses}
+def weekly_review():
+    if not TRADES_FILE.exists():return
+    try:
+        d=pd.read_csv(TRADES_FILE);d['time']=pd.to_datetime(d['time'],utc=True,errors='coerce');w=d[d['time']>=pd.Timestamp(now_utc()-timedelta(days=7))]
+        if w.empty:return
+        losses=w[w['pnl']<0];out={'generated_at':now_utc().isoformat(),'events':len(w),'loss_events':len(losses),'pnl_events':float(w['pnl'].sum()),'loss_symbols':losses['symbol'].value_counts().to_dict(),'loss_sides':losses['side'].value_counts().to_dict()};WEEKLY_REVIEW.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+    except Exception as e:print('[WEEKLY_REVIEW_WARN]',e,flush=True)
 
-    print("", flush=True)
-    print("========== MUSIGNY ANALYSIS ==========", flush=True)
-
-    for symbol in SYMBOLS:
-        a = by_symbol.get(symbol)
-
-        if a is None:
-            status = "DATA_SKIP" if symbol in failed_symbols else "NO_DATA"
-            print(f"{symbol:>3} | {status}", flush=True)
-            continue
-
-        strength = "STRONG" if a.confidence >= STRONG_THRESHOLD and a.side != "WAIT" else ""
-        print(
-            f"{symbol:>3} | {a.side:<5} | "
-            f"LONG={a.score_long:>3} SHORT={a.score_short:>3} "
-            f"CONF={a.confidence:>3} {strength} | REGIME={a.regime}",
-            flush=True
-        )
-
-    print("======================================", flush=True)
-    print("", flush=True)
-
-def choose_winner(analyses,state):
-    open_symbols={p["symbol"] for p in state.get("positions",[])}
-    pending_symbol=(state.get("pending") or {}).get("symbol")
-    valid=[
-        a for a in analyses
-        if a.side!="WAIT"
-        and a.confidence>=ENTRY_THRESHOLD
-        and a.symbol not in open_symbols
-        and a.symbol!=pending_symbol
-    ]
-    return sorted(valid,key=lambda a:a.confidence,reverse=True)[0] if valid else None
-
-def create_pending(state,a):
-    state["pending"]={"symbol":a.symbol,"side":a.side,"confidence":a.confidence,"entry_low":a.entry_low,"entry_high":a.entry_high,"stop":a.stop,"tp1":a.tp1,"tp2":a.tp2,"tp3":a.tp3,"created_at":now_utc().isoformat(),"candle_id":a.candle_id}
-
-def notify(t):
-    print(t, flush=True)
-    if NTFY_TOPIC:
-        requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=t.encode("utf-8"),
-            headers={
-                "Title": "Musigny 4-Crypto BOT v11",
-                "Content-Type": "text/plain; charset=utf-8",
-            },
-            timeout=15,
-        ).raise_for_status()
-
-def fmt_candidate(a,ranking,state):
-    strength = "強シグナル" if a.confidence >= STRONG_THRESHOLD else "候補"
-
-    range_text = ""
-    if (
-        a.range_low is not None
-        and a.range_high is not None
-        and a.range_pos is not None
-    ):
-        range_text = (
-            f"1Hレンジ: {a.range_low:,.4f} - {a.range_high:,.4f} "
-            f"/ 位置={a.range_pos:.2f}\n"
-        )
-
-    return (
-        f"===== ENTRY {strength} =====\n"
-        f"銘柄: {a.symbol}\n"
-        f"方向: {a.side}\n"
-        f"信頼度: {a.confidence}/100\n"
-        f"{ranking}\n"
-        f"現在値: {a.price:,.4f}\n"
-        f"相場環境: {a.regime}\n"
-        f"{range_text}"
-        f"待機エントリー帯: "
-        f"{min(a.entry_low,a.entry_high):,.4f} - "
-        f"{max(a.entry_low,a.entry_high):,.4f}\n"
-        f"STOP: {a.stop:,.4f}\n"
-        f"TP1: {a.tp1:,.4f}\n"
-        f"TP2: {a.tp2:,.4f}\n"
-        f"TP3: {a.tp3:,.4f}\n"
-        f"根拠: {' / '.join(a.reasons[:10])}\n"
-        f"候補はログのみ。約定時にntfy通知。\n"
-        f"=========================="
-    )
+def print_tf_times(sym,fs):
+    tm=tf_times(fs)
+    print(f"[TF] {sym} | 5m={tm['5min']} | 15m={tm['15min']} | 1H={tm['1hour']} | 4H={tm['4hour']} | 1D={tm['1day']} | 1W={tm['1week']}",flush=True)
 
 def main():
-    analyses=[]; failed_symbols=[]
-    for symbol in SYMBOLS:
+    tick={x['symbol']:x for x in api_get('/v1/ticker')};market=any(tick.get(s,{}).get('status')=='OPEN' for s in SYMBOLS)
+    allf={};failed=[]
+    for s in SYMBOLS:
         try:
-            frames={
-                "5min":drop_open_candle(fetch_intraday(symbol,"5min",3,extra_days=7,min_rows=80)),
-                "15min":drop_open_candle(fetch_intraday(symbol,"15min",5,extra_days=10,min_rows=80)),
-                "1hour":drop_open_candle(fetch_intraday(symbol,"1hour",20,extra_days=12,min_rows=120)),
-                "4hour":drop_open_candle(fetch_yearly(symbol,"4hour",2,extra_years=1)),
-                "1day":drop_open_candle(fetch_yearly(symbol,"1day",3,extra_years=1)),
-                "1week":drop_open_candle(fetch_yearly(symbol,"1week",4,extra_years=1))
-            }
-            required={"5min":55,"15min":55,"1hour":55,"4hour":55,"1day":55,"1week":50}
-            short=[f"{tf}:{len(frames[tf])}本" for tf,n in required.items() if len(frames[tf])<n]
-            if short: raise RuntimeError(f"{symbol} データ不足 "+", ".join(short))
-            analyses.append(analyze(symbol,frames))
-        except Exception as e:
-            failed_symbols.append(symbol)
-            print(f"[DATA-SKIP] {symbol}: skip this cycle ({e})",flush=True)
+            allf[s]={'5min':drop_open(fetch_intraday(s,'5min',3,8,80)),'15min':drop_open(fetch_intraday(s,'15min',5,10,80)),'1hour':drop_open(fetch_intraday(s,'1hour',20,12,120)),'4hour':drop_open(fetch_yearly(s,'4hour',3)),'1day':drop_open(fetch_yearly(s,'1day',3)),'1week':drop_open(fetch_yearly(s,'1week',3))}
+            print_tf_times(s,allf[s])
+        except Exception as e:failed.append(s);print('[DATA_SKIP]',s,e,flush=True)
+    corr=correlations(allf);a=[]
+    for s,fs in allf.items():
+        try:a.append(analyze(s,fs,corr_note(s,corr)))
+        except Exception as e:failed.append(s);print('[ANALYSIS_SKIP]',s,e,flush=True)
 
-    state=load_state()
-    tickers=fetch_live_tickers()
+    st=load_state()
+    for m in manage_position(st,tick,a):notify(m)
+    if not a:save_state(st);return
 
-    # 最大2ポジションをそれぞれ独立監視
-    for m in manage_positions(state,analyses,tickers):
-        notify("📊 "+m)
+    print_summary(a,failed);log_signals(a)
 
-    if not analyses:
-        print("[DATA-WAIT] No symbols available. Position monitoring only.",flush=True)
-        save_state(state); return
+    if not st.get('position'):
+        m=manage_pending(st,a,tick)
+        if m:notify(m)
 
-    if failed_symbols:
-        print("[DATA-INFO] skipped symbols: "+", ".join(failed_symbols),flush=True)
-
-    print_analysis_summary(analyses,failed_symbols)
-    log_signals(analyses)
-
-    # 待機注文があれば約定判定。1ポジション保有中でも2個目は約定可能。
-    if state.get("pending"):
-        msg=manage_pending(state,analyses,tickers)
-        if msg:
-            if msg.startswith("🎯 仮想約定"): notify(msg)
-            else: print(msg,flush=True)
-
-    # 空き枠があれば、保有中でない別銘柄から次候補を1つ作る
-    if len(state.get("positions",[]))<MAX_OPEN_POSITIONS and not state.get("pending"):
-        winner=choose_winner(analyses,state)
-        ranking=rank_text(analyses)
-        if winner:
-            key=hashlib.sha1(f"{winner.symbol}:{winner.candle_id}:{winner.side}".encode()).hexdigest()[:16]
-            if state.get("last_notified")!=key:
-                ok,why=can_open(state)
-                if ok:
-                    create_pending(state,winner)
-                    print(fmt_candidate(winner,ranking,state),flush=True)
-                    state["last_notified"]=key
-                else:
-                    print("新規停止:",why,flush=True)
+    if market and not st.get('position') and not st.get('pending'):
+        valid=sorted([x for x in a if x.side!='WAIT' and x.confidence>=ENTRY_THRESHOLD],key=lambda x:x.confidence,reverse=True)
+        if valid:
+            c=valid[0];eb,er=event_block(c.symbol);nb,nr=news_block(c.symbol);ok,why=can_open(st)
+            print(f'[CANDIDATE] {c.symbol} {c.side} CONF={c.confidence} RR1={c.rr1:.2f} COUNTER={" | ".join(c.counter[:5]) or "NONE"}',flush=True)
+            if eb:print('[BLOCK]',er,flush=True)
+            elif nb:print('[BLOCK]',nr,flush=True)
+            elif not ok:print('[BLOCK]',why,flush=True)
             else:
-                print(ranking,flush=True)
-        else:
-            print("[TRADE] No additional entry candidate this cycle",flush=True)
-            print(ranking,flush=True)
+                key=hashlib.sha1(f'{c.symbol}:{c.side}:{c.candle_id}'.encode()).hexdigest()[:16]
+                if st.get('last_key')!=key:create_pending(st,c);st['last_key']=key;print(f'[PENDING_CREATED] {c.symbol} {c.side}',flush=True)
 
-    positions=state.get("positions",[])
-    if positions:
-        print(
-            f"[STATE] OPEN_POSITIONS: {len(positions)}/{MAX_OPEN_POSITIONS} | "+
-            ", ".join(p["symbol"] for p in positions),
-            flush=True
-        )
-    else:
-        print(f"[STATE] OPEN_POSITIONS: 0/{MAX_OPEN_POSITIONS}",flush=True)
+    if st.get('position'):print('[STATE] OPEN_POSITION:',st['position']['symbol'],flush=True)
+    elif st.get('pending'):print('[STATE] PENDING:',st['pending']['symbol'],flush=True)
 
-    if state.get("pending"):
-        print("[STATE] PENDING:",state["pending"]["symbol"],flush=True)
+    weekly_review();save_state(st)
 
-    save_state(state)
-
-if __name__=="__main__": main()
+if __name__=='__main__':main()
