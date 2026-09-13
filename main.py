@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Musigny 4-Crypto BOT v11.2 - multi-timeframe RCI + JP notifications + net profit + paper leverage 10x
+# Musigny 4-Crypto BOT v11.4 - swing corridor in any market + multi-timeframe RCI + JP notifications + net profit + paper leverage 10x
 from __future__ import annotations
 import os, json, math, csv, hashlib, time, sys
 from dataclasses import dataclass
@@ -70,6 +70,13 @@ RANGE_MIN_TOUCHES = int(os.getenv("RANGE_MIN_TOUCHES", "2"))
 RANGE_MIN_WIDTH_PCT = float(os.getenv("RANGE_MIN_WIDTH_PCT", "0.006"))
 RANGE_MAX_WIDTH_PCT = float(os.getenv("RANGE_MAX_WIDTH_PCT", "0.08"))
 
+# ===== v11.3 スイング区間取り =====
+SWING_MAX_DISTANCE_PCT = float(os.getenv("SWING_MAX_DISTANCE_PCT", "0.10"))
+SWING_MIN_WIDTH_PCT = float(os.getenv("SWING_MIN_WIDTH_PCT", "0.008"))
+SHORT_ENTRY_MIN_POS = float(os.getenv("SHORT_ENTRY_MIN_POS", "0.60"))
+LONG_ENTRY_MAX_POS = float(os.getenv("LONG_ENTRY_MAX_POS", "0.40"))
+SWING_STOP_PAD_PCT = float(os.getenv("SWING_STOP_PAD_PCT", "0.10"))
+
 @dataclass
 class Analysis:
     symbol: str; side: str; score_long: int; score_short: int; confidence: int
@@ -81,6 +88,9 @@ class Analysis:
     range_high: float|None = None
     range_mid: float|None = None
     range_pos: float|None = None
+    swing_low: float|None = None
+    swing_high: float|None = None
+    swing_pos: float|None = None
 
 def now_utc(): return datetime.now(timezone.utc)
 def now_jst(): return now_utc() + timedelta(hours=9)
@@ -344,55 +354,75 @@ def rci_snapshot(ind):
     }
 
 def multi_tf_rci_gate(W,D,H4,H1,M15,M5):
-    snaps={
-        "W":rci_snapshot(W),"D":rci_snapshot(D),
-        "H4":rci_snapshot(H4),"H1":rci_snapshot(H1),
-        "M15":rci_snapshot(M15),"M5":rci_snapshot(M5),
-    }
-
-    def dir_score(keys,side):
-        s=0
+    snaps={"W":rci_snapshot(W),"D":rci_snapshot(D),"H4":rci_snapshot(H4),"H1":rci_snapshot(H1),"M15":rci_snapshot(M15),"M5":rci_snapshot(M5)}
+    def score(keys,side):
+        v=0
         for k in keys:
             z=snaps[k]
             if side=="LONG":
-                s += 1 if z["d25"]>0 else -1 if z["d25"]<0 else 0
-                s += 1 if z["d47"]>0 else -1 if z["d47"]<0 else 0
+                v += 1 if z["d25"]>0 else -1 if z["d25"]<0 else 0
+                v += 1 if z["d47"]>0 else -1 if z["d47"]<0 else 0
             else:
-                s += 1 if z["d25"]<0 else -1 if z["d25"]>0 else 0
-                s += 1 if z["d47"]<0 else -1 if z["d47"]>0 else 0
-        return s
-
-    lm=dir_score(["W","D"],"LONG")
-    sm=dir_score(["W","D"],"SHORT")
-    lmid=dir_score(["H4","H1"],"LONG")
-    smid=dir_score(["H4","H1"],"SHORT")
-
+                v += 1 if z["d25"]<0 else -1 if z["d25"]>0 else 0
+                v += 1 if z["d47"]<0 else -1 if z["d47"]>0 else 0
+        return v
+    lm=score(["W","D"],"LONG"); sm=score(["W","D"],"SHORT")
+    lmid=score(["H4","H1"],"LONG"); smid=score(["H4","H1"],"SHORT")
     a15=snaps["M15"]; a5=snaps["M5"]
-
-    long_setup=((a15["d8"]>0 and a15["d25"]>=0) or
-                (a15["r8"] is not None and a15["r8"]<=-75 and a15["d8"]>0))
-    short_setup=((a15["d8"]<0 and a15["d25"]<=0) or
-                 (a15["r8"] is not None and a15["r8"]>=75 and a15["d8"]<0))
-
-    long_trigger=a5["d8"]>0
-    short_trigger=a5["d8"]<0
-
-    allow_long=(lmid>=1 and lm>=-1 and long_setup and long_trigger)
-    allow_short=(smid>=1 and sm>=-1 and short_setup and short_trigger)
-
-    lr=[
-        f"週足・日足RCI方向点={lm}",
-        f"4H・1H RCI方向点={lmid}",
-        f"15分RCI={'OK' if long_setup else 'NG'}",
-        f"5分RCI上向き={'YES' if long_trigger else 'NO'}",
-    ]
-    sr=[
-        f"週足・日足RCI方向点={sm}",
-        f"4H・1H RCI方向点={smid}",
-        f"15分RCI={'OK' if short_setup else 'NG'}",
-        f"5分RCI下向き={'YES' if short_trigger else 'NO'}",
-    ]
+    long15=(a15["d8"]>0) or (a15["r8"] is not None and a15["r8"]<=-65 and a15["d8"]>=0)
+    short15=(a15["d8"]<0) or (a15["r8"] is not None and a15["r8"]>=65 and a15["d8"]<=0)
+    long5=a5["d8"]>0; short5=a5["d8"]<0
+    allow_long=(lm>=-2 and lmid>=-1 and (long15 or long5))
+    allow_short=(sm>=-2 and smid>=-1 and (short15 or short5))
+    lr=[f"週日RCI方向点={lm}",f"4H1H_RCI方向点={lmid}",f"15分RCI上向き={'YES' if long15 else 'NO'}",f"5分RCI先行上向き={'YES' if long5 else 'NO'}"]
+    sr=[f"週日RCI方向点={sm}",f"4H1H_RCI方向点={smid}",f"15分RCI下向き={'YES' if short15 else 'NO'}",f"5分RCI先行下向き={'YES' if short5 else 'NO'}"]
     return allow_long,allow_short,lr,sr
+
+def _cluster_levels(values,tol):
+    groups=[]
+    for value,weight in sorted(values,key=lambda x:x[0]):
+        for g in groups:
+            if abs(value-g["level"])<=tol:
+                g["vals"].append((value,weight))
+                total=sum(w for _,w in g["vals"])
+                g["level"]=sum(v*w for v,w in g["vals"])/total
+                g["score"]=total
+                break
+        else:
+            groups.append({"level":float(value),"vals":[(value,weight)],"score":float(weight)})
+    return groups
+
+def detect_swing_corridor(H4,H1,price):
+    h4=H4.iloc[-90:].reset_index(drop=True)
+    h1=H1.iloc[-180:].reset_index(drop=True)
+    h4h,h4l=pivot_levels(h4,left=2,right=2)
+    h1h,h1l=pivot_levels(h1,left=3,right=3)
+    highs=[(float(v),2.0) for _,v in h4h[-12:]]+[(float(v),1.0) for _,v in h1h[-18:]]
+    lows=[(float(v),2.0) for _,v in h4l[-12:]]+[(float(v),1.0) for _,v in h1l[-18:]]
+    if not highs or not lows:return None
+    atr=float(H1["atr"].iloc[-1])
+    if not math.isfinite(atr) or atr<=0:atr=price*.01
+    tol=max(atr*.45,price*.0025)
+    rh=_cluster_levels(highs,tol); rl=_cluster_levels(lows,tol)
+    maxdist=price*SWING_MAX_DISTANCE_PCT
+    res=[g for g in rh if g["level"]>price and g["level"]-price<=maxdist] or [g for g in rh if g["level"]>price]
+    sup=[g for g in rl if g["level"]<price and price-g["level"]<=maxdist] or [g for g in rl if g["level"]<price]
+    if not res or not sup:return None
+    top=sorted(res,key=lambda g:(-g["score"],g["level"]-price))[0]["level"]
+    bottom=sorted(sup,key=lambda g:(-g["score"],price-g["level"]))[0]["level"]
+    if top<=bottom:return None
+    width=top-bottom; mid=(top+bottom)/2
+    if width/max(mid,1e-12)<SWING_MIN_WIDTH_PCT:return None
+    return {"low":bottom,"high":top,"mid":mid,"width":width,"pos":(price-bottom)/width,"atr":atr}
+
+def swing_targets(side,sw):
+    low,high,w=sw["low"],sw["high"],sw["width"]
+    if side=="SHORT":
+        vals=sorted([low+w*.45,low+w*.20,low+w*.05],reverse=True)
+    else:
+        vals=sorted([low+w*.55,low+w*.80,high-w*.05])
+    return vals[0],vals[1],vals[2]
+
 
 def analyze(symbol,frames):
     W,D,H4,H1,M15,M5=[indicators(frames[k]) for k in ("1week","1day","4hour","1hour","15min","5min")]
@@ -403,6 +433,9 @@ def analyze(symbol,frames):
     rg=detect_1h_range(H1)
     regime=market_regime(H4,H1,rg)
     rpos=range_position(p,rg)
+    sw=detect_swing_corridor(H4,H1,p)
+    spos=sw["pos"] if sw else None
+    # レンジ判定の有無に関係なく、4H/1Hのスイング上限・下限を使う。
 
     L=S=0
     rl=[]
@@ -499,8 +532,19 @@ def analyze(symbol,frames):
 
     if pd.notna(c15.span_a) and pd.notna(c15.span_b):
         hi=max(c15.span_a,c15.span_b); lo=min(c15.span_a,c15.span_b)
-        if p>hi: L+=4
-        elif p<lo: S+=4
+        if p>hi:
+            L+=3; rl.append("15分 雲の上")
+        elif p<lo:
+            S+=3; rs.append("15分 雲の下")
+        else:
+            rl.append("15分 雲内"); rs.append("15分 雲内")
+
+    atr1=float(H1.atr.iloc[-1]) if pd.notna(H1.atr.iloc[-1]) else p*.01
+    if abs(p-float(c15.ema12))/max(atr1,1e-12)<=0.35:
+        if regime=="DOWN":
+            S+=5; rs.append("15分EMA付近の戻り")
+        elif regime=="UP":
+            L+=5; rl.append("15分EMA付近の押し")
 
     if pd.notna(c15.vol_ma20) and c15.volume>c15.vol_ma20*1.25:
         if c15.close>c15.open: L+=3
@@ -511,10 +555,21 @@ def analyze(symbol,frames):
     rl += rci_long_reasons
     rs += rci_short_reasons
 
-    if regime=="UP":
-        allow_short=False
-    elif regime=="DOWN":
-        allow_long=False
+    # v11.4:
+    # REGIME(UP/DOWN/RANGE/MIXED)は参考表示だけ。
+    # 売買可否は「スイング区間の位置 + 各時間足RCI」で決める。
+    if sw is not None:
+        if spos < SHORT_ENTRY_MIN_POS:
+            allow_short=False
+            rs.append(f"SHORT位置待ち 区間位置={spos:.2f}")
+        else:
+            S+=12; rs.append(f"上側戻り売りゾーン 区間位置={spos:.2f}")
+
+        if spos > LONG_ENTRY_MAX_POS:
+            allow_long=False
+            rl.append(f"LONG位置待ち 区間位置={spos:.2f}")
+        else:
+            L+=12; rl.append(f"下側押し目買いゾーン 区間位置={spos:.2f}")
 
     side="WAIT"
     confidence=max(L,S)
@@ -536,44 +591,40 @@ def analyze(symbol,frames):
             rg["low"] if rg else None,
             rg["high"] if rg else None,
             rg["mid"] if rg else None,
-            rpos
+            rpos,
+            sw["low"] if sw else None,
+            sw["high"] if sw else None,
+            spos
         )
 
     atr=float(H1.atr.iloc[-1])
     atr=atr if math.isfinite(atr) and atr>0 else p*.012
 
-    if rg is not None and regime=="RANGE":
-        pad=max(rg["width"]*0.08,atr*0.30)
-
-        if side=="LONG":
-            entry_high=min(p,rg["low"]+rg["width"]*0.22)
-            entry_low=max(rg["low"]-pad*0.10,entry_high-atr*0.20)
-            mid=(entry_low+entry_high)/2
-            stop=rg["low"]-pad
-            tp1,tp2,tp3=range_targets("LONG",mid,stop,rg)
-            invalid=f"1Hレンジ下限 {rg['low']:,.4f} 明確割れ"
+    if sw is not None:
+        pad=max(sw["width"]*SWING_STOP_PAD_PCT,atr*.40)
+        if side=="SHORT":
+            entry_low=sw["high"]-sw["width"]*.22
+            entry_high=sw["high"]-sw["width"]*.05
+            stop=sw["high"]+pad
+            tp1,tp2,tp3=swing_targets("SHORT",sw)
+            invalid=f"上側レジスタンス {sw['high']:,.4f} 明確上抜け"
         else:
-            entry_low=max(p,rg["high"]-rg["width"]*0.22)
-            entry_high=min(rg["high"]+pad*0.10,entry_low+atr*0.20)
-            mid=(entry_low+entry_high)/2
-            stop=rg["high"]+pad
-            tp1,tp2,tp3=range_targets("SHORT",mid,stop,rg)
-            invalid=f"1Hレンジ上限 {rg['high']:,.4f} 明確上抜け"
+            entry_low=sw["low"]+sw["width"]*.05
+            entry_high=sw["low"]+sw["width"]*.22
+            stop=sw["low"]-pad
+            tp1,tp2,tp3=swing_targets("LONG",sw)
+            invalid=f"下側サポート {sw['low']:,.4f} 明確割れ"
     else:
         if side=="LONG":
-            entry_high=p-.08*atr
-            entry_low=p-.32*atr
+            entry_high=p-.08*atr; entry_low=p-.32*atr
             stop=min(entry_low-.75*atr,rlow-.15*atr)
-            mid=(entry_low+entry_high)/2
-            risk=max(mid-stop,p*.003)
+            mid=(entry_low+entry_high)/2; risk=max(mid-stop,p*.003)
             tp1,tp2,tp3=mid+TP1_R*risk,mid+TP2_R*risk,mid+TP3_R*risk
             invalid=f"1H押し安値 {rlow:,.4f} 割れ"
         else:
-            entry_low=p+.08*atr
-            entry_high=p+.32*atr
+            entry_low=p+.08*atr; entry_high=p+.32*atr
             stop=max(entry_high+.75*atr,rh+.15*atr)
-            mid=(entry_low+entry_high)/2
-            risk=max(stop-mid,p*.003)
+            mid=(entry_low+entry_high)/2; risk=max(stop-mid,p*.003)
             tp1,tp2,tp3=mid-TP1_R*risk,mid-TP2_R*risk,mid-TP3_R*risk
             invalid=f"1H戻り高値 {rh:,.4f} 上抜け"
 
@@ -705,13 +756,23 @@ def make_position(state,p,tickers):
         "regime":getattr(p,"regime","UNKNOWN"),
         "range_low":getattr(p,"range_low",None),
         "range_high":getattr(p,"range_high",None),
-        "range_mid":getattr(p,"range_mid",None)
+        "range_mid":getattr(p,"range_mid",None),
+        "swing_low":getattr(p,"swing_low",None),
+        "swing_high":getattr(p,"swing_high",None),
+        "swing_pos":getattr(p,"swing_pos",None)
     }
     state.setdefault("positions",[]).append(new_position)
 
     range_text=""
     if getattr(p,"range_low",None) is not None and getattr(p,"range_high",None) is not None:
-        range_text=f"1時間足レンジ: {p.range_low:,.4f} ～ {p.range_high:,.4f}\n"
+        range_text=f"参考1Hレンジ: {p.range_low:,.4f} ～ {p.range_high:,.4f}\n"
+
+    swing_text=""
+    if getattr(p,"swing_low",None) is not None and getattr(p,"swing_high",None) is not None:
+        swing_text=(
+            f"狙うスイング区間: {p.swing_low:,.4f} ～ {p.swing_high:,.4f}\n"
+            f"現在の区間位置: {p.swing_pos:.2f}\n"
+        )
 
     return (
         f"🎯 仮想新規約定 {p['symbol']}\n"
@@ -721,6 +782,7 @@ def make_position(state,p,tickers):
         f"数量: {qty:.8f}\n"
         f"相場環境: {jp_regime(getattr(p,'regime','UNKNOWN'))}\n"
         f"{range_text}"
+        f"{swing_text}"
         f"損切り: {p['stop']:,.4f}\n"
         f"利確①: {p['tp1']:,.4f}\n"
         f"利確②: {p['tp2']:,.4f}\n"
