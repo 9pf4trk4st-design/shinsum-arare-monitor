@@ -1,20 +1,25 @@
-name: Musigny 4Crypto Daytrade Bot v4
+name: Musigny Crypto BOT v11.4
 
 on:
   workflow_dispatch:
 
+  schedule:
+    # 毎時0分に起動
+    - cron: "0 * * * *"
+
 permissions:
   contents: write
-  actions: write
 
 concurrency:
-  group: musigny-4crypto-daytrade-v4
+  group: musigny-crypto-bot-v11-4
   cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+
+    # 1時間以内を目安に終了
+    timeout-minutes: 65
 
     steps:
       - name: Checkout repository
@@ -30,62 +35,95 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy
+          pip install -r requirements.txt
 
-      - name: Run Musigny bot every 5 minutes
+      - name: Run Musigny Crypto BOT every 5 minutes
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          PYTHONUNBUFFERED: "1"
+
+          # 仮想残高
+          PAPER_BALANCE: "100000"
+
+          # 1回の許容リスク 0.75%
+          RISK_PCT: "0.0075"
+
+          # ペーパー上の最大レバレッジ 10倍
+          MAX_LEVERAGE: "10"
+
+          # 最大同時保有数
+          MAX_OPEN_POSITIONS: "2"
+
+          # エントリー基準
+          ENTRY_THRESHOLD: "62"
+          STRONG_THRESHOLD: "72"
+          OPPOSITE_GAP: "10"
+
+          # 損失制限
+          MAX_DAILY_LOSS_PCT: "0.03"
+          MAX_CONSECUTIVE_LOSSES: "3"
+
+          # 待機注文
+          PENDING_EXPIRE_HOURS: "1.5"
+
+          # スイング区間判定
+          SWING_MAX_DISTANCE_PCT: "0.10"
+          SWING_MIN_WIDTH_PCT: "0.008"
+
+          # SHORTは区間上側40%から
+          SHORT_ENTRY_MIN_POS: "0.60"
+
+          # LONGは区間下側40%から
+          LONG_ENTRY_MAX_POS: "0.40"
+
+          # STOP余白
+          SWING_STOP_PAD_PCT: "0.10"
+
         run: |
+          set -u
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          for i in $(seq 1 12); do
+          for i in $(seq 1 10)
+          do
             echo "========================================"
-            echo "Musigny check $i / 12"
+            echo "Musigny Crypto check $i / 10"
             date -u
             echo "========================================"
 
-            python main.py
+            # BOT実行
+            python main.py || echo "[WARN] main.py returned an error, continuing next cycle"
 
+            # stateを保存
             git add state/ 2>/dev/null || true
 
-            if ! git diff --cached --quiet; then
-              git commit -m "Update Musigny virtual trade state"
+            if ! git diff --cached --quiet
+            then
+              git commit -m "Update Musigny crypto virtual trade state" || true
+
+              # リモート側に変更があった場合も対応
               git pull --rebase origin main || true
-              git push origin HEAD:main || true
+
+              # push失敗時は少し待って再試行
+              git push origin main || {
+                echo "[WARN] push failed. retrying..."
+                sleep 5
+                git pull --rebase origin main || true
+                git push origin main || true
+              }
             else
               echo "No state changes"
             fi
 
-            if [ "$i" -lt 12 ]; then
+            # 最終回はsleepしない
+            if [ "$i" -lt 10 ]
+            then
               echo "Next check in 5 minutes..."
               sleep 300
             fi
           done
 
-      - name: Delete old workflow runs
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Final status
+        if: always()
         run: |
-          gh run list \
-            --workflow musigny_4crypto_v4.yml \
-            --limit 100 \
-            --json databaseId \
-            --jq '.[10:][].databaseId' > old_runs.txt
-
-          while IFS= read -r RUN_ID; do
-            if [ -n "$RUN_ID" ]; then
-              echo "Deleting old workflow run: $RUN_ID"
-              gh run delete "$RUN_ID" || true
-            fi
-          done < old_runs.txt
-
-      - name: Start next monitoring cycle
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Starting next Musigny monitoring cycle"
-          gh workflow run musigny_4crypto_v4.yml --ref main
+          echo "Musigny Crypto BOT monitoring cycle finished."
