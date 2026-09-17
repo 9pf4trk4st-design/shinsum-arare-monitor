@@ -214,6 +214,56 @@ def candidate_links(page):
 # スリットアラート解析
 # ============================================================
 
+def extract_theory_section(text):
+    """
+    旧監視ツールで実際に使えていた方式。
+    ページ内の全「シンsum理論」候補を調べ、
+    4桁登録番号が最も多く並ぶ箇所を本物の理論表として採用する。
+    「←シンsum理論に戻る」を誤認しない。
+    """
+    starts = [
+        m.start()
+        for m in re.finditer(r"シン\s*sum理論", text)
+    ]
+
+    best_section = ""
+    best_score = -1
+
+    for start in starts:
+        end = text.find("シンsumチェッカー", start)
+
+        section = text[
+            start:(
+                end
+                if end > start
+                else min(len(text), start + 12000)
+            )
+        ]
+
+        regs = re.findall(
+            r"(?<!\d)(\d{4})(?!\d)",
+            section
+        )
+        regs_unique = list(dict.fromkeys(regs))
+
+        diff_like = re.findall(
+            r"(?<![\d.])([+-]\d+(?:\.\d+)?)(?!\s*%)",
+            section
+        )
+
+        score = (
+            len(regs_unique) * 100
+            + len(diff_like)
+        )
+
+        if score > best_score:
+            best_score = score
+            best_section = section
+
+    return best_section
+
+
+
 def parse_alert_cell(cell_text):
     """
     スリットアラート欄の1セルだけを解析。
@@ -292,71 +342,57 @@ def extract_boat_number(cell_texts, row_text):
 
 def parse_slit_alerts(page):
     """
-    V44:
-    DOMの列位置・Y座標は使わず、表示テキストだけで判定する。
+    V45:
+    旧監視ツールで実績のある extract_theory_section() を使う。
 
-    1) 最後の「シンsum理論」から注釈までを切り出す
-    2) 4桁の登録番号を上から6艇ぶん取得
-    3) 各登録番号〜次の登録番号までを1艇のブロックとして解析
-    4) ブロック内で
-         +0.1
-         1着 +9%
-       のように連続表示される箇所だけをスリットアラートと判定
+    1. 本物のシンsum理論表を特定
+    2. 4桁登録番号を上から6個取得
+    3. 登録番号〜次の登録番号までを、その艇だけのブロックにする
+    4. ブロック内の
+         +0.1  1着 +9%
+         SUPER +0.1  1着 +15%
+       を直接検出
 
-    これなら「平均との差」や通常の1着補正とは混同しない。
+    艇番は登録番号の出現順 = 1〜6号艇なので、
+    前のような1艇ズレを起こさない。
     """
     try:
-        body = page.locator("body").inner_text(timeout=10000)
+        body = page.locator(
+            "body"
+        ).inner_text(timeout=10000)
     except Exception as e:
-        print(f"本文取得失敗: {repr(e)}", flush=True)
-        return []
-
-    # --------------------------------------------------------
-    # シンsum理論セクションだけに限定
-    # --------------------------------------------------------
-    pos = body.rfind("シンsum理論")
-    if pos < 0:
-        print("シンsum理論セクションなし", flush=True)
-        return []
-
-    section = body[pos:]
-
-    note_pos = section.find("※スリットアラート")
-    if note_pos >= 0:
-        section = section[:note_pos]
-
-    # 行単位で整形
-    lines = [
-        " ".join(line.split())
-        for line in section.splitlines()
-        if line.strip()
-    ]
-
-    # --------------------------------------------------------
-    # 登録番号の位置を取得
-    # 同じ番号の重複は最初だけ
-    # --------------------------------------------------------
-    reg_positions = []
-    seen = set()
-
-    for idx, line in enumerate(lines):
-        if re.fullmatch(r"\d{4}", line) and line not in seen:
-            reg_positions.append((idx, line))
-            seen.add(line)
-            if len(reg_positions) >= 6:
-                break
-
-    if len(reg_positions) < 6:
         print(
-            f"理論表登録番号不足: {len(reg_positions)}件 / "
-            f"{[r for _, r in reg_positions]}",
+            f"本文取得失敗: {repr(e)}",
             flush=True,
         )
         return []
 
+    section = extract_theory_section(body)
+
+    if not section:
+        return []
+
+    # 登録番号を出現順に6艇分取得
+    regs = re.findall(
+        r"(?<!\d)(\d{4})(?!\d)",
+        section
+    )
+    regs = list(dict.fromkeys(regs))
+
+    if len(regs) < 6:
+        print(
+            f"理論表登録番号不足: "
+            f"{len(regs)}件 / {regs}",
+            flush=True,
+        )
+        return []
+
+    regs = regs[:6]
+
     mapping = {
         reg: boat
-        for boat, (_, reg) in enumerate(reg_positions, start=1)
+        for boat, reg
+        in enumerate(regs, start=1)
     }
 
     print(
@@ -366,81 +402,88 @@ def parse_slit_alerts(page):
 
     alerts = []
 
-    # --------------------------------------------------------
-    # 1艇ずつブロック解析
-    # --------------------------------------------------------
-    for boat, (start_idx, reg) in enumerate(reg_positions, start=1):
+    for boat, reg in enumerate(
+        regs,
+        start=1,
+    ):
+        mreg = re.search(
+            rf"(?<!\d){re.escape(reg)}(?!\d)",
+            section
+        )
+
+        if not mreg:
+            continue
+
+        next_pos = len(section)
+
         if boat < 6:
-            end_idx = reg_positions[boat][0]
-        else:
-            end_idx = len(lines)
+            next_reg = regs[boat]
 
-        block = lines[start_idx:end_idx]
+            mn = re.search(
+                rf"(?<!\d){re.escape(next_reg)}(?!\d)",
+                section[mreg.end():]
+            )
 
-        # 例:
-        #   +0.1
-        #   1着 +9%
-        # または
-        #   SUPER
-        #   +0.1
-        #   1着 +15%
-        for i, line in enumerate(block):
-            is_super = False
-            slit = None
-            boost = None
-
-            # SUPERが独立行の場合
-            if line.upper() == "SUPER":
-                if i + 2 < len(block):
-                    m_slit = re.fullmatch(r"\+0\.\d+", block[i + 1])
-                    m_boost = re.fullmatch(
-                        r"1着\s*([+-]\d+(?:\.\d+)?)%",
-                        block[i + 2],
-                    )
-                    if m_slit and m_boost:
-                        is_super = True
-                        slit = block[i + 1]
-                        boost = float(m_boost.group(1))
-
-            # 「+0.1」「1着 +9%」の2行構成
-            if slit is None:
-                m_slit = re.fullmatch(r"\+0\.\d+", line)
-                if m_slit and i + 1 < len(block):
-                    m_boost = re.fullmatch(
-                        r"1着\s*([+-]\d+(?:\.\d+)?)%",
-                        block[i + 1],
-                    )
-                    if m_boost:
-                        slit = line
-                        boost = float(m_boost.group(1))
-                        if i > 0 and block[i - 1].upper() == "SUPER":
-                            is_super = True
-
-            # 1セルが同一行になっている場合
-            if slit is None:
-                m_same = re.fullmatch(
-                    r"(?:⚡\s*)?(SUPER\s*)?(\+0\.\d+)\s*1着\s*([+-]\d+(?:\.\d+)?)%",
-                    line,
-                    re.I,
+            if mn:
+                next_pos = (
+                    mreg.end()
+                    + mn.start()
                 )
-                if m_same:
-                    is_super = bool(m_same.group(1))
-                    slit = m_same.group(2)
-                    boost = float(m_same.group(3))
 
-            if slit is not None and boost is not None:
-                alerts.append({
-                    "boat": boat,
-                    "super": is_super,
-                    "slit": slit,
-                    "boost": boost,
-                })
-                print(
-                    f"スリット検出: {boat}号艇 / 登録{reg} / "
-                    f"{('SUPER / ' if is_super else '')}{slit} / 1着{boost:+g}%",
-                    flush=True,
-                )
-                break
+        block = section[
+            mreg.end():next_pos
+        ]
+
+        # 改行や空白をまとめる
+        compact = " ".join(
+            block.split()
+        )
+
+        # SUPERがある場合もない場合も対応。
+        # 「平均との差 +0.xx」は直後に1着+○%が来ないので拾わない。
+        m = re.search(
+            r"(?:(?:⚡\s*)?SUPER\s*)?"
+            r"(\+0\.\d+)\s*"
+            r"1着\s*"
+            r"(\+\d+(?:\.\d+)?)\s*%",
+            compact,
+            re.I,
+        )
+
+        if not m:
+            continue
+
+        slit = m.group(1)
+        boost = float(
+            m.group(2)
+        )
+
+        # アラート直前付近にSUPERがあるか確認
+        alert_start = m.start()
+        before = compact[
+            max(0, alert_start - 30):
+            alert_start + 5
+        ]
+
+        is_super = (
+            "SUPER" in before.upper()
+            or "SUPER" in m.group(0).upper()
+        )
+
+        alerts.append({
+            "boat": boat,
+            "super": is_super,
+            "slit": slit,
+            "boost": boost,
+        })
+
+        print(
+            f"スリット検出: "
+            f"{boat}号艇 / 登録{reg} / "
+            f"{('SUPER / ' if is_super else '')}"
+            f"{slit} / 1着{boost:+g}%",
+            flush=True,
+        )
 
     return alerts
 
@@ -648,7 +691,7 @@ def main():
 
     print(
         f"[{now():%Y-%m-%d %H:%M:%S}] "
-        f"スリットアラート専用監視開始 [V44 text-block-parser]",
+        f"スリットアラート専用監視開始 [V45 old-theory-section-parser]",
         flush=True,
     )
 
