@@ -292,105 +292,157 @@ def extract_boat_number(cell_texts, row_text):
 
 def parse_slit_alerts(page):
     """
-    「スリットアラート」列をヘッダから特定し、
-    その列だけを解析する。
+    V39:
+    1) tableの「スリットアラート」列を読む
+    2) tableとして取れない場合は、実際に画面に表示されている
+       「シンsum理論」の文字列を艇ごとのブロックに分けて読む
 
-    理論欄・平均との差・チェッカー等は一切使わない。
+    今回の実ページ例:
+      3
+      3385
+      -0.08        ← 平均との差
+      +0.1         ← スリットアラート
+      1着 +7%      ← 上昇幅
+      -1% ...      ← 通常の理論補正
     """
-
     alerts = []
 
-    tables = page.locator("table")
+    # --------------------------------------------------------
+    # 1. 通常のtable構造
+    # --------------------------------------------------------
+    try:
+        tables = page.locator("table")
 
-    for ti in range(tables.count()):
-        table = tables.nth(ti)
-        rows = table.locator("tr")
+        for ti in range(tables.count()):
+            table = tables.nth(ti)
+            rows = table.locator("tr")
+            alert_col = None
 
-        alert_col = None
+            for ri in range(rows.count()):
+                cells = rows.nth(ri).locator("th, td")
+                texts = []
+                for ci in range(cells.count()):
+                    try:
+                        texts.append(" ".join(cells.nth(ci).inner_text(timeout=500).split()))
+                    except Exception:
+                        texts.append("")
 
-        # まずヘッダから「スリットアラート」の列番号を取得
-        for ri in range(rows.count()):
-            row = rows.nth(ri)
-            cells = row.locator("th, td")
-
-            texts = []
-
-            for ci in range(cells.count()):
-                try:
-                    texts.append(
-                        " ".join(
-                            cells.nth(ci).inner_text(timeout=500).split()
-                        )
-                    )
-                except Exception:
-                    texts.append("")
-
-            for ci, txt in enumerate(texts):
-                if "スリットアラート" in txt:
-                    alert_col = ci
+                for ci, txt in enumerate(texts):
+                    if "スリットアラート" in txt:
+                        alert_col = ci
+                        break
+                if alert_col is not None:
                     break
 
-            if alert_col is not None:
-                break
-
-        if alert_col is None:
-            continue
-
-        # 同じ表の各艇行を確認
-        for ri in range(rows.count()):
-            row = rows.nth(ri)
-            cells = row.locator("th, td")
-
-            if cells.count() <= alert_col:
+            if alert_col is None:
                 continue
 
-            cell_texts = []
+            for ri in range(rows.count()):
+                row = rows.nth(ri)
+                cells = row.locator("th, td")
+                if cells.count() <= alert_col:
+                    continue
 
-            for ci in range(cells.count()):
+                cell_texts = []
+                for ci in range(cells.count()):
+                    try:
+                        cell_texts.append(" ".join(cells.nth(ci).inner_text(timeout=500).split()))
+                    except Exception:
+                        cell_texts.append("")
+
                 try:
-                    cell_texts.append(
-                        " ".join(
-                            cells.nth(ci).inner_text(timeout=500).split()
-                        )
-                    )
+                    row_text = " ".join(row.inner_text(timeout=700).split())
                 except Exception:
-                    cell_texts.append("")
+                    row_text = " ".join(cell_texts)
 
-            try:
-                row_text = " ".join(
-                    row.inner_text(timeout=700).split()
+                boat = extract_boat_number(cell_texts, row_text)
+                if boat is None:
+                    continue
+
+                alert = parse_alert_cell(cell_texts[alert_col])
+                if alert:
+                    alert["boat"] = boat
+                    alerts.append(alert)
+
+    except Exception as e:
+        print(f"table方式解析失敗: {repr(e)}", flush=True)
+
+    # --------------------------------------------------------
+    # 2. 実表示テキスト方式（今回のサイト構造用）
+    # --------------------------------------------------------
+    if not alerts:
+        try:
+            body = page.locator("body").inner_text(timeout=10000)
+        except Exception:
+            body = ""
+
+        # 上部に「←シンsum理論に戻る」があるので、
+        # 「場平均」が存在する本物の理論表付近を優先して切り出す。
+        marker = body.rfind("シンsum理論")
+        section = body[marker:] if marker >= 0 else body
+
+        # 表の下の説明文より先だけで十分
+        note = section.find("※スリットアラート")
+        if note >= 0:
+            section = section[:note]
+
+        lines = [" ".join(x.split()) for x in section.splitlines() if x.strip()]
+
+        # 艇ごとの開始位置 = 「1〜6」の単独行の直後に4桁登録番号がある箇所
+        starts = []
+        for i in range(len(lines) - 1):
+            if re.fullmatch(r"[1-6]", lines[i]) and re.fullmatch(r"\d{4}", lines[i + 1]):
+                starts.append((i, int(lines[i])))
+
+        for n, (st, boat) in enumerate(starts):
+            en = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+            block = lines[st:en]
+
+            # 艇番・登録番号・平均との差の次から、1着/2着/3着/3連の
+            # 通常補正が始まる前までにある +0.1 等だけを見る。
+            # 「1着 +○%」が直後に伴うものだけアラート扱い。
+            joined = "\n".join(block)
+
+            m = re.search(
+                r"(?:SUPER\s*)?([+]0\.\d+)\s*\n\s*1着\s*([+]\d+(?:\.\d+)?)\s*%",
+                joined,
+                re.I,
+            )
+
+            if not m:
+                # SUPERが別行/記号付きでも拾えるよう少し緩める
+                m = re.search(
+                    r"(?:⚡\s*)?(SUPER\s*)?\n?\s*([+]0\.\d+)\s*\n\s*1着\s*([+]\d+(?:\.\d+)?)\s*%",
+                    joined,
+                    re.I,
                 )
-            except Exception:
-                row_text = " ".join(cell_texts)
+                if m:
+                    slit = m.group(2)
+                    boost = float(m.group(3))
+                    is_super = bool(m.group(1)) or "SUPER" in joined.upper()
+                else:
+                    continue
+            else:
+                slit = m.group(1)
+                boost = float(m.group(2))
+                is_super = "SUPER" in joined.upper()
 
-            boat = extract_boat_number(
-                cell_texts,
-                row_text
-            )
+            alerts.append({
+                "boat": boat,
+                "super": is_super,
+                "slit": slit,
+                "boost": boost,
+            })
 
-            if boat is None:
-                continue
+        if alerts:
+            print(f"表示テキスト方式で検出: {alerts}", flush=True)
 
-            alert = parse_alert_cell(
-                cell_texts[alert_col]
-            )
-
-            if not alert:
-                continue
-
-            alert["boat"] = boat
-            alerts.append(alert)
-
-    # 艇番単位の重複除去
+    # 艇番単位で重複除去
     unique = {}
-
     for a in alerts:
         unique[a["boat"]] = a
 
-    return [
-        unique[b]
-        for b in sorted(unique)
-    ]
+    return [unique[b] for b in sorted(unique)]
 
 
 # ============================================================
@@ -596,7 +648,7 @@ def main():
 
     print(
         f"[{now():%Y-%m-%d %H:%M:%S}] "
-        f"スリットアラート専用監視開始 [V38 old-link-logic + auth-check]",
+        f"スリットアラート専用監視開始 [V39 slit-display-text-fix]",
         flush=True,
     )
 
