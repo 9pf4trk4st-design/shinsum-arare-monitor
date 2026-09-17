@@ -125,198 +125,89 @@ def get_race(text):
 
 def candidate_links(page):
     """
-    トップページからレース詳細候補URLを収集。
+    以前の監視ツールで使っていた候補リンク抽出方式をそのまま採用。
+    a[href] を走査し、対象場/R/race/detail/sum を含むリンクを拾う。
 
-    V37:
-    <a href> だけでなく、
-    form/action・data-href・data-url・onclick・HTML内URLも探索する。
-    サイト側がボタン/JS遷移に変わっていても拾えるようにする。
+    V38では、認証失敗を見逃さないよう HTTP status も確認する。
     """
 
-    page.goto(
+    response = page.goto(
         BASE_URL,
         wait_until="domcontentloaded",
-        timeout=30000,
+        timeout=30000
     )
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(1000)
 
-    host = urlparse(BASE_URL).netloc
-    raw_candidates = []
-
-    # --------------------------------------------------------
-    # 1. DOM属性からURL候補を回収
-    # --------------------------------------------------------
-    selectors_and_attrs = (
-        ("a[href]", "href"),
-        ("[data-href]", "data-href"),
-        ("[data-url]", "data-url"),
-        ("form[action]", "action"),
-        ("button[formaction]", "formaction"),
-    )
-
-    for selector, attr in selectors_and_attrs:
-        loc = page.locator(selector)
-
-        for i in range(loc.count()):
-            el = loc.nth(i)
-
-            try:
-                value = el.get_attribute(attr)
-            except Exception:
-                continue
-
-            if value:
-                raw_candidates.append(value)
-
-    # --------------------------------------------------------
-    # 2. onclick 内のURL候補
-    # --------------------------------------------------------
-    onclicks = page.locator("[onclick]")
-
-    for i in range(onclicks.count()):
-        el = onclicks.nth(i)
-
-        try:
-            value = el.get_attribute("onclick") or ""
-        except Exception:
-            continue
-
-        # location='...'
-        # location.href='...'
-        # window.location='...'
-        # open('...')
-        for m in re.finditer(
-            r"""(?:
-                location(?:\.href)?\s*=\s*
-                |
-                window\.location(?:\.href)?\s*=\s*
-                |
-                open\s*\(
-            )
-            ['"]([^'"]+)['"]""",
-            value,
-            re.I | re.X,
-        ):
-            raw_candidates.append(m.group(1))
-
-    # --------------------------------------------------------
-    # 3. HTMLソース内に埋め込まれた内部URLも拾う
-    # --------------------------------------------------------
-    try:
-        html = page.content()
-    except Exception:
-        html = ""
-
-    # 絶対URL
-    for m in re.finditer(
-        r"""https?://boatrace-shinsum\.com/[^\s"'<>]+""",
-        html,
-        re.I,
-    ):
-        raw_candidates.append(m.group(0))
-
-    # 相対URL
-    for m in re.finditer(
-        r"""["'](/[^"'<> ]+)["']""",
-        html,
-        re.I,
-    ):
-        raw_candidates.append(m.group(1))
-
-    # --------------------------------------------------------
-    # 4. 正規化・同一ドメイン限定
-    # --------------------------------------------------------
-    normalized = []
-
-    for value in raw_candidates:
-        if not value:
-            continue
-
-        value = value.strip()
-
-        if value.startswith(
-            ("#", "javascript:", "mailto:", "tel:")
-        ):
-            continue
-
-        full = urljoin(
-            BASE_URL,
-            value
+    if response is None:
+        print(
+            "トップページ応答なし",
+            flush=True
         )
+        return []
 
-        parsed = urlparse(full)
-
-        if parsed.netloc != host:
-            continue
-
-        low = full.lower()
-
-        if re.search(
-            r"\.(?:jpg|jpeg|png|gif|svg|css|js|ico|pdf|woff2?)(?:\?|$)",
-            low
-        ):
-            continue
-
-        if any(
-            x in low
-            for x in (
-                "/logout",
-                "/login",
-                "/privacy",
-                "/terms",
-            )
-        ):
-            continue
-
-        # トップページそのものは除外
-        if (
-            parsed.path in ("", "/")
-            and not parsed.query
-        ):
-            continue
-
-        normalized.append(full)
-
-    normalized = list(
-        dict.fromkeys(normalized)
-    )
+    status = response.status
 
     print(
-        f"内部URL候補総数: {len(normalized)}",
-        flush=True,
+        f"トップページHTTP: {status}",
+        flush=True
     )
 
-    # --------------------------------------------------------
-    # 5. レース詳細っぽいURLを優先
-    # --------------------------------------------------------
-    preferred = []
+    if status in (401, 403):
+        print(
+            "認証失敗: SHINSUM_USER / SHINSUM_PASSWORD を確認",
+            flush=True
+        )
+        return []
 
-    for full in normalized:
-        low = full.lower()
+    host = urlparse(BASE_URL).netloc
+    out = []
+    aa = page.locator("a")
 
-        if any(
-            word in low
-            for word in (
-                "race",
-                "detail",
-                "shinsum",
-                "sum",
-                "prediction",
-                "race_no",
-                "raceno",
-            )
-        ):
-            preferred.append(full)
+    for i in range(aa.count()):
+        a = aa.nth(i)
 
-    # URL名だけで判別できないサイト構造もあるため、
-    # preferred が0件なら同一ドメインの内部URLを全部確認する。
-    result = (
-        preferred
-        if preferred
-        else normalized
-    )
+        try:
+            href = a.get_attribute("href")
 
-    return result[:250]
+            if (
+                not href
+                or href.startswith("#")
+                or href.startswith("javascript:")
+            ):
+                continue
+
+            full = urljoin(BASE_URL, href)
+
+            if urlparse(full).netloc != host:
+                continue
+
+            txt = ""
+
+            try:
+                txt = a.inner_text(timeout=250) or ""
+            except Exception:
+                pass
+
+            try:
+                txt += "\n" + a.locator(
+                    "xpath=ancestor::*[self::div or self::td or self::li or self::section][1]"
+                ).inner_text(timeout=250)
+            except Exception:
+                pass
+
+            if (
+                any(v in txt for v in TARGET_VENUES)
+                or re.search(r"([1-9]|1[0-2])\s*R", txt)
+                or "race" in full.lower()
+                or "detail" in full.lower()
+                or "sum" in full.lower()
+            ):
+                out.append(full)
+
+        except Exception:
+            pass
+
+    return list(dict.fromkeys(out))
 
 
 # ============================================================
@@ -659,12 +550,6 @@ def inspect_race_page(page):
 def cycle(page):
     links = candidate_links(page)
 
-    # トップページ自体にレース詳細が描画される構成にも対応
-    try:
-        inspect_race_page(page)
-    except Exception:
-        pass
-
     print(
         f"詳細候補リンク数: {len(links)}",
         flush=True,
@@ -677,7 +562,7 @@ def cycle(page):
         )
         return
 
-    for url in links[:250]:
+    for url in links[:150]:
         try:
             page.goto(
                 url,
@@ -711,7 +596,7 @@ def main():
 
     print(
         f"[{now():%Y-%m-%d %H:%M:%S}] "
-        f"スリットアラート専用監視開始 [V37 route-fix]",
+        f"スリットアラート専用監視開始 [V38 old-link-logic + auth-check]",
         flush=True,
     )
 
@@ -736,6 +621,8 @@ def main():
             http_credentials={
                 "username": SHINSUM_USER,
                 "password": SHINSUM_PASSWORD,
+                "origin": BASE_URL.rstrip("/"),
+                "send": "always",
             }
         )
 
