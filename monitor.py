@@ -292,230 +292,157 @@ def extract_boat_number(cell_texts, row_text):
 
 def parse_slit_alerts(page):
     """
-    V43:
-    V39で通知成功した認証・リンク取得・ntfyは維持。
+    V44:
+    DOMの列位置・Y座標は使わず、表示テキストだけで判定する。
 
-    スリットアラートは画面上の列位置で直接読む。
-    1) 「スリットアラート」見出しのX座標を取得
-    2) その列直下の +0.1 / +0.2 ... だけ拾う
-    3) 同じY位置の「1着 +○%」を結びつける
-    4) 同じY位置の4桁登録番号を拾う
-    5) その登録番号と同じ行の艇番1〜6を拾う
+    1) 最後の「シンsum理論」から注釈までを切り出す
+    2) 4桁の登録番号を上から6艇ぶん取得
+    3) 各登録番号〜次の登録番号までを1艇のブロックとして解析
+    4) ブロック内で
+         +0.1
+         1着 +9%
+       のように連続表示される箇所だけをスリットアラートと判定
 
-    平均との差（+0.09等）は別列なので拾わない。
+    これなら「平均との差」や通常の1着補正とは混同しない。
     """
     try:
-        data = page.evaluate(
-            r"""
-            () => {
-              const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-              const rect = el => {
-                const r = el.getBoundingClientRect();
-                return {
-                  x: r.left + window.scrollX,
-                  y: r.top + window.scrollY,
-                  w: r.width,
-                  h: r.height,
-                  cx: r.left + window.scrollX + r.width / 2,
-                  cy: r.top + window.scrollY + r.height / 2
-                };
-              };
-              const visible = el => {
-                const r = el.getBoundingClientRect();
-                const st = getComputedStyle(el);
-                return r.width > 0 && r.height > 0 &&
-                  st.display !== 'none' && st.visibility !== 'hidden';
-              };
-
-              const all = Array.from(document.querySelectorAll('body *')).filter(visible);
-
-              // シンsum理論見出しはページ内の最後のものを採用
-              const theoryHeaders = all.filter(el => norm(el.innerText) === 'シンsum理論');
-              if (!theoryHeaders.length) {
-                return {error: 'theory-header-not-found', alerts: []};
-              }
-              theoryHeaders.sort((a,b) => rect(a).y - rect(b).y);
-              const theory = theoryHeaders[theoryHeaders.length - 1];
-              const theoryY = rect(theory).y;
-
-              // 注釈「※スリットアラート」より上だけを表領域とする
-              const notes = all.filter(el => norm(el.innerText).startsWith('※スリットアラート'))
-                .map(el => ({el, ...rect(el)}))
-                .filter(o => o.y > theoryY)
-                .sort((a,b) => a.y - b.y);
-              const bottomY = notes.length ? notes[0].y : Infinity;
-
-              // スリットアラート見出し。最後の理論見出しより下のものを使う
-              const headers = all
-                .filter(el => norm(el.innerText).replace(/\s+/g,'').includes('スリットアラート'))
-                .map(el => ({el, text:norm(el.innerText), ...rect(el)}))
-                .filter(o => o.y > theoryY && o.y < bottomY)
-                .sort((a,b) => a.y - b.y);
-
-              if (!headers.length) {
-                return {error: 'slit-header-not-found', alerts: []};
-              }
-
-              // 最も上のスリットアラート見出しの中心X
-              const slitHeader = headers[0];
-              const slitX = slitHeader.cx;
-              const headerBottom = slitHeader.y + slitHeader.h;
-
-              // 4桁登録番号リンクを理論表領域から取得
-              const regs = Array.from(document.querySelectorAll('a'))
-                .filter(visible)
-                .map(el => ({text:norm(el.innerText), ...rect(el)}))
-                .filter(o => /^\d{4}$/.test(o.text) && o.y > headerBottom && o.y < bottomY)
-                .sort((a,b) => a.cy - b.cy);
-
-              // 重複登録番号除去
-              const uniqueRegs = [];
-              const seen = new Set();
-              for (const r of regs) {
-                if (!seen.has(r.text)) {
-                  uniqueRegs.push(r);
-                  seen.add(r.text);
-                }
-              }
-
-              // +0.1/+0.2... のleaf要素だけ取得。
-              // X座標がスリット列見出しの近辺にあるものだけ採用。
-              const slitEls = all
-                .filter(el => el.children.length === 0)
-                .map(el => ({text:norm(el.textContent), ...rect(el)}))
-                .filter(o => /^\+0\.\d+$/.test(o.text))
-                .filter(o => o.y > headerBottom && o.y < bottomY)
-                .filter(o => Math.abs(o.cx - slitX) <= 110)
-                .sort((a,b) => a.cy - b.cy);
-
-              // 1着 +N% のleaf要素
-              const boosts = all
-                .filter(el => el.children.length === 0)
-                .map(el => ({text:norm(el.textContent), ...rect(el)}))
-                .filter(o => /^1着\s*\+\d+(?:\.\d+)?%$/.test(o.text))
-                .filter(o => o.y > headerBottom && o.y < bottomY);
-
-              // SUPER leaf要素
-              const supers = all
-                .filter(el => el.children.length === 0)
-                .map(el => ({text:norm(el.textContent), ...rect(el)}))
-                .filter(o => /SUPER/i.test(o.text))
-                .filter(o => o.y > headerBottom && o.y < bottomY);
-
-              const results = [];
-
-              for (const s of slitEls) {
-                // 同じセルの1着+N%を最短距離で探す
-                let boost = null;
-                let bestBoost = Infinity;
-                for (const b of boosts) {
-                  const dy = Math.abs(b.cy - s.cy);
-                  const dx = Math.abs(b.cx - s.cx);
-                  // 縦積みされるため、Xは近く、Yは多少ずれてよい
-                  if (dx <= 120 && dy <= 75) {
-                    const d = dx + dy;
-                    if (d < bestBoost) {
-                      bestBoost = d;
-                      boost = b;
-                    }
-                  }
-                }
-                if (!boost) continue;
-
-                // 同じ行の登録番号をY差で特定
-                let reg = null;
-                let bestReg = Infinity;
-                for (const r of uniqueRegs) {
-                  const dy = Math.abs(r.cy - s.cy);
-                  if (dy <= 80 && dy < bestReg) {
-                    bestReg = dy;
-                    reg = r;
-                  }
-                }
-                if (!reg) continue;
-
-                // 登録番号の並び順から艇番を確定（表は1〜6号艇の順）
-                const boatIndex = uniqueRegs.findIndex(r => r.text === reg.text);
-                if (boatIndex < 0 || boatIndex > 5) continue;
-
-                const mBoost = boost.text.match(/\+(\d+(?:\.\d+)?)%/);
-                if (!mBoost) continue;
-
-                const isSuper = supers.some(sp =>
-                  Math.abs(sp.cy - s.cy) <= 75 && Math.abs(sp.cx - s.cx) <= 150
-                );
-
-                results.push({
-                  boat: boatIndex + 1,
-                  reg: reg.text,
-                  super: isSuper,
-                  slit: s.text,
-                  boost: Number(mBoost[1]),
-                  ydiff: bestReg,
-                  xdiff: Math.abs(s.cx - slitX),
-                  boostText: boost.text
-                });
-              }
-
-              return {
-                error: '',
-                theoryY,
-                bottomY,
-                slitX,
-                regs: uniqueRegs.map((r,i) => ({boat:i+1, reg:r.text, y:r.cy})),
-                slitCandidates: slitEls.map(s => ({text:s.text, x:s.cx, y:s.cy})),
-                alerts: results
-              };
-            }
-            """
-        )
+        body = page.locator("body").inner_text(timeout=10000)
     except Exception as e:
-        print(f"スリットDOM解析失敗: {repr(e)}", flush=True)
+        print(f"本文取得失敗: {repr(e)}", flush=True)
         return []
 
-    if data.get('error'):
-        print(f"スリット解析: {data['error']}", flush=True)
+    # --------------------------------------------------------
+    # シンsum理論セクションだけに限定
+    # --------------------------------------------------------
+    pos = body.rfind("シンsum理論")
+    if pos < 0:
+        print("シンsum理論セクションなし", flush=True)
         return []
 
-    regs = data.get('regs', [])
-    if regs:
+    section = body[pos:]
+
+    note_pos = section.find("※スリットアラート")
+    if note_pos >= 0:
+        section = section[:note_pos]
+
+    # 行単位で整形
+    lines = [
+        " ".join(line.split())
+        for line in section.splitlines()
+        if line.strip()
+    ]
+
+    # --------------------------------------------------------
+    # 登録番号の位置を取得
+    # 同じ番号の重複は最初だけ
+    # --------------------------------------------------------
+    reg_positions = []
+    seen = set()
+
+    for idx, line in enumerate(lines):
+        if re.fullmatch(r"\d{4}", line) and line not in seen:
+            reg_positions.append((idx, line))
+            seen.add(line)
+            if len(reg_positions) >= 6:
+                break
+
+    if len(reg_positions) < 6:
         print(
-            '理論表 艇番対応: ' + str({r['reg']: r['boat'] for r in regs[:6]}),
+            f"理論表登録番号不足: {len(reg_positions)}件 / "
+            f"{[r for _, r in reg_positions]}",
             flush=True,
         )
+        return []
 
-    candidates = data.get('slitCandidates', [])
-    if candidates:
-        print(f"スリット候補: {candidates}", flush=True)
+    mapping = {
+        reg: boat
+        for boat, (_, reg) in enumerate(reg_positions, start=1)
+    }
 
-    out = []
-    for a in data.get('alerts', []):
-        item = {
-            'boat': int(a['boat']),
-            'super': bool(a['super']),
-            'slit': str(a['slit']),
-            'boost': float(a['boost']),
-        }
-        out.append(item)
-        print(
-            f"スリット確定: {a['reg']}→{a['boat']}号艇 / "
-            f"{a['slit']} / {a['boostText']} / "
-            f"Y差={a['ydiff']:.1f}px",
-            flush=True,
-        )
+    print(
+        f"理論表 艇番対応: {mapping}",
+        flush=True,
+    )
 
-    # 重複除去
-    unique = {}
-    for a in out:
-        unique[(a['boat'], a['super'], a['slit'], a['boost'])] = a
+    alerts = []
 
-    result = list(unique.values())
-    result.sort(key=lambda x: x['boat'])
+    # --------------------------------------------------------
+    # 1艇ずつブロック解析
+    # --------------------------------------------------------
+    for boat, (start_idx, reg) in enumerate(reg_positions, start=1):
+        if boat < 6:
+            end_idx = reg_positions[boat][0]
+        else:
+            end_idx = len(lines)
 
-    if result:
-        print(f"スリット欄解析結果: {result}", flush=True)
+        block = lines[start_idx:end_idx]
 
-    return result
+        # 例:
+        #   +0.1
+        #   1着 +9%
+        # または
+        #   SUPER
+        #   +0.1
+        #   1着 +15%
+        for i, line in enumerate(block):
+            is_super = False
+            slit = None
+            boost = None
+
+            # SUPERが独立行の場合
+            if line.upper() == "SUPER":
+                if i + 2 < len(block):
+                    m_slit = re.fullmatch(r"\+0\.\d+", block[i + 1])
+                    m_boost = re.fullmatch(
+                        r"1着\s*([+-]\d+(?:\.\d+)?)%",
+                        block[i + 2],
+                    )
+                    if m_slit and m_boost:
+                        is_super = True
+                        slit = block[i + 1]
+                        boost = float(m_boost.group(1))
+
+            # 「+0.1」「1着 +9%」の2行構成
+            if slit is None:
+                m_slit = re.fullmatch(r"\+0\.\d+", line)
+                if m_slit and i + 1 < len(block):
+                    m_boost = re.fullmatch(
+                        r"1着\s*([+-]\d+(?:\.\d+)?)%",
+                        block[i + 1],
+                    )
+                    if m_boost:
+                        slit = line
+                        boost = float(m_boost.group(1))
+                        if i > 0 and block[i - 1].upper() == "SUPER":
+                            is_super = True
+
+            # 1セルが同一行になっている場合
+            if slit is None:
+                m_same = re.fullmatch(
+                    r"(?:⚡\s*)?(SUPER\s*)?(\+0\.\d+)\s*1着\s*([+-]\d+(?:\.\d+)?)%",
+                    line,
+                    re.I,
+                )
+                if m_same:
+                    is_super = bool(m_same.group(1))
+                    slit = m_same.group(2)
+                    boost = float(m_same.group(3))
+
+            if slit is not None and boost is not None:
+                alerts.append({
+                    "boat": boat,
+                    "super": is_super,
+                    "slit": slit,
+                    "boost": boost,
+                })
+                print(
+                    f"スリット検出: {boat}号艇 / 登録{reg} / "
+                    f"{('SUPER / ' if is_super else '')}{slit} / 1着{boost:+g}%",
+                    flush=True,
+                )
+                break
+
+    return alerts
 
 
 # ============================================================
@@ -721,7 +648,7 @@ def main():
 
     print(
         f"[{now():%Y-%m-%d %H:%M:%S}] "
-        f"スリットアラート専用監視開始 [V43 column-position-fix]",
+        f"スリットアラート専用監視開始 [V44 text-block-parser]",
         flush=True,
     )
 
