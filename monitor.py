@@ -292,244 +292,292 @@ def extract_boat_number(cell_texts, row_text):
 
 def parse_slit_alerts(page):
     """
-    V40:
-    CSSグリッド型の実ページに合わせ、画面上のY座標で
-    「スリットアラート」と艇番を対応付ける。
+    V41:
+    V39で通知自体は成功したので、認証・リンク取得はそのまま使用。
+    艇番だけ、文字列の並び順ではなくDOM上の「同じ艇の行」で判定する。
 
-    これにより、4号艇の +0.1 / 1着+8% を
-    3号艇にずらして通知する問題を修正。
+    手順:
+      1) シンsum理論内の登録番号6艇を上から 1〜6号艇に対応
+      2) +0.1 / +0.2 ... の表示要素を探す
+      3) その要素から親要素へ上がり、「登録番号が1つだけある最小の行」を探す
+      4) その登録番号から正しい艇番を確定
+      5) 同じ行から 1着 +○% / SUPER を取得
     """
-
     alerts = []
 
+    try:
+        body = page.locator("body").inner_text(timeout=10000)
+    except Exception:
+        body = ""
+
     # --------------------------------------------------------
-    # 1. 画面位置ベース方式（最優先）
+    # 本物の「シンsum理論」表を特定
+    # --------------------------------------------------------
+    theory_root = None
+
+    # 「スリットアラート」見出しを含み、かつ4桁登録番号が複数ある
+    # 最小寄りの祖先を探す。
+    try:
+        headers = page.get_by_text("スリットアラート", exact=False)
+
+        for hi in range(headers.count() - 1, -1, -1):
+            node = headers.nth(hi)
+
+            for _ in range(8):
+                try:
+                    txt = " ".join(node.inner_text(timeout=300).split())
+                except Exception:
+                    txt = ""
+
+                regs_here = re.findall(r"(?<!\d)\d{4}(?!\d)", txt)
+
+                if (
+                    "スリットアラート" in txt
+                    and "シンsum理論" in txt
+                    and len(set(regs_here)) >= 6
+                ):
+                    theory_root = node
+                    break
+
+                try:
+                    node = node.locator("xpath=..")
+                except Exception:
+                    break
+
+            if theory_root is not None:
+                break
+    except Exception:
+        theory_root = None
+
+    # 見つからない場合はbody全体を使う
+    if theory_root is None:
+        theory_root = page.locator("body")
+
+    # --------------------------------------------------------
+    # 登録番号 → 艇番 の対応を作る
+    # --------------------------------------------------------
+    reg_order = []
+
+    try:
+        links = theory_root.locator("a")
+
+        for i in range(links.count()):
+            a = links.nth(i)
+
+            try:
+                t = " ".join((a.inner_text(timeout=250) or "").split())
+            except Exception:
+                continue
+
+            if re.fullmatch(r"\d{4}", t):
+                if t not in reg_order:
+                    reg_order.append(t)
+
+            if len(reg_order) >= 6:
+                break
+    except Exception:
+        pass
+
+    # aタグで取れないサイト構造用
+    if len(reg_order) < 6:
+        try:
+            t = theory_root.inner_text(timeout=1000)
+        except Exception:
+            t = ""
+
+        for reg in re.findall(r"(?m)^\s*(\d{4})\s*$", t):
+            if reg not in reg_order:
+                reg_order.append(reg)
+
+            if len(reg_order) >= 6:
+                break
+
+    reg_order = reg_order[:6]
+    reg_to_boat = {
+        reg: idx + 1
+        for idx, reg in enumerate(reg_order)
+    }
+
+    print(
+        f"理論表 登録番号対応: {reg_to_boat}",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # +0.1 / +0.2 ... の表示要素を探す
+    # XPathなのでPlaywrightのtext regex依存を避ける
     # --------------------------------------------------------
     try:
-        header = page.get_by_text("スリットアラート", exact=False).last
-        hb = header.bounding_box(timeout=1500)
+        candidates = theory_root.locator(
+            "xpath=.//*[contains(normalize-space(.), '+0.') and not(*)]"
+        )
+    except Exception:
+        candidates = page.locator("xpath=//*[contains(normalize-space(.), '+0.') and not(*)]")
 
-        if hb:
-            header_x = hb["x"] + hb["width"] / 2
-            header_y = hb["y"]
+    for i in range(candidates.count()):
+        el = candidates.nth(i)
 
-            # 理論表内の4桁登録番号リンクをY順に並べる。
+        try:
+            val = " ".join((el.inner_text(timeout=250) or "").split())
+        except Exception:
+            continue
+
+        # スリット差の形式だけ
+        if not re.fullmatch(r"\+0\.\d+", val):
+            continue
+
+        row_node = el
+        row_text = ""
+        matched_reg = None
+
+        # ----------------------------------------------------
+        # アラート要素から上へ。
+        # 「登録番号が1つだけ含まれる最小祖先」を同じ艇の行とする。
+        # ----------------------------------------------------
+        for _ in range(10):
+            try:
+                txt = " ".join(row_node.inner_text(timeout=300).split())
+            except Exception:
+                txt = ""
+
             regs = []
-            links = page.locator("a")
 
-            for i in range(links.count()):
-                a = links.nth(i)
-                try:
-                    txt = " ".join((a.inner_text(timeout=250) or "").split())
-                except Exception:
-                    continue
-
-                if not re.fullmatch(r"\d{4}", txt):
-                    continue
-
-                try:
-                    bb = a.bounding_box(timeout=250)
-                except Exception:
-                    bb = None
-
-                if not bb or bb["y"] <= header_y:
-                    continue
-
-                regs.append({
-                    "reg": txt,
-                    "y": bb["y"] + bb["height"] / 2,
-                })
-
-            regs.sort(key=lambda x: x["y"])
-
-            # 同じ理論表の最初の6艇だけを使う。
-            regs = regs[:6]
-
-            if len(regs) == 6:
-                for idx, r in enumerate(regs):
-                    r["boat"] = idx + 1
-
-                # +0.1 / +0.2 ... の表示要素を全探索。
-                candidates = page.locator("text=/^\\+0\\.\\d+$/")
-
-                for i in range(candidates.count()):
-                    el = candidates.nth(i)
+            # まずリンクから登録番号
+            try:
+                aa = row_node.locator("a")
+                for j in range(aa.count()):
                     try:
-                        val = " ".join(el.inner_text(timeout=250).split())
-                        bb = el.bounding_box(timeout=250)
+                        at = " ".join((aa.nth(j).inner_text(timeout=150) or "").split())
                     except Exception:
                         continue
 
-                    if not bb:
-                        continue
+                    if re.fullmatch(r"\d{4}", at):
+                        regs.append(at)
+            except Exception:
+                pass
 
-                    cx = bb["x"] + bb["width"] / 2
-                    cy = bb["y"] + bb["height"] / 2
+            # リンクで無ければ文字列から
+            if not regs:
+                regs = re.findall(
+                    r"(?<!\d)(\d{4})(?!\d)",
+                    txt
+                )
 
-                    # スリットアラート列以外（平均との差等）の +0.x を除外。
-                    if abs(cx - header_x) > 120:
-                        continue
+            regs = [
+                r for r in dict.fromkeys(regs)
+                if r in reg_to_boat
+            ]
 
-                    # 最もY座標が近い登録番号 = その艇。
-                    nearest = min(
-                        regs,
-                        key=lambda r: abs(r["y"] - cy)
-                    )
+            if len(regs) == 1:
+                matched_reg = regs[0]
+                row_text = txt
+                break
 
-                    # 隣の艇へ誤対応しないよう縦距離も制限。
-                    if abs(nearest["y"] - cy) > 90:
-                        continue
+            # 6艇全部を含むところまで来たら行を越えているので打切り
+            if len(regs) >= 6:
+                break
 
-                    # +0.1 の近傍から「1着 +8%」を取得。
-                    boost = None
-                    is_super = False
+            try:
+                row_node = row_node.locator("xpath=..")
+            except Exception:
+                break
 
-                    # 親要素を少しずつ広げて近傍テキストを確認。
-                    near_text = ""
-                    node = el
-                    for up in range(5):
-                        try:
-                            t = " ".join(node.inner_text(timeout=250).split())
-                        except Exception:
-                            t = ""
+        if not matched_reg:
+            continue
 
-                        if "1着" in t:
-                            near_text = t
-                            break
-
-                        try:
-                            node = node.locator("xpath=..")
-                        except Exception:
-                            break
-
-                    m = re.search(
-                        r"1着\s*([+-]\d+(?:\.\d+)?)\s*%",
-                        near_text
-                    )
-
-                    if m:
-                        boost = float(m.group(1))
-                        is_super = "SUPER" in near_text.upper()
-                    else:
-                        # 親構造で取れない場合、同じY帯の画面テキストから探す。
-                        all_text = page.locator("text=/1着\\s*[+-]\\d+(?:\\.\\d+)?\\s*%/")
-                        best = None
-
-                        for j in range(all_text.count()):
-                            tnode = all_text.nth(j)
-                            try:
-                                tb = tnode.bounding_box(timeout=200)
-                                tt = " ".join(tnode.inner_text(timeout=200).split())
-                            except Exception:
-                                continue
-
-                            if not tb:
-                                continue
-
-                            ty = tb["y"] + tb["height"] / 2
-                            dist = abs(ty - cy)
-
-                            if dist <= 70 and (best is None or dist < best[0]):
-                                best = (dist, tt)
-
-                        if best:
-                            m = re.search(
-                                r"1着\s*([+-]\d+(?:\.\d+)?)\s*%",
-                                best[1]
-                            )
-                            if m:
-                                boost = float(m.group(1))
-                                is_super = "SUPER" in best[1].upper()
-
-                    if boost is None:
-                        continue
-
-                    alerts.append({
-                        "boat": nearest["boat"],
-                        "super": is_super,
-                        "slit": val,
-                        "boost": boost,
-                    })
-
-    except Exception as e:
-        print(
-            f"位置ベース解析失敗: {repr(e)}",
-            flush=True,
+        # ----------------------------------------------------
+        # 同じ行から1着上昇幅を取得
+        # ----------------------------------------------------
+        boost_match = re.search(
+            r"1着\s*([+-]\d+(?:\.\d+)?)\s*%",
+            row_text
         )
 
+        # DOM上で「+0.1」と「1着+8%」が兄弟セルの場合、
+        # さらに1〜2階層だけ広げて探す。ただし登録番号は同じ1艇のみ。
+        if not boost_match:
+            probe = row_node
+
+            for _ in range(2):
+                try:
+                    probe = probe.locator("xpath=..")
+                    txt = " ".join(probe.inner_text(timeout=300).split())
+                except Exception:
+                    break
+
+                regs = [
+                    r for r in re.findall(r"(?<!\d)(\d{4})(?!\d)", txt)
+                    if r in reg_to_boat
+                ]
+                regs = list(dict.fromkeys(regs))
+
+                if len(regs) != 1 or regs[0] != matched_reg:
+                    break
+
+                boost_match = re.search(
+                    r"1着\s*([+-]\d+(?:\.\d+)?)\s*%",
+                    txt
+                )
+
+                if boost_match:
+                    row_text = txt
+                    break
+
+        if not boost_match:
+            continue
+
+        boost = float(boost_match.group(1))
+        boat = reg_to_boat[matched_reg]
+        is_super = "SUPER" in row_text.upper()
+
+        alerts.append({
+            "boat": boat,
+            "super": is_super,
+            "slit": val,
+            "boost": boost,
+        })
+
     # --------------------------------------------------------
-    # 2. table構造フォールバック
+    # 最終フォールバック:
+    # V39方式で検出はするが、艇番は登録番号対応から補正できる時だけ採用
     # --------------------------------------------------------
     if not alerts:
-        try:
-            tables = page.locator("table")
+        marker = body.rfind("シンsum理論")
+        section = body[marker:] if marker >= 0 else body
 
-            for ti in range(tables.count()):
-                table = tables.nth(ti)
-                rows = table.locator("tr")
-                alert_col = None
+        note = section.find("※スリットアラート")
+        if note >= 0:
+            section = section[:note]
 
-                for ri in range(rows.count()):
-                    cells = rows.nth(ri).locator("th, td")
-                    texts = []
-                    for ci in range(cells.count()):
-                        try:
-                            texts.append(" ".join(cells.nth(ci).inner_text(timeout=400).split()))
-                        except Exception:
-                            texts.append("")
+        # 1つのアラートだけでも検出可能な緩い抽出。
+        # 艇番はここでは決め打ちしない。
+        m = re.search(
+            r"(?:SUPER\s*)?(\+0\.\d+)\s*[\r\n ]+1着\s*(\+\d+(?:\.\d+)?)\s*%",
+            section,
+            re.I,
+        )
 
-                    for ci, txt in enumerate(texts):
-                        if "スリットアラート" in txt:
-                            alert_col = ci
-                            break
-                    if alert_col is not None:
-                        break
-
-                if alert_col is None:
-                    continue
-
-                for ri in range(rows.count()):
-                    row = rows.nth(ri)
-                    cells = row.locator("th, td")
-                    if cells.count() <= alert_col:
-                        continue
-
-                    vals = []
-                    for ci in range(cells.count()):
-                        try:
-                            vals.append(" ".join(cells.nth(ci).inner_text(timeout=400).split()))
-                        except Exception:
-                            vals.append("")
-
-                    try:
-                        row_text = " ".join(row.inner_text(timeout=500).split())
-                    except Exception:
-                        row_text = " ".join(vals)
-
-                    boat = extract_boat_number(vals, row_text)
-                    if boat is None:
-                        continue
-
-                    alert = parse_alert_cell(vals[alert_col])
-                    if alert:
-                        alert["boat"] = boat
-                        alerts.append(alert)
-
-        except Exception as e:
+        if m:
             print(
-                f"table方式解析失敗: {repr(e)}",
+                "警告: アラート表示は見つかったが、DOMから艇番を確定できませんでした。"
+                "誤通知防止のため通知しません。",
                 flush=True,
             )
 
     # 重複除去
     unique = {}
-    for a in alerts:
-        unique[(a["boat"], a["slit"], a["boost"])] = a
 
-    result = sorted(
-        unique.values(),
-        key=lambda x: x["boat"]
-    )
+    for a in alerts:
+        key = (
+            a["boat"],
+            a["slit"],
+            a["boost"],
+            a["super"],
+        )
+        unique[key] = a
+
+    result = list(unique.values())
+    result.sort(key=lambda x: x["boat"])
 
     if result:
         print(
@@ -743,7 +791,7 @@ def main():
 
     print(
         f"[{now():%Y-%m-%d %H:%M:%S}] "
-        f"スリットアラート専用監視開始 [V39 slit-display-text-fix]",
+        f"スリットアラート専用監視開始 [V41 row-dom-fix]",
         flush=True,
     )
 
