@@ -292,157 +292,252 @@ def extract_boat_number(cell_texts, row_text):
 
 def parse_slit_alerts(page):
     """
-    V39:
-    1) tableの「スリットアラート」列を読む
-    2) tableとして取れない場合は、実際に画面に表示されている
-       「シンsum理論」の文字列を艇ごとのブロックに分けて読む
+    V40:
+    CSSグリッド型の実ページに合わせ、画面上のY座標で
+    「スリットアラート」と艇番を対応付ける。
 
-    今回の実ページ例:
-      3
-      3385
-      -0.08        ← 平均との差
-      +0.1         ← スリットアラート
-      1着 +7%      ← 上昇幅
-      -1% ...      ← 通常の理論補正
+    これにより、4号艇の +0.1 / 1着+8% を
+    3号艇にずらして通知する問題を修正。
     """
+
     alerts = []
 
     # --------------------------------------------------------
-    # 1. 通常のtable構造
+    # 1. 画面位置ベース方式（最優先）
     # --------------------------------------------------------
     try:
-        tables = page.locator("table")
+        header = page.get_by_text("スリットアラート", exact=False).last
+        hb = header.bounding_box(timeout=1500)
 
-        for ti in range(tables.count()):
-            table = tables.nth(ti)
-            rows = table.locator("tr")
-            alert_col = None
+        if hb:
+            header_x = hb["x"] + hb["width"] / 2
+            header_y = hb["y"]
 
-            for ri in range(rows.count()):
-                cells = rows.nth(ri).locator("th, td")
-                texts = []
-                for ci in range(cells.count()):
-                    try:
-                        texts.append(" ".join(cells.nth(ci).inner_text(timeout=500).split()))
-                    except Exception:
-                        texts.append("")
+            # 理論表内の4桁登録番号リンクをY順に並べる。
+            regs = []
+            links = page.locator("a")
 
-                for ci, txt in enumerate(texts):
-                    if "スリットアラート" in txt:
-                        alert_col = ci
-                        break
-                if alert_col is not None:
-                    break
-
-            if alert_col is None:
-                continue
-
-            for ri in range(rows.count()):
-                row = rows.nth(ri)
-                cells = row.locator("th, td")
-                if cells.count() <= alert_col:
+            for i in range(links.count()):
+                a = links.nth(i)
+                try:
+                    txt = " ".join((a.inner_text(timeout=250) or "").split())
+                except Exception:
                     continue
 
-                cell_texts = []
-                for ci in range(cells.count()):
-                    try:
-                        cell_texts.append(" ".join(cells.nth(ci).inner_text(timeout=500).split()))
-                    except Exception:
-                        cell_texts.append("")
+                if not re.fullmatch(r"\d{4}", txt):
+                    continue
 
                 try:
-                    row_text = " ".join(row.inner_text(timeout=700).split())
+                    bb = a.bounding_box(timeout=250)
                 except Exception:
-                    row_text = " ".join(cell_texts)
+                    bb = None
 
-                boat = extract_boat_number(cell_texts, row_text)
-                if boat is None:
+                if not bb or bb["y"] <= header_y:
                     continue
 
-                alert = parse_alert_cell(cell_texts[alert_col])
-                if alert:
-                    alert["boat"] = boat
-                    alerts.append(alert)
+                regs.append({
+                    "reg": txt,
+                    "y": bb["y"] + bb["height"] / 2,
+                })
+
+            regs.sort(key=lambda x: x["y"])
+
+            # 同じ理論表の最初の6艇だけを使う。
+            regs = regs[:6]
+
+            if len(regs) == 6:
+                for idx, r in enumerate(regs):
+                    r["boat"] = idx + 1
+
+                # +0.1 / +0.2 ... の表示要素を全探索。
+                candidates = page.locator("text=/^\\+0\\.\\d+$/")
+
+                for i in range(candidates.count()):
+                    el = candidates.nth(i)
+                    try:
+                        val = " ".join(el.inner_text(timeout=250).split())
+                        bb = el.bounding_box(timeout=250)
+                    except Exception:
+                        continue
+
+                    if not bb:
+                        continue
+
+                    cx = bb["x"] + bb["width"] / 2
+                    cy = bb["y"] + bb["height"] / 2
+
+                    # スリットアラート列以外（平均との差等）の +0.x を除外。
+                    if abs(cx - header_x) > 120:
+                        continue
+
+                    # 最もY座標が近い登録番号 = その艇。
+                    nearest = min(
+                        regs,
+                        key=lambda r: abs(r["y"] - cy)
+                    )
+
+                    # 隣の艇へ誤対応しないよう縦距離も制限。
+                    if abs(nearest["y"] - cy) > 90:
+                        continue
+
+                    # +0.1 の近傍から「1着 +8%」を取得。
+                    boost = None
+                    is_super = False
+
+                    # 親要素を少しずつ広げて近傍テキストを確認。
+                    near_text = ""
+                    node = el
+                    for up in range(5):
+                        try:
+                            t = " ".join(node.inner_text(timeout=250).split())
+                        except Exception:
+                            t = ""
+
+                        if "1着" in t:
+                            near_text = t
+                            break
+
+                        try:
+                            node = node.locator("xpath=..")
+                        except Exception:
+                            break
+
+                    m = re.search(
+                        r"1着\s*([+-]\d+(?:\.\d+)?)\s*%",
+                        near_text
+                    )
+
+                    if m:
+                        boost = float(m.group(1))
+                        is_super = "SUPER" in near_text.upper()
+                    else:
+                        # 親構造で取れない場合、同じY帯の画面テキストから探す。
+                        all_text = page.locator("text=/1着\\s*[+-]\\d+(?:\\.\\d+)?\\s*%/")
+                        best = None
+
+                        for j in range(all_text.count()):
+                            tnode = all_text.nth(j)
+                            try:
+                                tb = tnode.bounding_box(timeout=200)
+                                tt = " ".join(tnode.inner_text(timeout=200).split())
+                            except Exception:
+                                continue
+
+                            if not tb:
+                                continue
+
+                            ty = tb["y"] + tb["height"] / 2
+                            dist = abs(ty - cy)
+
+                            if dist <= 70 and (best is None or dist < best[0]):
+                                best = (dist, tt)
+
+                        if best:
+                            m = re.search(
+                                r"1着\s*([+-]\d+(?:\.\d+)?)\s*%",
+                                best[1]
+                            )
+                            if m:
+                                boost = float(m.group(1))
+                                is_super = "SUPER" in best[1].upper()
+
+                    if boost is None:
+                        continue
+
+                    alerts.append({
+                        "boat": nearest["boat"],
+                        "super": is_super,
+                        "slit": val,
+                        "boost": boost,
+                    })
 
     except Exception as e:
-        print(f"table方式解析失敗: {repr(e)}", flush=True)
+        print(
+            f"位置ベース解析失敗: {repr(e)}",
+            flush=True,
+        )
 
     # --------------------------------------------------------
-    # 2. 実表示テキスト方式（今回のサイト構造用）
+    # 2. table構造フォールバック
     # --------------------------------------------------------
     if not alerts:
         try:
-            body = page.locator("body").inner_text(timeout=10000)
-        except Exception:
-            body = ""
+            tables = page.locator("table")
 
-        # 上部に「←シンsum理論に戻る」があるので、
-        # 「場平均」が存在する本物の理論表付近を優先して切り出す。
-        marker = body.rfind("シンsum理論")
-        section = body[marker:] if marker >= 0 else body
+            for ti in range(tables.count()):
+                table = tables.nth(ti)
+                rows = table.locator("tr")
+                alert_col = None
 
-        # 表の下の説明文より先だけで十分
-        note = section.find("※スリットアラート")
-        if note >= 0:
-            section = section[:note]
+                for ri in range(rows.count()):
+                    cells = rows.nth(ri).locator("th, td")
+                    texts = []
+                    for ci in range(cells.count()):
+                        try:
+                            texts.append(" ".join(cells.nth(ci).inner_text(timeout=400).split()))
+                        except Exception:
+                            texts.append("")
 
-        lines = [" ".join(x.split()) for x in section.splitlines() if x.strip()]
+                    for ci, txt in enumerate(texts):
+                        if "スリットアラート" in txt:
+                            alert_col = ci
+                            break
+                    if alert_col is not None:
+                        break
 
-        # 艇ごとの開始位置 = 「1〜6」の単独行の直後に4桁登録番号がある箇所
-        starts = []
-        for i in range(len(lines) - 1):
-            if re.fullmatch(r"[1-6]", lines[i]) and re.fullmatch(r"\d{4}", lines[i + 1]):
-                starts.append((i, int(lines[i])))
+                if alert_col is None:
+                    continue
 
-        for n, (st, boat) in enumerate(starts):
-            en = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
-            block = lines[st:en]
+                for ri in range(rows.count()):
+                    row = rows.nth(ri)
+                    cells = row.locator("th, td")
+                    if cells.count() <= alert_col:
+                        continue
 
-            # 艇番・登録番号・平均との差の次から、1着/2着/3着/3連の
-            # 通常補正が始まる前までにある +0.1 等だけを見る。
-            # 「1着 +○%」が直後に伴うものだけアラート扱い。
-            joined = "\n".join(block)
+                    vals = []
+                    for ci in range(cells.count()):
+                        try:
+                            vals.append(" ".join(cells.nth(ci).inner_text(timeout=400).split()))
+                        except Exception:
+                            vals.append("")
 
-            m = re.search(
-                r"(?:SUPER\s*)?([+]0\.\d+)\s*\n\s*1着\s*([+]\d+(?:\.\d+)?)\s*%",
-                joined,
-                re.I,
+                    try:
+                        row_text = " ".join(row.inner_text(timeout=500).split())
+                    except Exception:
+                        row_text = " ".join(vals)
+
+                    boat = extract_boat_number(vals, row_text)
+                    if boat is None:
+                        continue
+
+                    alert = parse_alert_cell(vals[alert_col])
+                    if alert:
+                        alert["boat"] = boat
+                        alerts.append(alert)
+
+        except Exception as e:
+            print(
+                f"table方式解析失敗: {repr(e)}",
+                flush=True,
             )
 
-            if not m:
-                # SUPERが別行/記号付きでも拾えるよう少し緩める
-                m = re.search(
-                    r"(?:⚡\s*)?(SUPER\s*)?\n?\s*([+]0\.\d+)\s*\n\s*1着\s*([+]\d+(?:\.\d+)?)\s*%",
-                    joined,
-                    re.I,
-                )
-                if m:
-                    slit = m.group(2)
-                    boost = float(m.group(3))
-                    is_super = bool(m.group(1)) or "SUPER" in joined.upper()
-                else:
-                    continue
-            else:
-                slit = m.group(1)
-                boost = float(m.group(2))
-                is_super = "SUPER" in joined.upper()
-
-            alerts.append({
-                "boat": boat,
-                "super": is_super,
-                "slit": slit,
-                "boost": boost,
-            })
-
-        if alerts:
-            print(f"表示テキスト方式で検出: {alerts}", flush=True)
-
-    # 艇番単位で重複除去
+    # 重複除去
     unique = {}
     for a in alerts:
-        unique[a["boat"]] = a
+        unique[(a["boat"], a["slit"], a["boost"])] = a
 
-    return [unique[b] for b in sorted(unique)]
+    result = sorted(
+        unique.values(),
+        key=lambda x: x["boat"]
+    )
+
+    if result:
+        print(
+            f"スリット欄解析結果: {result}",
+            flush=True,
+        )
+
+    return result
 
 
 # ============================================================
