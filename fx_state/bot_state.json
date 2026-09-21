@@ -1,26 +1,9 @@
 {
-  "paper_balance": 100774.47041830639,
-  "position": {
-    "symbol": "EUR_USD",
-    "side": "SHORT",
-    "entry": 1.1480816071428572,
-    "qty_initial": 2792.6341185027677,
-    "qty_remaining": 2792.6341185027677,
-    "stop": 1.1486695,
-    "original_stop": 1.1486695,
-    "initial_risk": 0.0005878928571427799,
-    "tp1": 1.1474847823428573,
-    "tp2": 1.1471634151428571,
-    "tp3": 1.1467043191428572,
-    "tp1_done": false,
-    "tp2_done": false,
-    "realized_pnl": 0.0,
-    "opened_at": "2026-09-21T08:47:00.346859+00:00",
-    "max_r": 0.513030800073077
-  },
+  "paper_balance": 100772.63176795015,
+  "position": null,
   "pending": null,
   "daily_date": "2026-09-21",
   "daily_start_balance": 100774.47041830639,
-  "consecutive_losses": 1,
+  "consecutive_losses": 2,
   "last_key": "f8416a1fe83083f8"
 }
