@@ -1,9 +1,34 @@
 {
   "paper_balance": 100774.47041830639,
   "position": null,
-  "pending": null,
-  "daily_date": "2026-09-09",
-  "daily_start_balance": 100662.35517996235,
+  "pending": {
+    "symbol": "EUR_USD",
+    "side": "SHORT",
+    "confidence": 64,
+    "long": 18,
+    "short": 64,
+    "entry_low": 1.1479994285714286,
+    "entry_high": 1.1481637857142857,
+    "stop": 1.1486695,
+    "tp1": 1.1474847823428573,
+    "tp2": 1.1471634151428571,
+    "tp3": 1.1467043191428572,
+    "rr1": 1.0151931474393576,
+    "rr2": 1.5618356114456016,
+    "created_at": "2026-09-21T08:23:52.288021+00:00",
+    "reasons": [
+      "4H_BEAR",
+      "1H_BEAR",
+      "W_D_RCI25_47_DOWN",
+      "DAILY_RESIST_1",
+      "5M_RCI8_LEAD_DOWN",
+      "15M_IN_CLOUD"
+    ],
+    "counter": [],
+    "early": true
+  },
+  "daily_date": "2026-09-21",
+  "daily_start_balance": 100774.47041830639,
   "consecutive_losses": 1,
-  "last_key": "3aa58fa3bc5bad3b"
+  "last_key": "f8416a1fe83083f8"
 }
